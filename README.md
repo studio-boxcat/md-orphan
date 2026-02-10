@@ -25,7 +25,7 @@ md-orphan <entry-point...> [--exclude <prefix>...] [--verbose]
 ```
 md-orphan CLAUDE.md
 md-orphan CLAUDE.md README.md
-md-orphan --exclude Library --exclude Packages AGENTS.md
+md-orphan --exclude Library,Packages AGENTS.md
 md-orphan --verbose CLAUDE.md
 ```
 
@@ -33,8 +33,15 @@ The root directory is the parent of the entry point. All `.md` files under that 
 
 | Flag | Description |
 |------|-------------|
-| `--exclude <prefix>` | Exclude paths matching prefix, repeatable |
+| `--exclude <pattern>` | Exclude paths by prefix or glob (comma-separated, repeatable) |
 | `--verbose`, `-v` | Show success message when all files are reachable |
+
+## Structure
+
+- `Sources/Lib/` — Core library (discovery, link extraction, BFS crawl)
+- `Sources/CLI/` — ArgumentParser entry point
+- `Tests/` — Swift Testing test suite
+- `dist/` — Pre-built release binary
 
 ## Algorithm
 

@@ -204,6 +204,29 @@ import Testing
     #expect(isExcluded("CHANGELOG.md", by: ["CHANGELOG.md"]))
 }
 
+@Test func excludesWithGlob() {
+    #expect(isExcluded("docs/draft-intro.md", by: ["docs/draft-*.md"]))
+}
+
+@Test func globDoesNotMatchDifferentName() {
+    #expect(!isExcluded("docs/guide.md", by: ["docs/draft-*.md"]))
+}
+
+@Test func globDoesNotMatchDeeper() {
+    #expect(!isExcluded("docs/sub/draft-intro.md", by: ["docs/draft-*.md"]))
+}
+
+@Test func globWithQuestionMark() {
+    #expect(isExcluded("docs/v1.md", by: ["docs/v?.md"]))
+    #expect(!isExcluded("docs/v12.md", by: ["docs/v?.md"]))
+}
+
+@Test func mixesPrefixAndGlob() {
+    #expect(isExcluded("Library/foo.md", by: ["Library", "docs/draft-*.md"]))
+    #expect(isExcluded("docs/draft-intro.md", by: ["Library", "docs/draft-*.md"]))
+    #expect(!isExcluded("docs/guide.md", by: ["Library", "docs/draft-*.md"]))
+}
+
 @Test func dirNameOfFilePath() {
     #expect(dirName("/repo/docs/file.md") == "/repo/docs")
 }

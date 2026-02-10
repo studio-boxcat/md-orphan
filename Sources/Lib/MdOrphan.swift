@@ -17,11 +17,14 @@ public func dirName(_ path: String) -> String {
 }
 
 /// Check if a relative path matches any exclude pattern.
-/// Patterns match as path prefix (e.g. "Library" matches "Library/foo/bar.md").
+/// Plain patterns match as path prefix (e.g. "Library" matches "Library/foo/bar.md").
+/// Patterns with *, ?, [ are matched as globs via fnmatch(3).
 public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
     for pattern in patterns {
-        if relPath == pattern || relPath.hasPrefix(pattern + "/") {
-            return true
+        if pattern.contains("*") || pattern.contains("?") || pattern.contains("[") {
+            if fnmatch(pattern, relPath, FNM_PATHNAME) == 0 { return true }
+        } else {
+            if relPath == pattern || relPath.hasPrefix(pattern + "/") { return true }
         }
     }
     return false
