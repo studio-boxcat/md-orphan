@@ -39,7 +39,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 ## Algorithm
 
 1. **Discover** — Find all `.md` files under root, keyed by inode (`stat.st_ino`) for correct symlink/hardlink handling
-2. **Crawl** — BFS from entry points, extracting `[text](path.md)` links (supports `#anchor` stripping, `./` and `../` relative paths; ignores URLs and non-`.md` links). Paths resolved relative to containing file, normalized, and bounded to root
+2. **Crawl** — BFS from entry points, extracting `[text](path.md)` and `[[wiki]]` links (supports `#anchor` stripping, `|alias`, `./` and `../` relative paths; ignores URLs and non-`.md` links). Paths resolved relative to containing file, normalized, and bounded to root
 3. **Diff** — Report files whose inodes are not in the reachable set
 
 Edge cases: missing entry point → exit 1; broken link → warn to stderr; circular links → inode visited set; multiple entry points → union; symlinks → followed
