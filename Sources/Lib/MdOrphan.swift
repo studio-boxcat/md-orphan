@@ -16,16 +16,23 @@ public func dirName(_ path: String) -> String {
     return "."
 }
 
+public func baseName(_ path: String) -> String {
+    if let idx = path.lastIndex(of: "/") {
+        return String(path[path.index(after: idx)...])
+    }
+    return path
+}
+
 /// Check if a relative path matches any exclude pattern.
 /// Plain patterns match as path prefix (e.g. "Library" matches "Library/foo/bar.md").
 /// Trailing "/" treats pattern as directory prefix (e.g. "assets/loc/*/" matches everything under matching dirs).
 /// Patterns with *, ?, [ are matched as globs via fnmatch(3).
 public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
+    func isGlob(_ s: String) -> Bool { s.contains("*") || s.contains("?") || s.contains("[") }
     for pattern in patterns {
         if pattern.hasSuffix("/") {
             let prefix = String(pattern.dropLast())
-            if prefix.contains("*") || prefix.contains("?") || prefix.contains("[") {
-                // Glob the directory part, then prefix-match the rest
+            if isGlob(prefix) {
                 let parts = relPath.split(separator: "/", omittingEmptySubsequences: true)
                 let depth = prefix.split(separator: "/", omittingEmptySubsequences: true).count
                 if parts.count > depth {
@@ -35,7 +42,7 @@ public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
             } else {
                 if relPath.hasPrefix(pattern) { return true }
             }
-        } else if pattern.contains("*") || pattern.contains("?") || pattern.contains("[") {
+        } else if isGlob(pattern) {
             if fnmatch(pattern, relPath, FNM_PATHNAME) == 0 { return true }
         } else {
             if relPath == pattern || relPath.hasPrefix(pattern + "/") { return true }
@@ -142,9 +149,18 @@ public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
     }
 }
 
+/// Check if the path segment has a file extension (a '.' followed by 1+ chars, not preceded by '/').
 @inline(__always)
-private func endsMd(_ base: UnsafePointer<UInt8>, at pos: Int, len: Int) -> Bool {
-    len >= 4 && base[pos - 1] == 0x64 && base[pos - 2] == 0x6D && base[pos - 3] == 0x2E
+private func hasExtension(_ base: UnsafePointer<UInt8>, from: Int, len: Int) -> Bool {
+    guard len >= 3 else { return false } // minimum: "a.b"
+    var i = from + len - 1
+    while i > from {
+        let b = base[i]
+        if b == 0x2E { return true }  // '.' found with chars after it
+        if b == 0x2F { return false } // hit '/' before finding '.'
+        i -= 1
+    }
+    return false
 }
 
 @inline(__always)
@@ -152,12 +168,17 @@ private func decodeUTF8(_ base: UnsafePointer<UInt8>, from: Int, len: Int) -> St
     String(decoding: UnsafeBufferPointer(start: base + from, count: len), as: UTF8.self)
 }
 
-/// Scan raw UTF-8 bytes for markdown links to .md files.
+public struct MdLink: Equatable {
+    public let path: String
+    public let fragment: String?
+}
+
+/// Scan raw UTF-8 bytes for markdown links to local files.
 /// Manual byte scan — Swift Regex is 28-33x slower: https://forums.swift.org/t/slow-regex-performance/75768
-public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
+public func extractLinksWithFragments(_ buf: UnsafeBufferPointer<UInt8>) -> [MdLink] {
     guard let base = buf.baseAddress, buf.count > 4 else { return [] }
     let count = buf.count
-    var links: [String] = []
+    var links: [MdLink] = []
     var i = 0
 
     while i < count - 1 {
@@ -175,9 +196,13 @@ public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
     return links
 }
 
+public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
+    extractLinksWithFragments(buf).map(\.path)
+}
+
 /// Parse [[page]], [[page|alias]], [[page#section]] wiki links.
 private func scanWikiLink(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [String]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLink]
 ) -> Int {
     let start = i + 2
     var end = start
@@ -192,20 +217,33 @@ private func scanWikiLink(
     }
 
     var nameEnd = end
+    var hashPos = -1
     for j in start..<end {
-        if base[j] == 0x23 || base[j] == 0x7C { nameEnd = j; break }
+        if base[j] == 0x23 { hashPos = j; nameEnd = j; break }
+        if base[j] == 0x7C { nameEnd = j; break }
+    }
+    var fragEnd = end
+    if hashPos >= 0 {
+        for j in (hashPos + 1)..<end {
+            if base[j] == 0x7C { fragEnd = j; break }
+        }
     }
     let nameLen = nameEnd - start
     guard nameLen > 0 else { return end + 2 }
 
-    guard endsMd(base, at: nameEnd, len: nameLen) else { return end + 2 }
-    links.append(decodeUTF8(base, from: start, len: nameLen))
+    guard hasExtension(base, from: start, len: nameLen) else { return end + 2 }
+    var fragment: String? = nil
+    if hashPos >= 0 {
+        let fragLen = fragEnd - hashPos - 1
+        if fragLen > 0 { fragment = decodeUTF8(base, from: hashPos + 1, len: fragLen) }
+    }
+    links.append(MdLink(path: decodeUTF8(base, from: start, len: nameLen), fragment: fragment))
     return end + 2
 }
 
 /// Parse [text](path.md#fragment) standard links.
 private func scanStandardLink(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [String]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLink]
 ) -> Int {
     let start = i + 2
     var end = start
@@ -220,14 +258,20 @@ private func scanStandardLink(
 
     let pathEnd = fragPos >= 0 ? fragPos : end
     let pathLen = pathEnd - start
-    guard endsMd(base, at: pathEnd, len: pathLen) else { return end + 1 }
 
     // Skip http(s) URLs
     if base[start] == 0x68, pathLen > 7,
        base[start + 1] == 0x74, base[start + 2] == 0x74, base[start + 3] == 0x70
     { return end + 1 }
 
-    links.append(decodeUTF8(base, from: start, len: pathLen))
+    guard hasExtension(base, from: start, len: pathLen) else { return end + 1 }
+
+    var fragment: String? = nil
+    if fragPos >= 0 {
+        let fragLen = end - fragPos - 1
+        if fragLen > 0 { fragment = decodeUTF8(base, from: fragPos + 1, len: fragLen) }
+    }
+    links.append(MdLink(path: decodeUTF8(base, from: start, len: pathLen), fragment: fragment))
     return end + 1
 }
 
@@ -235,6 +279,67 @@ private func scanStandardLink(
 public func extractLinks(from string: String) -> [String] {
     var str = string
     return str.withUTF8 { extractLinks($0) }
+}
+
+/// Convenience: extract links with fragments from a String.
+public func extractLinksWithFragments(from string: String) -> [MdLink] {
+    var str = string
+    return str.withUTF8 { extractLinksWithFragments($0) }
+}
+
+/// Convert heading text to GitHub-style anchor ID.
+/// Lowercase, keep letters/numbers/hyphens/underscores, spaces→hyphens.
+public func anchorId(from text: String) -> String {
+    var result = ""
+    for ch in text.lowercased() {
+        if ch.isLetter || ch.isNumber || ch == "-" || ch == "_" {
+            result.append(ch)
+        } else if ch == " " {
+            result.append("-")
+        }
+    }
+    return result
+}
+
+/// Extract heading anchors from markdown content (GitHub-style slugs).
+public func extractHeadings(_ buf: UnsafeBufferPointer<UInt8>) -> Set<String> {
+    guard let base = buf.baseAddress else { return [] }
+    let count = buf.count
+    var headings = Set<String>()
+    var i = 0
+
+    while i < count {
+        if base[i] == 0x23 && (i == 0 || base[i - 1] == 0x0A || base[i - 1] == 0x0D) {
+            var j = i
+            while j < count && base[j] == 0x23 { j += 1 }
+            if j < count && base[j] == 0x20 {
+                j += 1
+                let headStart = j
+                while j < count && base[j] != 0x0A && base[j] != 0x0D { j += 1 }
+                // Trim trailing whitespace
+                var headEnd = j
+                while headEnd > headStart && (base[headEnd - 1] == 0x20 || base[headEnd - 1] == 0x09) {
+                    headEnd -= 1
+                }
+                if headEnd > headStart {
+                    let text = decodeUTF8(base, from: headStart, len: headEnd - headStart)
+                    headings.insert(anchorId(from: text))
+                }
+            }
+            i = j + 1
+        } else {
+            while i < count && base[i] != 0x0A { i += 1 }
+            i += 1
+        }
+    }
+
+    return headings
+}
+
+/// Convenience: extract headings from a String.
+public func extractHeadings(from string: String) -> Set<String> {
+    var str = string
+    return str.withUTF8 { extractHeadings($0) }
 }
 
 /// Resolve a link relative to the file containing it. Returns absolute path or nil if escapes root.
@@ -267,7 +372,7 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 /// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
 /// When a link can't be resolved relative to its file, falls back to basename lookup in allFiles.
 public struct LinkIssue: Equatable {
-    public enum Kind: Equatable { case broken, ambiguous(Int) }
+    public enum Kind: Equatable { case broken, ambiguous(Int), brokenAnchor(String) }
     public let link: String
     public let source: String
     public let kind: Kind
@@ -277,19 +382,14 @@ public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: Strin
     // Build basename → absolute path lookup for fallback resolution
     var byName: [String: [String]] = [:]
     for (_, relPath) in allFiles {
-        let name: String
-        if let idx = relPath.lastIndex(of: "/") {
-            name = String(relPath[relPath.index(after: idx)...])
-        } else {
-            name = relPath
-        }
-        byName[name, default: []].append(root + "/" + relPath)
+        byName[baseName(relPath), default: []].append(root + "/" + relPath)
     }
 
     var reachable = Set<ino_t>()
     var issues: [LinkIssue] = []
     var queued = Set(entryPaths)
     var queue = entryPaths
+    var headingCache: [String: Set<String>] = [:]
     var idx = 0
 
     while idx < queue.count {
@@ -303,32 +403,49 @@ public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: Strin
 
         guard reachable.insert(inode).inserted else { continue }
 
-        for link in extractLinks(content) {
-            guard let resolved = resolveLink(link, relativeTo: filePath, root: root) else {
+        for link in extractLinksWithFragments(content) {
+            guard let resolved = resolveLink(link.path, relativeTo: filePath, root: root) else {
                 continue
             }
+            let isMd = link.path.hasSuffix(".md")
             var canonical = realPath(resolved)
 
-            // Fallback: search by basename if exact resolution fails
-            if canonical == nil {
-                let basename: String
-                if let idx = link.lastIndex(of: "/") {
-                    basename = String(link[link.index(after: idx)...])
-                } else {
-                    basename = link
-                }
+            // Basename fallback only for .md links
+            if canonical == nil && isMd {
+                let basename = baseName(link.path)
                 if let candidates = byName[basename], candidates.count == 1 {
                     canonical = realPath(candidates[0])
                 } else if let candidates = byName[basename], candidates.count > 1 {
-                    issues.append(LinkIssue(link: link, source: filePath, kind: .ambiguous(candidates.count)))
+                    issues.append(LinkIssue(link: link.path, source: filePath, kind: .ambiguous(candidates.count)))
                     continue
                 }
             }
 
             guard let canonical else {
-                issues.append(LinkIssue(link: link, source: filePath, kind: .broken))
+                issues.append(LinkIssue(link: link.path, source: filePath, kind: .broken))
                 continue
             }
+
+            // Only crawl .md files for further links
+            guard isMd else { continue }
+
+            // Lazy anchor check: only read target for headings when fragment present
+            if let fragment = link.fragment {
+                let headings: Set<String>
+                if let cached = headingCache[canonical] {
+                    headings = cached
+                } else if let (_, targetBuf) = readFile(path: canonical) {
+                    headings = extractHeadings(targetBuf)
+                    headingCache[canonical] = headings
+                } else {
+                    headings = []
+                    headingCache[canonical] = headings
+                }
+                if !headings.contains(fragment) {
+                    issues.append(LinkIssue(link: link.path, source: filePath, kind: .brokenAnchor(fragment)))
+                }
+            }
+
             if queued.insert(canonical).inserted {
                 queue.append(canonical)
             }

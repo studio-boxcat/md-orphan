@@ -4,7 +4,7 @@ Detect markdown files not reachable from a given entry point by crawling relativ
 
 ## Install
 
-Pre-built macOS binary in `dist/`. Build and symlink to `/usr/local/bin`:
+Pre-built macOS binary in `dist/`. Build and symlink to `~/.local/bin`:
 
 ```
 just install
@@ -46,8 +46,8 @@ The root directory is the parent of the entry point. All `.md` files under that 
 ## Algorithm
 
 1. **Discover** — Find all `.md` files under root, keyed by inode (`stat.st_ino`) for correct symlink/hardlink handling
-2. **Crawl** — BFS from entry points, extracting `[text](path.md)` and `[[wiki]]` links (supports `#anchor` stripping, `|alias`, `./` and `../` relative paths; ignores URLs and non-`.md` links). Paths resolved relative to containing file, normalized, and bounded to root
+2. **Crawl** — BFS from entry points, extracting `[text](path)` and `[[wiki]]` links (supports `#anchor` stripping, `|alias`, `./` and `../` relative paths; ignores URLs and extensionless links). `.md` links are followed for further crawling; non-`.md` links (images, PDFs, etc.) are checked for existence only. Paths resolved relative to containing file, normalized, and bounded to root
 3. **Diff** — Report files whose inodes are not in the reachable set
 
-Edge cases: missing entry point → exit 1; broken link → warn to stderr; circular links → inode visited set; multiple entry points → union; symlinks → followed
+Edge cases: missing entry point → exit 1; broken link (`.md` or non-`.md`) → exit 1; circular links → inode visited set; multiple entry points → union; symlinks → followed
 

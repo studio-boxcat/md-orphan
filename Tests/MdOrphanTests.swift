@@ -39,9 +39,9 @@ import Testing
     #expect(links.isEmpty)
 }
 
-@Test func skipsNonMarkdownLinks() {
+@Test func extractsNonMarkdownLinks() {
     let links = extractLinks(from: "[img](photo.png) [script](app.ts)")
-    #expect(links.isEmpty)
+    #expect(links == ["photo.png", "app.ts"])
 }
 
 @Test func skipsHtmlTags() {
@@ -76,7 +76,7 @@ import Testing
 }
 
 @Test func skipsShortPaths() {
-    // ".md" alone is only 3 chars, need at least 4 (x.md)
+    // ".md" has no filename before the extension
     let links = extractLinks(from: "[x](.md)")
     #expect(links.isEmpty)
 }
@@ -113,9 +113,9 @@ import Testing
     #expect(links.isEmpty)
 }
 
-@Test func skipsWikiLinkToNonMd() {
+@Test func extractsWikiLinkToNonMd() {
     let links = extractLinks(from: "See [[image.png]] here")
-    #expect(links.isEmpty)
+    #expect(links == ["image.png"])
 }
 
 @Test func extractsMixedLinks() {
@@ -136,6 +136,80 @@ import Testing
 @Test func extractsAdjacentWikiLinks() {
     let links = extractLinks(from: "[[one.md]][[two.md]]")
     #expect(links == ["one.md", "two.md"])
+}
+
+// MARK: - extractLinksWithFragments
+
+@Test func fragmentFromStandardLink() {
+    let links = extractLinksWithFragments(from: "[ref](page.md#section)")
+    #expect(links == [MdLink(path: "page.md", fragment: "section")])
+}
+
+@Test func fragmentFromWikiLink() {
+    let links = extractLinksWithFragments(from: "[[guide.md#core-classes]]")
+    #expect(links == [MdLink(path: "guide.md", fragment: "core-classes")])
+}
+
+@Test func wikiLinkFragmentWithAlias() {
+    let links = extractLinksWithFragments(from: "[[guide.md#section|display]]")
+    #expect(links == [MdLink(path: "guide.md", fragment: "section")])
+}
+
+@Test func noFragmentWhenAbsent() {
+    let links = extractLinksWithFragments(from: "[ref](page.md)")
+    #expect(links == [MdLink(path: "page.md", fragment: nil)])
+}
+
+@Test func emptyFragmentTreatedAsNone() {
+    let links = extractLinksWithFragments(from: "[ref](page.md#)")
+    #expect(links == [MdLink(path: "page.md", fragment: nil)])
+}
+
+// MARK: - extractHeadings
+
+@Test func extractsSimpleHeading() {
+    let headings = extractHeadings(from: "# Hello World")
+    #expect(headings == ["hello-world"])
+}
+
+@Test func extractsMultipleLevelHeadings() {
+    let headings = extractHeadings(from: "# First\n## Second\n### Third")
+    #expect(headings == ["first", "second", "third"])
+}
+
+@Test func headingWithSpecialChars() {
+    let headings = extractHeadings(from: "## Core (Classes)")
+    #expect(headings == ["core-classes"])
+}
+
+@Test func headingWithFormatting() {
+    let headings = extractHeadings(from: "## **Bold** heading")
+    #expect(headings == ["bold-heading"])
+}
+
+@Test func headingWithUnderscore() {
+    let headings = extractHeadings(from: "## hello_world")
+    #expect(headings == ["hello_world"])
+}
+
+@Test func headingWithBackticks() {
+    let headings = extractHeadings(from: "## `code` stuff")
+    #expect(headings == ["code-stuff"])
+}
+
+@Test func noHeadingsInPlainText() {
+    let headings = extractHeadings(from: "Just text\nMore text")
+    #expect(headings.isEmpty)
+}
+
+@Test func headingMustHaveSpaceAfterHash() {
+    let headings = extractHeadings(from: "#NoSpace")
+    #expect(headings.isEmpty)
+}
+
+@Test func headingNotMidLine() {
+    let headings = extractHeadings(from: "text ## not a heading")
+    #expect(headings.isEmpty)
 }
 
 // MARK: - resolveLink
@@ -239,6 +313,7 @@ import Testing
 }
 
 // MARK: - bfsCrawl
+// Serialized because bfsCrawl/readFile share a global read buffer.
 
 private func withTempDir(_ body: (String) -> Void) {
     let dir = NSTemporaryDirectory() + "md-orphan-test-\(UUID().uuidString)"
@@ -255,55 +330,120 @@ private func writeFile(_ path: String, _ content: String) {
     }
 }
 
-@Test func bfsCrawlFindsBrokenLinks() {
-    withTempDir { root in
-        writeFile("\(root)/index.md", "[a](missing.md)")
-        let allFiles = discoverFiles(root: root)
-        let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(issues.count == 1)
-        #expect(issues[0].link == "missing.md")
-        #expect(issues[0].kind == .broken)
+@Suite(.serialized) struct BfsCrawlTests {
+    @Test func findsBrokenLinks() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[a](missing.md)")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.count == 1)
+            #expect(issues[0].link == "missing.md")
+            #expect(issues[0].kind == .broken)
+        }
     }
-}
 
-@Test func bfsCrawlNoBrokenOnValidLinks() {
-    withTempDir { root in
-        writeFile("\(root)/index.md", "[a](other.md)")
-        writeFile("\(root)/other.md", "hello")
-        let allFiles = discoverFiles(root: root)
-        let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(issues.isEmpty)
-        #expect(reachable.count == 2)
+    @Test func noBrokenOnValidLinks() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[a](other.md)")
+            writeFile("\(root)/other.md", "hello")
+            let allFiles = discoverFiles(root: root)
+            let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.isEmpty)
+            #expect(reachable.count == 2)
+        }
     }
-}
 
-@Test func bfsCrawlBasenameFallback() {
-    withTempDir { root in
-        mkdir("\(root)/docs", 0o755)
-        writeFile("\(root)/index.md", "[a](guide.md)")
-        writeFile("\(root)/docs/guide.md", "hello")
-        let allFiles = discoverFiles(root: root)
-        let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(issues.isEmpty)
-        #expect(reachable.count == 2)
+    @Test func basenameFallback() {
+        withTempDir { root in
+            mkdir("\(root)/docs", 0o755)
+            writeFile("\(root)/index.md", "[a](guide.md)")
+            writeFile("\(root)/docs/guide.md", "hello")
+            let allFiles = discoverFiles(root: root)
+            let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.isEmpty)
+            #expect(reachable.count == 2)
+        }
     }
-}
 
-@Test func bfsCrawlAmbiguousLink() {
-    withTempDir { root in
-        mkdir("\(root)/a", 0o755)
-        mkdir("\(root)/b", 0o755)
-        writeFile("\(root)/index.md", "[a](guide.md)")
-        writeFile("\(root)/a/guide.md", "hello")
-        writeFile("\(root)/b/guide.md", "hello")
-        let allFiles = discoverFiles(root: root)
-        let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(issues.count == 1)
-        #expect(issues[0].link == "guide.md")
-        if case .ambiguous(let count) = issues[0].kind {
-            #expect(count == 2)
-        } else {
-            Issue.record("Expected ambiguous, got \(issues[0].kind)")
+    @Test func ambiguousLink() {
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            writeFile("\(root)/index.md", "[a](guide.md)")
+            writeFile("\(root)/a/guide.md", "hello")
+            writeFile("\(root)/b/guide.md", "hello")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.count == 1)
+            #expect(issues[0].link == "guide.md")
+            if case .ambiguous(let count) = issues[0].kind {
+                #expect(count == 2)
+            } else {
+                Issue.record("Expected ambiguous, got \(issues[0].kind)")
+            }
+        }
+    }
+
+    @Test func brokenNonMdLink() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[img](photo.png)")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.count == 1)
+            #expect(issues[0].link == "photo.png")
+            #expect(issues[0].kind == .broken)
+        }
+    }
+
+    @Test func validNonMdLink() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[img](photo.png)")
+            writeFile("\(root)/photo.png", "fake image data")
+            let allFiles = discoverFiles(root: root)
+            let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.isEmpty)
+            // Non-.md files should not be in reachable set (only .md files are crawled)
+            #expect(reachable.count == 1)
+        }
+    }
+
+    @Test func brokenAnchor() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[ref](other.md#missing-section)")
+            writeFile("\(root)/other.md", "# Existing Section\n\nSome content")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.count == 1)
+            if case .brokenAnchor(let frag) = issues[0].kind {
+                #expect(frag == "missing-section")
+            } else {
+                Issue.record("Expected brokenAnchor, got \(issues[0].kind)")
+            }
+        }
+    }
+
+    @Test func validAnchor() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[ref](other.md#existing-section)")
+            writeFile("\(root)/other.md", "# Existing Section\n\nSome content")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.isEmpty)
+        }
+    }
+
+    @Test func wikiLinkBrokenAnchor() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "[[other.md#no-such-heading]]")
+            writeFile("\(root)/other.md", "# Real Heading\n\nContent")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            #expect(issues.count == 1)
+            if case .brokenAnchor(let frag) = issues[0].kind {
+                #expect(frag == "no-such-heading")
+            } else {
+                Issue.record("Expected brokenAnchor, got \(issues[0].kind)")
+            }
         }
     }
 }

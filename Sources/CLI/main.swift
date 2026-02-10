@@ -43,23 +43,21 @@ struct MdOrphan: ParsableCommand {
             .map(\.value)
             .sorted()
 
-        let names = entryPoints.map { path -> String in
-            if let idx = path.lastIndex(of: "/") {
-                return String(path[path.index(after: idx)...])
-            }
-            return path
-        }.joined(separator: ", ")
+        let names = entryPoints.map { baseName($0) }.joined(separator: ", ")
+        let relSource = { (issue: LinkIssue) -> String in
+            issue.source.hasPrefix(root + "/") ? String(issue.source.dropFirst(root.count + 1)) : issue.source
+        }
 
         var failed = false
 
         let broken = issues.filter { $0.kind == .broken }
         let ambiguous = issues.filter { if case .ambiguous = $0.kind { return true }; return false }
+        let brokenAnchors = issues.filter { if case .brokenAnchor = $0.kind { return true }; return false }
 
         if !broken.isEmpty {
             print("\u{1F517} \(broken.count) broken links:")
             for b in broken {
-                let src = b.source.hasPrefix(root + "/") ? String(b.source.dropFirst(root.count + 1)) : b.source
-                print("  \(b.link) in \(src)")
+                print("  \(b.link) in \(relSource(b))")
             }
             failed = true
         }
@@ -67,9 +65,18 @@ struct MdOrphan: ParsableCommand {
         if !ambiguous.isEmpty {
             print("\u{26A0}\u{FE0F} \(ambiguous.count) ambiguous links:")
             for a in ambiguous {
-                let src = a.source.hasPrefix(root + "/") ? String(a.source.dropFirst(root.count + 1)) : a.source
                 if case .ambiguous(let count) = a.kind {
-                    print("  \(a.link) in \(src) (\(count) files match)")
+                    print("  \(a.link) in \(relSource(a)) (\(count) files match)")
+                }
+            }
+            failed = true
+        }
+
+        if !brokenAnchors.isEmpty {
+            print("\u{2693} \(brokenAnchors.count) broken anchors:")
+            for a in brokenAnchors {
+                if case .brokenAnchor(let frag) = a.kind {
+                    print("  \(a.link)#\(frag) in \(relSource(a))")
                 }
             }
             failed = true
