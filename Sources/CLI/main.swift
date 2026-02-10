@@ -36,7 +36,7 @@ struct MdOrphan: ParsableCommand {
         }
         let root = dirName(resolvedEntries[0])
         let allFiles = discoverFiles(root: root, exclude: excludePatterns)
-        let reachable = bfsCrawl(entryPaths: resolvedEntries, root: root)
+        let (reachable, broken) = bfsCrawl(entryPaths: resolvedEntries, root: root, allFiles: allFiles)
 
         let orphans = allFiles
             .filter { !reachable.contains($0.key) }
@@ -50,16 +50,32 @@ struct MdOrphan: ParsableCommand {
             return path
         }.joined(separator: ", ")
 
-        if orphans.isEmpty {
-            if verbose {
-                print("\u{2705} All \(allFiles.count) markdown files are reachable from \(names)")
+        var failed = false
+
+        if !broken.isEmpty {
+            let relBroken = broken.map { b in
+                let src = b.source.hasPrefix(root + "/") ? String(b.source.dropFirst(root.count + 1)) : b.source
+                return (link: b.link, source: src)
             }
-        } else {
+            print("\u{1F517} \(broken.count) broken links:")
+            for b in relBroken {
+                print("  \(b.link) in \(b.source)")
+            }
+            failed = true
+        }
+
+        if !orphans.isEmpty {
             print("\u{274C} \(orphans.count) orphan markdown files (not reachable from \(names)):")
             for path in orphans {
                 print("  \(path)")
             }
+            failed = true
+        }
+
+        if failed {
             throw ExitCode(1)
+        } else if verbose {
+            print("\u{2705} All \(allFiles.count) markdown files are reachable from \(names)")
         }
     }
 }

@@ -83,34 +83,33 @@ import Testing
 // MARK: - extractLinks (wiki links)
 
 @Test func extractsWikiLink() {
-    let links = extractLinks(from: "See [[guide]] for details")
+    let links = extractLinks(from: "See [[guide.md]] for details")
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithAlias() {
-    let links = extractLinks(from: "See [[guide|the guide]] for details")
+    let links = extractLinks(from: "See [[guide.md|the guide]] for details")
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithFragment() {
-    let links = extractLinks(from: "See [[guide#section]] here")
+    let links = extractLinks(from: "See [[guide.md#section]] here")
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithFragmentAndAlias() {
-    let links = extractLinks(from: "See [[guide#section|display]] here")
+    let links = extractLinks(from: "See [[guide.md#section|display]] here")
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithPath() {
-    let links = extractLinks(from: "See [[docs/guide]] for details")
+    let links = extractLinks(from: "See [[docs/guide.md]] for details")
     #expect(links == ["docs/guide.md"])
 }
 
-@Test func extractsWikiLinkWithExtension() {
-    // If .md is already present, don't double-add
-    let links = extractLinks(from: "See [[guide.md]] for details")
-    #expect(links == ["guide.md"])
+@Test func skipsWikiLinkWithoutExtension() {
+    let links = extractLinks(from: "See [[guide]] here")
+    #expect(links.isEmpty)
 }
 
 @Test func skipsWikiLinkToNonMd() {
@@ -119,7 +118,7 @@ import Testing
 }
 
 @Test func extractsMixedLinks() {
-    let links = extractLinks(from: "[[wiki]] and [standard](standard.md)")
+    let links = extractLinks(from: "[[wiki.md]] and [standard](standard.md)")
     #expect(links == ["wiki.md", "standard.md"])
 }
 
@@ -134,7 +133,7 @@ import Testing
 }
 
 @Test func extractsAdjacentWikiLinks() {
-    let links = extractLinks(from: "[[one]][[two]]")
+    let links = extractLinks(from: "[[one.md]][[two.md]]")
     #expect(links == ["one.md", "two.md"])
 }
 
@@ -219,6 +218,17 @@ import Testing
 @Test func globWithQuestionMark() {
     #expect(isExcluded("docs/v1.md", by: ["docs/v?.md"]))
     #expect(!isExcluded("docs/v12.md", by: ["docs/v?.md"]))
+}
+
+@Test func trailingSlashAsPrefixPlain() {
+    #expect(isExcluded("assets/localizer/cat-profiles/00_Normal.md", by: ["assets/localizer/"]))
+    #expect(!isExcluded("assets/other/file.md", by: ["assets/localizer/"]))
+}
+
+@Test func trailingSlashAsPrefixGlob() {
+    #expect(isExcluded("assets/localizer/cat-profiles/00_Normal.md", by: ["assets/localizer/*/"]))
+    #expect(isExcluded("assets/localizer/prompts/deep/file.md", by: ["assets/localizer/*/"]))
+    #expect(!isExcluded("assets/localizer/top.md", by: ["assets/localizer/*/"]))
 }
 
 @Test func mixesPrefixAndGlob() {

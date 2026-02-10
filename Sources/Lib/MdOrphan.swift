@@ -18,10 +18,24 @@ public func dirName(_ path: String) -> String {
 
 /// Check if a relative path matches any exclude pattern.
 /// Plain patterns match as path prefix (e.g. "Library" matches "Library/foo/bar.md").
+/// Trailing "/" treats pattern as directory prefix (e.g. "assets/loc/*/" matches everything under matching dirs).
 /// Patterns with *, ?, [ are matched as globs via fnmatch(3).
 public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
     for pattern in patterns {
-        if pattern.contains("*") || pattern.contains("?") || pattern.contains("[") {
+        if pattern.hasSuffix("/") {
+            let prefix = String(pattern.dropLast())
+            if prefix.contains("*") || prefix.contains("?") || prefix.contains("[") {
+                // Glob the directory part, then prefix-match the rest
+                let parts = relPath.split(separator: "/", omittingEmptySubsequences: true)
+                let depth = prefix.split(separator: "/", omittingEmptySubsequences: true).count
+                if parts.count > depth {
+                    let dir = parts[..<depth].joined(separator: "/")
+                    if fnmatch(prefix, dir, FNM_PATHNAME) == 0 { return true }
+                }
+            } else {
+                if relPath.hasPrefix(pattern) { return true }
+            }
+        } else if pattern.contains("*") || pattern.contains("?") || pattern.contains("[") {
             if fnmatch(pattern, relPath, FNM_PATHNAME) == 0 { return true }
         } else {
             if relPath == pattern || relPath.hasPrefix(pattern + "/") { return true }
@@ -184,13 +198,8 @@ private func scanWikiLink(
     let nameLen = nameEnd - start
     guard nameLen > 0 else { return end + 2 }
 
-    if endsMd(base, at: nameEnd, len: nameLen) {
-        links.append(decodeUTF8(base, from: start, len: nameLen))
-    } else {
-        var hasDot = false
-        for j in start..<nameEnd { if base[j] == 0x2E { hasDot = true; break } }
-        if !hasDot { links.append(decodeUTF8(base, from: start, len: nameLen) + ".md") }
-    }
+    guard endsMd(base, at: nameEnd, len: nameLen) else { return end + 2 }
+    links.append(decodeUTF8(base, from: start, len: nameLen))
     return end + 2
 }
 
@@ -213,6 +222,7 @@ private func scanStandardLink(
     let pathLen = pathEnd - start
     guard endsMd(base, at: pathEnd, len: pathLen) else { return end + 1 }
 
+    // Skip http(s) URLs
     if base[start] == 0x68, pathLen > 7,
        base[start + 1] == 0x74, base[start + 2] == 0x74, base[start + 3] == 0x70
     { return end + 1 }
@@ -255,8 +265,27 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 
 /// BFS from entry points. Returns set of reachable inodes.
 /// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
-public func bfsCrawl(entryPaths: [String], root: String) -> Set<ino_t> {
+/// When a link can't be resolved relative to its file, falls back to basename lookup in allFiles.
+public struct BrokenLink: Equatable {
+    public let link: String
+    public let source: String
+}
+
+public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: String] = [:]) -> (reachable: Set<ino_t>, broken: [BrokenLink]) {
+    // Build basename → absolute path lookup for fallback resolution
+    var byName: [String: [String]] = [:]
+    for (_, relPath) in allFiles {
+        let name: String
+        if let idx = relPath.lastIndex(of: "/") {
+            name = String(relPath[relPath.index(after: idx)...])
+        } else {
+            name = relPath
+        }
+        byName[name, default: []].append(root + "/" + relPath)
+    }
+
     var reachable = Set<ino_t>()
+    var broken: [BrokenLink] = []
     var queued = Set(entryPaths)
     var queue = entryPaths
     var idx = 0
@@ -276,8 +305,26 @@ public func bfsCrawl(entryPaths: [String], root: String) -> Set<ino_t> {
             guard let resolved = resolveLink(link, relativeTo: filePath, root: root) else {
                 continue
             }
-            guard let canonical = realPath(resolved) else {
-                fputs("md-orphan: warning: broken link \(link) in \(filePath)\n", stderr)
+            var canonical = realPath(resolved)
+
+            // Fallback: search by basename if exact resolution fails
+            if canonical == nil {
+                let basename: String
+                if let idx = link.lastIndex(of: "/") {
+                    basename = String(link[link.index(after: idx)...])
+                } else {
+                    basename = link
+                }
+                if let candidates = byName[basename], candidates.count == 1 {
+                    canonical = realPath(candidates[0])
+                } else if let candidates = byName[basename], candidates.count > 1 {
+                    broken.append(BrokenLink(link: link, source: filePath))
+                    continue
+                }
+            }
+
+            guard let canonical else {
+                broken.append(BrokenLink(link: link, source: filePath))
                 continue
             }
             if queued.insert(canonical).inserted {
@@ -286,5 +333,5 @@ public func bfsCrawl(entryPaths: [String], root: String) -> Set<ino_t> {
         }
     }
 
-    return reachable
+    return (reachable, broken)
 }
