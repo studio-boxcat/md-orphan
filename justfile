@@ -7,7 +7,7 @@ build:
     cp .build/release/md-orphan dist/md-orphan
 
 install: build
-    ln -sf {{justfile_directory()}}/dist/md-orphan /usr/local/bin/md-orphan
+    ln -sf {{justfile_directory()}}/dist/md-orphan ~/.local/bin/md-orphan
 
 test:
     swift test
