@@ -36,7 +36,7 @@ struct MdOrphan: ParsableCommand {
         }
         let root = dirName(resolvedEntries[0])
         let allFiles = discoverFiles(root: root, exclude: excludePatterns)
-        let (reachable, broken) = bfsCrawl(entryPaths: resolvedEntries, root: root, allFiles: allFiles)
+        let (reachable, issues) = bfsCrawl(entryPaths: resolvedEntries, root: root, allFiles: allFiles)
 
         let orphans = allFiles
             .filter { !reachable.contains($0.key) }
@@ -52,14 +52,25 @@ struct MdOrphan: ParsableCommand {
 
         var failed = false
 
+        let broken = issues.filter { $0.kind == .broken }
+        let ambiguous = issues.filter { if case .ambiguous = $0.kind { return true }; return false }
+
         if !broken.isEmpty {
-            let relBroken = broken.map { b in
-                let src = b.source.hasPrefix(root + "/") ? String(b.source.dropFirst(root.count + 1)) : b.source
-                return (link: b.link, source: src)
-            }
             print("\u{1F517} \(broken.count) broken links:")
-            for b in relBroken {
-                print("  \(b.link) in \(b.source)")
+            for b in broken {
+                let src = b.source.hasPrefix(root + "/") ? String(b.source.dropFirst(root.count + 1)) : b.source
+                print("  \(b.link) in \(src)")
+            }
+            failed = true
+        }
+
+        if !ambiguous.isEmpty {
+            print("\u{26A0}\u{FE0F} \(ambiguous.count) ambiguous links:")
+            for a in ambiguous {
+                let src = a.source.hasPrefix(root + "/") ? String(a.source.dropFirst(root.count + 1)) : a.source
+                if case .ambiguous(let count) = a.kind {
+                    print("  \(a.link) in \(src) (\(count) files match)")
+                }
             }
             failed = true
         }

@@ -266,12 +266,14 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 /// BFS from entry points. Returns set of reachable inodes.
 /// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
 /// When a link can't be resolved relative to its file, falls back to basename lookup in allFiles.
-public struct BrokenLink: Equatable {
+public struct LinkIssue: Equatable {
+    public enum Kind: Equatable { case broken, ambiguous(Int) }
     public let link: String
     public let source: String
+    public let kind: Kind
 }
 
-public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: String] = [:]) -> (reachable: Set<ino_t>, broken: [BrokenLink]) {
+public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: String] = [:]) -> (reachable: Set<ino_t>, issues: [LinkIssue]) {
     // Build basename → absolute path lookup for fallback resolution
     var byName: [String: [String]] = [:]
     for (_, relPath) in allFiles {
@@ -285,7 +287,7 @@ public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: Strin
     }
 
     var reachable = Set<ino_t>()
-    var broken: [BrokenLink] = []
+    var issues: [LinkIssue] = []
     var queued = Set(entryPaths)
     var queue = entryPaths
     var idx = 0
@@ -318,13 +320,13 @@ public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: Strin
                 if let candidates = byName[basename], candidates.count == 1 {
                     canonical = realPath(candidates[0])
                 } else if let candidates = byName[basename], candidates.count > 1 {
-                    broken.append(BrokenLink(link: link, source: filePath))
+                    issues.append(LinkIssue(link: link, source: filePath, kind: .ambiguous(candidates.count)))
                     continue
                 }
             }
 
             guard let canonical else {
-                broken.append(BrokenLink(link: link, source: filePath))
+                issues.append(LinkIssue(link: link, source: filePath, kind: .broken))
                 continue
             }
             if queued.insert(canonical).inserted {
@@ -333,5 +335,5 @@ public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: Strin
         }
     }
 
-    return (reachable, broken)
+    return (reachable, issues)
 }

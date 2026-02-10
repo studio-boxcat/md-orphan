@@ -259,9 +259,10 @@ private func writeFile(_ path: String, _ content: String) {
     withTempDir { root in
         writeFile("\(root)/index.md", "[a](missing.md)")
         let allFiles = discoverFiles(root: root)
-        let (_, broken) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(broken.count == 1)
-        #expect(broken[0].link == "missing.md")
+        let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(issues.count == 1)
+        #expect(issues[0].link == "missing.md")
+        #expect(issues[0].kind == .broken)
     }
 }
 
@@ -270,8 +271,8 @@ private func writeFile(_ path: String, _ content: String) {
         writeFile("\(root)/index.md", "[a](other.md)")
         writeFile("\(root)/other.md", "hello")
         let allFiles = discoverFiles(root: root)
-        let (reachable, broken) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(broken.isEmpty)
+        let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(issues.isEmpty)
         #expect(reachable.count == 2)
     }
 }
@@ -282,9 +283,28 @@ private func writeFile(_ path: String, _ content: String) {
         writeFile("\(root)/index.md", "[a](guide.md)")
         writeFile("\(root)/docs/guide.md", "hello")
         let allFiles = discoverFiles(root: root)
-        let (reachable, broken) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
-        #expect(broken.isEmpty)
+        let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(issues.isEmpty)
         #expect(reachable.count == 2)
+    }
+}
+
+@Test func bfsCrawlAmbiguousLink() {
+    withTempDir { root in
+        mkdir("\(root)/a", 0o755)
+        mkdir("\(root)/b", 0o755)
+        writeFile("\(root)/index.md", "[a](guide.md)")
+        writeFile("\(root)/a/guide.md", "hello")
+        writeFile("\(root)/b/guide.md", "hello")
+        let allFiles = discoverFiles(root: root)
+        let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(issues.count == 1)
+        #expect(issues[0].link == "guide.md")
+        if case .ambiguous(let count) = issues[0].kind {
+            #expect(count == 2)
+        } else {
+            Issue.record("Expected ambiguous, got \(issues[0].kind)")
+        }
     }
 }
 
