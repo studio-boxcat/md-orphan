@@ -125,6 +125,16 @@ public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
     }
 }
 
+@inline(__always)
+private func endsMd(_ base: UnsafePointer<UInt8>, at pos: Int, len: Int) -> Bool {
+    len >= 4 && base[pos - 1] == 0x64 && base[pos - 2] == 0x6D && base[pos - 3] == 0x2E
+}
+
+@inline(__always)
+private func decodeUTF8(_ base: UnsafePointer<UInt8>, from: Int, len: Int) -> String {
+    String(decoding: UnsafeBufferPointer(start: base + from, count: len), as: UTF8.self)
+}
+
 /// Scan raw UTF-8 bytes for markdown links to .md files.
 /// Manual byte scan — Swift Regex is 28-33x slower: https://forums.swift.org/t/slow-regex-performance/75768
 public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
@@ -134,54 +144,78 @@ public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
     var i = 0
 
     while i < count - 1 {
-        guard base[i] == 0x5D, base[i + 1] == 0x28 else {
-            i += 1
+        if base[i] == 0x5B, base[i + 1] == 0x5B {
+            i = scanWikiLink(base, count: count, at: i, into: &links)
             continue
         }
-
-        let start = i + 2
-        var end = start
-        var fragPos = -1
-
-        while end < count {
-            let b = base[end]
-            if b == 0x29 || b == 0x0A || b == 0x0D { break }
-            if b == 0x23 && fragPos < 0 { fragPos = end }
-            end += 1
-        }
-
-        guard end < count, base[end] == 0x29 else {
-            i = end + 1
+        if base[i] == 0x5D, base[i + 1] == 0x28 {
+            i = scanStandardLink(base, count: count, at: i, into: &links)
             continue
         }
-
-        let pathEnd = fragPos >= 0 ? fragPos : end
-        let pathLen = pathEnd - start
-
-        guard pathLen >= 4,
-              base[pathEnd - 1] == 0x64,
-              base[pathEnd - 2] == 0x6D,
-              base[pathEnd - 3] == 0x2E
-        else {
-            i = end + 1
-            continue
-        }
-
-        if base[start] == 0x68, pathLen > 7,
-           base[start + 1] == 0x74,
-           base[start + 2] == 0x74,
-           base[start + 3] == 0x70
-        {
-            i = end + 1
-            continue
-        }
-
-        let link = String(decoding: UnsafeBufferPointer(start: base + start, count: pathLen), as: UTF8.self)
-        links.append(link)
-        i = end + 1
+        i += 1
     }
 
     return links
+}
+
+/// Parse [[page]], [[page|alias]], [[page#section]] wiki links.
+private func scanWikiLink(
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [String]
+) -> Int {
+    let start = i + 2
+    var end = start
+    while end < count - 1 {
+        let b = base[end]
+        if b == 0x0A || b == 0x0D { break }
+        if b == 0x5D, base[end + 1] == 0x5D { break }
+        end += 1
+    }
+    guard end < count - 1, base[end] == 0x5D, base[end + 1] == 0x5D, end > start else {
+        return end + 1
+    }
+
+    var nameEnd = end
+    for j in start..<end {
+        if base[j] == 0x23 || base[j] == 0x7C { nameEnd = j; break }
+    }
+    let nameLen = nameEnd - start
+    guard nameLen > 0 else { return end + 2 }
+
+    if endsMd(base, at: nameEnd, len: nameLen) {
+        links.append(decodeUTF8(base, from: start, len: nameLen))
+    } else {
+        var hasDot = false
+        for j in start..<nameEnd { if base[j] == 0x2E { hasDot = true; break } }
+        if !hasDot { links.append(decodeUTF8(base, from: start, len: nameLen) + ".md") }
+    }
+    return end + 2
+}
+
+/// Parse [text](path.md#fragment) standard links.
+private func scanStandardLink(
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [String]
+) -> Int {
+    let start = i + 2
+    var end = start
+    var fragPos = -1
+    while end < count {
+        let b = base[end]
+        if b == 0x29 || b == 0x0A || b == 0x0D { break }
+        if b == 0x23 && fragPos < 0 { fragPos = end }
+        end += 1
+    }
+    guard end < count, base[end] == 0x29 else { return end + 1 }
+
+    let pathEnd = fragPos >= 0 ? fragPos : end
+    let pathLen = pathEnd - start
+    guard endsMd(base, at: pathEnd, len: pathLen) else { return end + 1 }
+
+    if base[start] == 0x68, pathLen > 7,
+       base[start + 1] == 0x74, base[start + 2] == 0x74, base[start + 3] == 0x70
+    { return end + 1 }
+
+    links.append(decodeUTF8(base, from: start, len: pathLen))
+    return end + 1
 }
 
 /// Convenience: extract links from a String.

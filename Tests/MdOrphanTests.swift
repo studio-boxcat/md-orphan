@@ -80,6 +80,64 @@ import Testing
     #expect(links.isEmpty)
 }
 
+// MARK: - extractLinks (wiki links)
+
+@Test func extractsWikiLink() {
+    let links = extractLinks(from: "See [[guide]] for details")
+    #expect(links == ["guide.md"])
+}
+
+@Test func extractsWikiLinkWithAlias() {
+    let links = extractLinks(from: "See [[guide|the guide]] for details")
+    #expect(links == ["guide.md"])
+}
+
+@Test func extractsWikiLinkWithFragment() {
+    let links = extractLinks(from: "See [[guide#section]] here")
+    #expect(links == ["guide.md"])
+}
+
+@Test func extractsWikiLinkWithFragmentAndAlias() {
+    let links = extractLinks(from: "See [[guide#section|display]] here")
+    #expect(links == ["guide.md"])
+}
+
+@Test func extractsWikiLinkWithPath() {
+    let links = extractLinks(from: "See [[docs/guide]] for details")
+    #expect(links == ["docs/guide.md"])
+}
+
+@Test func extractsWikiLinkWithExtension() {
+    // If .md is already present, don't double-add
+    let links = extractLinks(from: "See [[guide.md]] for details")
+    #expect(links == ["guide.md"])
+}
+
+@Test func skipsWikiLinkToNonMd() {
+    let links = extractLinks(from: "See [[image.png]] here")
+    #expect(links.isEmpty)
+}
+
+@Test func extractsMixedLinks() {
+    let links = extractLinks(from: "[[wiki]] and [standard](standard.md)")
+    #expect(links == ["wiki.md", "standard.md"])
+}
+
+@Test func skipsEmptyWikiLink() {
+    let links = extractLinks(from: "See [[]] here")
+    #expect(links.isEmpty)
+}
+
+@Test func skipsWikiLinkSpanningLines() {
+    let links = extractLinks(from: "See [[broken\nlink]] here")
+    #expect(links.isEmpty)
+}
+
+@Test func extractsAdjacentWikiLinks() {
+    let links = extractLinks(from: "[[one]][[two]]")
+    #expect(links == ["one.md", "two.md"])
+}
+
 // MARK: - resolveLink
 
 @Test func resolvesSimpleLink() {
