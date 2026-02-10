@@ -1,5 +1,7 @@
 default: build
 
+# https://github.com/swiftlang/swift/blob/main/docs/OptimizationTips.rst
+# SwiftPM release already enables -O + WMO; -cross-module-optimization added in Package.swift
 build:
     swift build -c release
     cp .build/release/md-orphan dist/md-orphan

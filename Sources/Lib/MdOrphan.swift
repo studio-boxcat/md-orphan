@@ -16,8 +16,21 @@ public func dirName(_ path: String) -> String {
     return "."
 }
 
+/// Check if a relative path matches any exclude pattern.
+/// Patterns match as path prefix (e.g. "Library" matches "Library/foo/bar.md").
+public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
+    for pattern in patterns {
+        if relPath == pattern || relPath.hasPrefix(pattern + "/") {
+            return true
+        }
+    }
+    return false
+}
+
 /// Walk `root` with fts, return [inode: relativePath] for all .md files.
-public func discoverFiles(root: String) -> [ino_t: String] {
+/// fts_open with FTS_NOSTAT is fastest on APFS — http://blog.tempel.org/2019/04/dir-read-performance.html
+/// Avoid getattrlistbulk — https://developer.apple.com/forums/thread/656787
+public func discoverFiles(root: String, exclude: [String] = []) -> [ino_t: String] {
     let rootCStr = strdup(root)!
     defer { free(rootCStr) }
     var argv: [UnsafeMutablePointer<CChar>?] = [rootCStr, nil]
@@ -39,6 +52,16 @@ public func discoverFiles(root: String) -> [ino_t: String] {
         if info == FTS_D {
             if nameLen > 1 && namePtr.pointee == 0x2E {
                 fts_set(stream, entry, FTS_SKIP)
+                continue
+            }
+            if !exclude.isEmpty {
+                let absPath = String(cString: entry.pointee.fts_path)
+                let relPath = absPath.utf8.count > rootLen + 1
+                    ? String(absPath.dropFirst(rootLen + 1))
+                    : ""
+                if !relPath.isEmpty && isExcluded(relPath, by: exclude) {
+                    fts_set(stream, entry, FTS_SKIP)
+                }
             }
             continue
         }
@@ -51,13 +74,15 @@ public func discoverFiles(root: String) -> [ino_t: String] {
               namePtr[nameLen - 1] == 0x64
         else { continue }
 
-        var s = stat()
-        guard stat(entry.pointee.fts_path, &s) == 0 else { continue }
-
         let absPath = String(cString: entry.pointee.fts_path)
         let relPath = absPath.utf8.count > rootLen + 1
             ? String(absPath.dropFirst(rootLen + 1))
             : absPath
+
+        if !exclude.isEmpty && isExcluded(relPath, by: exclude) { continue }
+
+        var s = stat()
+        guard stat(entry.pointee.fts_path, &s) == 0 else { continue }
         allFiles[s.st_ino] = relPath
     }
 
@@ -66,6 +91,7 @@ public func discoverFiles(root: String) -> [ino_t: String] {
 
 /// Read file contents into the reusable buffer. Returns (inode, buffer slice).
 /// Buffer is only valid until the next call.
+/// read() beats mmap for small files — https://medium.com/cosmos-code/mmap-vs-read-a-performance-comparison-for-efficient-file-access-3e5337bd1e25
 public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
     path.withCString { cstr in
         let fd = open(cstr, O_RDONLY)
@@ -100,6 +126,7 @@ public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
 }
 
 /// Scan raw UTF-8 bytes for markdown links to .md files.
+/// Manual byte scan — Swift Regex is 28-33x slower: https://forums.swift.org/t/slow-regex-performance/75768
 public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
     guard let base = buf.baseAddress, buf.count > 4 else { return [] }
     let count = buf.count
@@ -190,6 +217,7 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 }
 
 /// BFS from entry points. Returns set of reachable inodes.
+/// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
 public func bfsCrawl(entryPaths: [String], root: String) -> Set<ino_t> {
     var reachable = Set<ino_t>()
     var queued = Set(entryPaths)

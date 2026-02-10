@@ -11,6 +11,9 @@ struct MdOrphan: ParsableCommand {
     @Argument(help: "One or more markdown entry points")
     var entryPoints: [String]
 
+    @Option(name: .long, help: "Exclude paths matching prefix (repeatable)")
+    var exclude: [String] = []
+
     @Flag(name: [.long, .customShort("v")], help: "Show success message when all files are reachable")
     var verbose = false
 
@@ -23,7 +26,7 @@ struct MdOrphan: ParsableCommand {
         }
 
         let root = dirName(resolvedEntries[0])
-        let allFiles = discoverFiles(root: root)
+        let allFiles = discoverFiles(root: root, exclude: exclude)
         let reachable = bfsCrawl(entryPaths: resolvedEntries, root: root)
 
         let orphans = allFiles

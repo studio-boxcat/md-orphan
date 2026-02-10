@@ -119,6 +119,33 @@ import Testing
 
 // MARK: - dirName
 
+// MARK: - isExcluded
+
+@Test func excludesExactPrefix() {
+    #expect(isExcluded("Library/foo/bar.md", by: ["Library"]))
+}
+
+@Test func excludesNestedPrefix() {
+    #expect(isExcluded("proj-ios/Pods/Firebase/README.md", by: ["proj-ios"]))
+}
+
+@Test func doesNotExcludePartialMatch() {
+    #expect(!isExcluded("LibraryExtra/file.md", by: ["Library"]))
+}
+
+@Test func doesNotExcludeUnrelated() {
+    #expect(!isExcluded("docs/guide.md", by: ["Library", "proj-ios"]))
+}
+
+@Test func excludesMultiplePatterns() {
+    #expect(isExcluded("proj-ios/foo.md", by: ["Library", "proj-ios"]))
+    #expect(isExcluded("Library/bar.md", by: ["Library", "proj-ios"]))
+}
+
+@Test func excludesFileDirectly() {
+    #expect(isExcluded("CHANGELOG.md", by: ["CHANGELOG.md"]))
+}
+
 @Test func dirNameOfFilePath() {
     #expect(dirName("/repo/docs/file.md") == "/repo/docs")
 }
