@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import MdOrphanLib
 
@@ -236,6 +237,58 @@ import Testing
     #expect(isExcluded("docs/draft-intro.md", by: ["Library", "docs/draft-*.md"]))
     #expect(!isExcluded("docs/guide.md", by: ["Library", "docs/draft-*.md"]))
 }
+
+// MARK: - bfsCrawl
+
+private func withTempDir(_ body: (String) -> Void) {
+    let dir = NSTemporaryDirectory() + "md-orphan-test-\(UUID().uuidString)"
+    mkdir(dir, 0o755)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    body(dir)
+}
+
+private func writeFile(_ path: String, _ content: String) {
+    content.withCString { ptr in
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        write(fd, ptr, strlen(ptr))
+        close(fd)
+    }
+}
+
+@Test func bfsCrawlFindsBrokenLinks() {
+    withTempDir { root in
+        writeFile("\(root)/index.md", "[a](missing.md)")
+        let allFiles = discoverFiles(root: root)
+        let (_, broken) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(broken.count == 1)
+        #expect(broken[0].link == "missing.md")
+    }
+}
+
+@Test func bfsCrawlNoBrokenOnValidLinks() {
+    withTempDir { root in
+        writeFile("\(root)/index.md", "[a](other.md)")
+        writeFile("\(root)/other.md", "hello")
+        let allFiles = discoverFiles(root: root)
+        let (reachable, broken) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(broken.isEmpty)
+        #expect(reachable.count == 2)
+    }
+}
+
+@Test func bfsCrawlBasenameFallback() {
+    withTempDir { root in
+        mkdir("\(root)/docs", 0o755)
+        writeFile("\(root)/index.md", "[a](guide.md)")
+        writeFile("\(root)/docs/guide.md", "hello")
+        let allFiles = discoverFiles(root: root)
+        let (reachable, broken) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+        #expect(broken.isEmpty)
+        #expect(reachable.count == 2)
+    }
+}
+
+// MARK: - dirName
 
 @Test func dirNameOfFilePath() {
     #expect(dirName("/repo/docs/file.md") == "/repo/docs")
