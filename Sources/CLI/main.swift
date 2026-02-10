@@ -11,7 +11,7 @@ struct MdOrphan: ParsableCommand {
     @Argument(help: "One or more markdown entry points")
     var entryPoints: [String]
 
-    @Option(name: .long, help: "Exclude paths by prefix or glob (comma-separated, repeatable)")
+    @Option(name: .long, help: "Exclude paths by prefix or glob; * and ? don't cross / (comma-separated, repeatable)")
     var exclude: [String] = []
 
     @Flag(name: [.long, .customShort("v")], help: "Show success message when all files are reachable")
@@ -26,6 +26,14 @@ struct MdOrphan: ParsableCommand {
         }
 
         let excludePatterns = exclude.flatMap { $0.split(separator: ",").map(String.init) }
+        for p in excludePatterns {
+            if p.contains("**") {
+                throw ValidationError("--exclude: '**' globstar not supported; * matches within a single directory")
+            }
+            if p.contains("[") && !p.contains("]") {
+                throw ValidationError("--exclude: unclosed '[' in pattern '\(p)'")
+            }
+        }
         let root = dirName(resolvedEntries[0])
         let allFiles = discoverFiles(root: root, exclude: excludePatterns)
         let reachable = bfsCrawl(entryPaths: resolvedEntries, root: root)
