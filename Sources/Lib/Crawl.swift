@@ -74,18 +74,32 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 /// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
 public func bfsCrawl(
     entryPaths: [String],
-    root: String,
-    allFiles: [ino_t: String] = [:],
+    index: RepoIndex,
     options: CrawlOptions = .init(),
     cache: ExtractionCache = ExtractionCache(enabled: false)
 ) -> (reachable: Set<ino_t>, issues: [LinkIssue]) {
-    var state = CrawlState(root: root, allFiles: allFiles, options: options, cache: cache)
+    var state = CrawlState(entryIndex: index, options: options, cache: cache)
     state.seed(entryPaths)
     while let item = state.dequeue() {
         state.visit(item)
     }
     state.pruneCache()
     return (state.reachable, state.issues)
+}
+
+/// Convenience: walk the repo and crawl in one call. Equivalent to `indexRepo` + `bfsCrawl`.
+public func bfsCrawl(
+    entryPaths: [String],
+    root: String,
+    options: CrawlOptions = .init(),
+    cache: ExtractionCache = ExtractionCache(enabled: false)
+) -> (index: RepoIndex, reachable: Set<ino_t>, issues: [LinkIssue]) {
+    let projectIgnore = (try? loadProjectIgnore(root: root)) ?? []
+    let exclude = options.extraExcludes + projectIgnore
+    let idx = indexRepo(root: root, exclude: exclude, useDefaultExcludes: options.useDefaultExcludes)
+    let (reachable, issues) = bfsCrawl(entryPaths: entryPaths, index: idx,
+                                       options: options, cache: cache)
+    return (idx, reachable, issues)
 }
 
 // MARK: - CrawlState
@@ -112,34 +126,21 @@ struct CrawlState {
     var issues: [LinkIssue] = []
     var headingCache: [String: Set<String>] = [:]
 
-    init(root: String, allFiles: [ino_t: String], options: CrawlOptions, cache: ExtractionCache) {
-        // Resolve root to canonical (realpath). Mixing resolved/unresolved paths breaks prefix
-        // checks (e.g. macOS /var/folders → /private/var/folders symlink).
-        let resolved = realPath(root) ?? root
-        self.entryRoot = resolved
+    init(entryIndex: RepoIndex, options: CrawlOptions, cache: ExtractionCache) {
+        // entryIndex.root is already canonical (realpath'd inside indexRepo) — no further
+        // canonicalization needed here. Mixing resolved/unresolved paths breaks prefix checks
+        // (e.g. macOS /var/folders → /private/var/folders symlink).
+        self.entryRoot = entryIndex.root
+        self.entryIndex = entryIndex
         self.options = options
         self.cache = cache
-
-        // Entry-repo index: synthesize from `allFiles` (legacy/test path) or build fresh.
-        if !allFiles.isEmpty {
-            var byName: [String: [String]] = [:]
-            for (_, relPath) in allFiles {
-                byName[baseName(relPath), default: []].append(resolved + "/" + relPath)
-            }
-            self.entryIndex = RepoIndex(root: resolved, mdFiles: allFiles, byName: byName, exclude: [])
-        } else {
-            let projectIgnore = (try? loadProjectIgnore(root: resolved)) ?? []
-            let exclude = options.extraExcludes + projectIgnore
-            self.entryIndex = indexRepo(root: resolved, exclude: exclude,
-                                        useDefaultExcludes: options.useDefaultExcludes)
-        }
 
         var resolvedRepos: [String: String] = [:]
         for (name, raw) in options.repos {
             resolvedRepos[name] = realPath(raw) ?? raw
         }
         self.resolvedRepos = resolvedRepos
-        self.indices = [resolved: entryIndex]
+        self.indices = [entryIndex.root: entryIndex]
     }
 
     // MARK: - Queue control

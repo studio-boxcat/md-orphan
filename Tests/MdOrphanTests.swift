@@ -338,8 +338,7 @@ private func writeFile(_ path: String, _ content: String) {
     @Test func findsBrokenLinks() {
         withTempDir { root in
             writeFile("\(root)/index.md", "[a](missing.md)")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.count == 1)
             #expect(issues[0].link == "missing.md")
             #expect(issues[0].kind == .broken)
@@ -350,8 +349,7 @@ private func writeFile(_ path: String, _ content: String) {
         withTempDir { root in
             writeFile("\(root)/index.md", "[a](other.md)")
             writeFile("\(root)/other.md", "hello")
-            let allFiles = discoverFiles(root: root)
-            let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.isEmpty)
             #expect(reachable.count == 2)
         }
@@ -362,8 +360,7 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/docs", 0o755)
             writeFile("\(root)/index.md", "[a](guide.md)")
             writeFile("\(root)/docs/guide.md", "hello")
-            let allFiles = discoverFiles(root: root)
-            let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.isEmpty)
             #expect(reachable.count == 2)
         }
@@ -376,8 +373,7 @@ private func writeFile(_ path: String, _ content: String) {
             writeFile("\(root)/index.md", "[a](guide.md)")
             writeFile("\(root)/a/guide.md", "hello")
             writeFile("\(root)/b/guide.md", "hello")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.count == 1)
             #expect(issues[0].link == "guide.md")
             if case .ambiguous(let count) = issues[0].kind {
@@ -391,8 +387,7 @@ private func writeFile(_ path: String, _ content: String) {
     @Test func brokenNonMdLink() {
         withTempDir { root in
             writeFile("\(root)/index.md", "[img](photo.png)")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.count == 1)
             #expect(issues[0].link == "photo.png")
             #expect(issues[0].kind == .broken)
@@ -403,8 +398,7 @@ private func writeFile(_ path: String, _ content: String) {
         withTempDir { root in
             writeFile("\(root)/index.md", "[img](photo.png)")
             writeFile("\(root)/photo.png", "fake image data")
-            let allFiles = discoverFiles(root: root)
-            let (reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, reachable, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.isEmpty)
             // Non-.md files should not be in reachable set (only .md files are crawled)
             #expect(reachable.count == 1)
@@ -415,8 +409,7 @@ private func writeFile(_ path: String, _ content: String) {
         withTempDir { root in
             writeFile("\(root)/index.md", "[ref](other.md#missing-section)")
             writeFile("\(root)/other.md", "# Existing Section\n\nSome content")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.count == 1)
             if case .brokenAnchor(let frag) = issues[0].kind {
                 #expect(frag == "missing-section")
@@ -430,8 +423,7 @@ private func writeFile(_ path: String, _ content: String) {
         withTempDir { root in
             writeFile("\(root)/index.md", "[ref](other.md#existing-section)")
             writeFile("\(root)/other.md", "# Existing Section\n\nSome content")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.isEmpty)
         }
     }
@@ -440,8 +432,7 @@ private func writeFile(_ path: String, _ content: String) {
         withTempDir { root in
             writeFile("\(root)/index.md", "[[other.md#no-such-heading]]")
             writeFile("\(root)/other.md", "# Real Heading\n\nContent")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             #expect(issues.count == 1)
             if case .brokenAnchor(let frag) = issues[0].kind {
                 #expect(frag == "no-such-heading")
@@ -458,8 +449,7 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/docs/system", 0o755)
             writeFile("\(root)/docs/dev/index.md", "see [[../system/foo.md]]")
             writeFile("\(root)/docs/system/foo.md", "hi")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root)
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
             #expect(style.count == 1)
             if case .style(_, let suggested, _, _) = style[0].kind {
@@ -475,8 +465,7 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/docs", 0o755)
             writeFile("\(root)/index.md", "see [[docs/foo.md]]")
             writeFile("\(root)/docs/foo.md", "hi")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
             #expect(style.count == 1)
             if case .style(_, let suggested, _, _) = style[0].kind {
@@ -492,8 +481,7 @@ private func writeFile(_ path: String, _ content: String) {
             writeFile("\(root)/index.md", "see [[a/foo.md]] and [[b/foo.md]]")
             writeFile("\(root)/a/foo.md", "x")
             writeFile("\(root)/b/foo.md", "y")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root)
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
             #expect(style.isEmpty)
         }
@@ -504,8 +492,7 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/docs", 0o755)
             writeFile("\(root)/docs/index.md", "see [[foo.md]]")
             writeFile("\(root)/docs/foo.md", "hi")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/docs/index.md"], root: root)
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
             #expect(style.isEmpty)
         }
@@ -518,8 +505,7 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/docs/system", 0o755)
             writeFile("\(root)/docs/dev/index.md", "see [[../system/foo.md#bar|alias]]")
             writeFile("\(root)/docs/system/foo.md", "# Bar\n")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root)
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
             #expect(style.count == 1)
             if case .style(_, let suggested, let s, let e) = style[0].kind {
@@ -541,8 +527,7 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/docs/system", 0o755)
             writeFile("\(root)/docs/dev/index.md", "[x](../system/foo.md)")
             writeFile("\(root)/docs/system/foo.md", "hi")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root, allFiles: allFiles)
+            let (_, _, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root)
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
             #expect(style.isEmpty)
         }
@@ -553,9 +538,8 @@ private func writeFile(_ path: String, _ content: String) {
     @Test func crossRepoUnknownRepoFlagged() {
         withTempDir { root in
             writeFile("\(root)/index.md", "see `foo.md` (no-such-repo)")
-            let allFiles = discoverFiles(root: root)
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/index.md"], root: root,
                 options: CrawlOptions(repos: [:])
             )
             let unknowns = issues.filter { if case .unknownRepo = $0.kind { return true }; return false }
@@ -572,9 +556,8 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/b", 0o755)
             writeFile("\(root)/a/index.md", "see `missing.md` (b)")
             writeFile("\(root)/b/other.md", "")
-            let allFiles = discoverFiles(root: "\(root)/a")
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a",
                 options: CrawlOptions(repos: ["b": "\(root)/b"])
             )
             let broken = issues.filter { if case .crossRepoBroken = $0.kind { return true }; return false }
@@ -592,9 +575,8 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/b/docs", 0o755)
             writeFile("\(root)/a/index.md", "see `docs/foo.md` (b)")
             writeFile("\(root)/b/docs/foo.md", "# Foo")
-            let allFiles = discoverFiles(root: "\(root)/a")
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a",
                 options: CrawlOptions(repos: ["b": "\(root)/b"])
             )
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
@@ -617,9 +599,8 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/b/docs", 0o755)
             writeFile("\(root)/a/index.md", "see `../docs/foo.md` (b)")
             writeFile("\(root)/b/docs/foo.md", "")
-            let allFiles = discoverFiles(root: "\(root)/a")
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a",
                 options: CrawlOptions(repos: ["b": "\(root)/b"])
             )
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
@@ -636,9 +617,8 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/b", 0o755)
             writeFile("\(root)/a/index.md", "see `foo.md` (b)")
             writeFile("\(root)/b/foo.md", "")
-            let allFiles = discoverFiles(root: "\(root)/a")
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a",
                 options: CrawlOptions(repos: ["b": "\(root)/b"])
             )
             let style = issues.filter { if case .style = $0.kind { return true }; return false }
@@ -654,9 +634,8 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/b", 0o755)
             writeFile("\(root)/a/index.md", "see `page.md` (b)")
             writeFile("\(root)/b/page.md", "[here](missing.md)")
-            let allFiles = discoverFiles(root: "\(root)/a")
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a",
                 options: CrawlOptions(repos: ["b": "\(root)/b"])
             )
             let broken = issues.filter { $0.kind == .broken }
@@ -671,9 +650,8 @@ private func writeFile(_ path: String, _ content: String) {
             mkdir("\(root)/b", 0o755)
             writeFile("\(root)/a/index.md", "see `foo.md#missing-section` (b)")
             writeFile("\(root)/b/foo.md", "# Real Heading")
-            let allFiles = discoverFiles(root: "\(root)/a")
-            let (_, issues) = bfsCrawl(
-                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+            let (_, _, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a",
                 options: CrawlOptions(repos: ["b": "\(root)/b"])
             )
             let anchors = issues.filter { if case .brokenAnchor = $0.kind { return true }; return false }

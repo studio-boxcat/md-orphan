@@ -113,7 +113,6 @@ public struct ExtractedFile {
 public final class ExtractionCache {
     private var caches: [String: LinkCache] = [:]      // canonical root → cache
     private var dirty: Set<String> = []                 // canonical roots needing save
-    private var displayNames: [String: String] = [:]   // canonical root → display name
     public var enabled: Bool
 
     public init(enabled: Bool = true) {
@@ -180,10 +179,6 @@ public final class ExtractionCache {
         dirty.insert(canonicalRoot)
     }
 
-    public func registerDisplayName(_ name: String, for canonicalRoot: String) {
-        displayNames[canonicalRoot] = name
-    }
-
     public func save() {
         guard enabled else { return }
         for root in dirty {
@@ -195,8 +190,7 @@ public final class ExtractionCache {
 
     private func ensureLoaded(canonicalRoot: String) -> LinkCache {
         if let existing = caches[canonicalRoot] { return existing }
-        let display = displayNames[canonicalRoot] ?? baseName(canonicalRoot)
-        let cache = loadLinkCache(canonicalRoot: canonicalRoot, displayName: display)
+        let cache = loadLinkCache(canonicalRoot: canonicalRoot, displayName: baseName(canonicalRoot))
         caches[canonicalRoot] = cache
         return cache
     }

@@ -65,24 +65,19 @@ struct MdOrphan: ParsableCommand {
         catch let e as ConfigError { throw ValidationError("\(e)") }
 
         let root = dirName(resolvedEntries[0])
-        let projectIgnore = (try? loadProjectIgnore(root: root)) ?? []
-        let layeredExclude = excludePatterns + projectIgnore
-        let effective = noDefaultExcludes ? layeredExclude : (defaultExcludes + layeredExclude)
-        let allFiles = discoverFiles(root: root, exclude: effective)
-
         let crawlOptions = CrawlOptions(
             repos: globalConfig.repos,
             useDefaultExcludes: !noDefaultExcludes,
             extraExcludes: excludePatterns
         )
         let cache = ExtractionCache(enabled: !noCache)
-        let (reachable, issues) = bfsCrawl(
+        let (entryIndex, reachable, issues) = bfsCrawl(
             entryPaths: resolvedEntries, root: root,
-            allFiles: allFiles, options: crawlOptions, cache: cache
+            options: crawlOptions, cache: cache
         )
         defer { cache.save() }
 
-        let orphans = allFiles
+        let orphans = entryIndex.mdFiles
             .filter { !reachable.contains($0.key) }
             .map(\.value)
             .sorted()
@@ -182,7 +177,7 @@ struct MdOrphan: ParsableCommand {
         if failed {
             throw ExitCode(1)
         } else if verbose {
-            print("\u{2705} All \(allFiles.count) markdown files are reachable from \(names)")
+            print("\u{2705} All \(entryIndex.mdFiles.count) markdown files are reachable from \(names)")
         }
     }
 }
