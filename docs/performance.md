@@ -49,6 +49,14 @@ Where the cache earns its keep:
 
 Disable with `--no-cache` to skip cache machinery entirely.
 
+## Parallel cross-repo discovery
+
+When the entry files reference cross-repo targets, those repos are indexed in parallel via `DispatchQueue.concurrentPerform`. Wall-clock cost for N referenced repos is `max(walk_time)` instead of `sum(walk_time)`.
+
+The prefetch only walks repos actually referenced from the seeded entry files (not every configured repo) — reading entry files in `CrawlState.seed`, extracting cross-repo names, then dispatching. Transitively-discovered cross-repos (referenced from a cross-repo file rather than the entry) fall back to lazy serial via `indexFor`; this is the rare path.
+
+For projects with no cross-repo refs, prescan finds zero targets and no parallel walks run — same wall clock as the single-repo case.
+
 ## What dominates
 
 1. **Per-file `String` allocations during the walk** — was the original 810 ms regression. Fixed in `Discovery.swift` by skipping non-`.md` `String(cString:)`/`dropFirst` work before allocation. 810 ms → 540 ms.

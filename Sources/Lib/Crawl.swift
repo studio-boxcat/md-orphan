@@ -155,6 +155,38 @@ struct CrawlState {
             queuedEntryPaths.insert(c)
             queue.append(BfsQueueItem(path: c, repoRoot: entryRoot, isEntryRepo: true))
         }
+        prefetchReferencedRepos()
+    }
+
+    /// Walk the seeded entry files once to discover cross-repo target names, then parallel-index
+    /// those repos. The entry files' extracted data is cached for reuse by `visit`. This handles
+    /// the common case (cross-repo refs from top-level docs) without paying for unreferenced
+    /// configured repos. Transitively-discovered cross-repos (referenced from a cross-repo file)
+    /// fall back to lazy serial via `indexFor`.
+    private mutating func prefetchReferencedRepos() {
+        var targets = Set<String>()
+        for item in queue where item.isEntryRepo {
+            guard let result = cache.read(filePath: item.path, repoRoot: item.repoRoot) else { continue }
+            for link in result.links {
+                if case .crossRepo(let name) = link.kind, let root = resolvedRepos[name] {
+                    targets.insert(root)
+                }
+            }
+        }
+        let toIndex = Array(targets.subtracting([entryRoot]))
+        guard !toIndex.isEmpty else { return }
+
+        var prefetched: [String: RepoIndex] = [:]
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: toIndex.count) { i in
+            let root = toIndex[i]
+            let projectIgnore = (try? loadProjectIgnore(root: root)) ?? []
+            let exclude = options.extraExcludes + projectIgnore
+            let idx = indexRepo(root: root, exclude: exclude,
+                                useDefaultExcludes: options.useDefaultExcludes)
+            lock.lock(); prefetched[root] = idx; lock.unlock()
+        }
+        for (root, idx) in prefetched { indices[root] = idx }
     }
 
     mutating func dequeue() -> BfsQueueItem? {

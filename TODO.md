@@ -22,9 +22,6 @@ Hooks already in place: `indexRepo(includeAllExtensions: true)` produces a compl
 ### Possible: directory-level mtime cache
 Currently the fts walk runs on every invocation. If profiling shows it dominating runtime in large monorepos with dense ignore lists already applied, we can layer a per-directory mtime cache (skip `readdir` for unchanged dirs, still stat each dir). Defer until profiling justifies it.
 
-### Possible: parallel cross-repo discovery
-Cross-repo crawls walk each referenced repo serially. If we routinely span 5+ repos, parallelizing the initial `indexRepo` calls (one per cross-repo target) could cut wall-clock noticeably. Trivial via `DispatchGroup` or Swift Concurrency.
-
 ### Concurrent invocation safety
 Cache writes are last-writer-wins. If users start running two `md-orphan` invocations against the same repo simultaneously (e.g. editor save hooks + lefthook), consider `flock(2)` on the cache file. So far accepted as last-writer-wins because cache is regenerable.
 
