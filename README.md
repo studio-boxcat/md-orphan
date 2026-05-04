@@ -40,6 +40,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 | `--config <path>` | Override global config (default `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`) |
 | `--no-default-excludes` | Disable built-in defaults (`.git`, `node_modules`, `Library`, `.build`, ...) |
 | `--no-cache` | Disable the per-file extraction cache |
+| `--claude` | Print full path + contents of nearest `CLAUDE.md` (walks up from cwd) |
 
 ## Link styles
 
@@ -114,7 +115,7 @@ Per-file extraction (links + headings) is cached at `$XDG_CONFIG_HOME/md-orphan/
 
 **Validation**: `(mtime_ns, size, fnv1a64(content))` must all match the on-disk file before a cache entry is reused. Mismatch → re-extract + update.
 
-**Robustness**: schema + parser version fields invalidate cache on format change; atomic writes (tmp + fsync + rename via Foundation's `Data.write(.atomic)`); load errors silently fall through to fresh extraction; entries for files no longer in the repo are auto-pruned each run.
+**Robustness**: a single `cacheSchemaVersion` field invalidates cache on any format or parser change; atomic writes (tmp + rename via Foundation's `Data.write(.atomic)`); load errors silently fall through to fresh extraction; entries for files no longer in the repo are auto-pruned each run.
 
 **Concurrency**: last-writer-wins on concurrent invocations. Cache is regenerable, so corruption is non-fatal — a corrupted file is treated as a miss and overwritten on next run.
 
@@ -135,7 +136,7 @@ Disable with `--no-cache`.
 
 ## Algorithm
 
-1. **Discover** — fts walk under the entry root. `.md` files keyed by inode for orphan reachability; all extensions enter the basename map for style/uniqueness checks.
+1. **Discover** — fts walk under the entry root. `.md` files keyed by inode for orphan reachability; `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is currently off by default — see [[TODO.md]].)
 2. **Crawl** — BFS from entry points. For each visited file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo and recursive crawl. Two visited sets: inodes (entry repo) and canonical paths (cross-repo).
 3. **Diff** — Files in the entry-repo `.md` set whose inodes are not in `reachable` are orphans.
 
@@ -156,4 +157,4 @@ Notes:
 
 - The fts walk dominates. Default excludes (`Library/`, `Pods/`, `node_modules/`, `.build/`, ...) cut the file count drastically — disabling them via `--no-default-excludes` doubles total runtime.
 - `indexRepo` keeps `byName` `.md`-only by default. Adding all extensions costs ~800ms on a Unity-sized repo, so wiki/cross-repo style for non-`.md` files (e.g. `[[RecordingEnv.cs]]`) is currently not flagged. Tracked in [[TODO.md]].
-- The per-file extraction cache exists and is correct (mtime + size + fnv1a64 content hash, atomic writes, parser-version invalidation), but on this workload it's ≈break-even because extraction itself is only 10ms total. Disable with `--no-cache`. It will become useful on much larger doc trees.
+- The per-file extraction cache exists and is correct (mtime + size + fnv1a64 content hash, atomic writes, schema-version invalidation), but on this workload it's ≈break-even because extraction itself is only 10ms total. Disable with `--no-cache`. It will become useful on much larger doc trees.

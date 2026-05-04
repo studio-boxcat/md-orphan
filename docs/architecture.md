@@ -44,7 +44,7 @@ Why `Util.swift` (not `Discovery.swift`) for `realPath`/`dirName`/`baseName`/`is
 Two real consumers, ranked by surface area needed:
 
 1. **CLI (`Sources/CLI/main.swift`)** — drives the whole pipeline. Calls `loadGlobalConfig`, `bfsCrawl(entryPoints:, root:)`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.pathStart..<Link.pathEnd`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
-2. **Tests (`Tests/MdOrphanTests.swift`, 96 tests)** — uses `@testable import` and asserts on the internal extractors (`extractLinks`, `extractHeadings`), the resolver (`resolveLink`), exclusion matching (`isExcluded`), the BFS results, the cache round-trip, and a few config helpers (`expandPath`, `loadProjectIgnore`).
+2. **Tests (`Tests/MdOrphanTests.swift`, 98 tests)** — uses `@testable import` and asserts on the internal extractors (`extractLinks`, `extractHeadings`), the resolver (`resolveLink`), exclusion matching (`isExcluded`), the BFS results, the cache disk round-trip, and a few config helpers (`expandPath`, `loadProjectIgnore`).
 
 No other consumers. No plugin story, no library users at the moment.
 
@@ -144,7 +144,6 @@ These bugs were paid for during Phase 1; the structure must keep them out:
 
 ## References
 
-- [Phase 1 plan-agent review notes (in conversation history)]
 - [mlc — closest-scale peer](https://github.com/becheran/mlc/tree/master/src)
 - [awesome_bot — flat lib/ at ~1.5k LOC](https://github.com/dkhamsing/awesome_bot/tree/master/lib/awesome_bot)
 - [markdown-link-check — coordination in <300 LOC](https://github.com/tcort/markdown-link-check/blob/master/index.js)
