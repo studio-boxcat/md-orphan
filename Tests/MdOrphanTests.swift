@@ -310,6 +310,23 @@ private func targetsAndFragments(_ s: String) -> [(String, String?)] {
     #expect(!isExcluded("assets/localizer/top.md", by: ["assets/localizer/*/"]))
 }
 
+// Bare-basename trailing-slash patterns match at any depth (gitignore semantics).
+@Test func bareBasenameMatchesAtAnyDepth() {
+    #expect(isExcluded("Pods/Firebase/README.md", by: ["Pods/"]))            // root
+    #expect(isExcluded("proj-ios/Pods/Firebase/README.md", by: ["Pods/"]))   // nested
+    #expect(isExcluded("a/b/c/Pods/x.md", by: ["Pods/"]))                    // deeply nested
+    #expect(isExcluded("Pods", by: ["Pods/"]))                               // bare match
+    #expect(isExcluded("a/b/Pods", by: ["Pods/"]))                           // trailing match
+    #expect(!isExcluded("PodsExtra/x.md", by: ["Pods/"]))                    // partial-name false match
+    #expect(!isExcluded("a/PodsExtra/x.md", by: ["Pods/"]))                  // nested false match
+}
+
+// Path-anchored trailing-slash patterns stay root-only.
+@Test func pathAnchoredTrailingSlashStaysRootOnly() {
+    #expect(isExcluded("docs/draft/x.md", by: ["docs/draft/"]))
+    #expect(!isExcluded("a/docs/draft/x.md", by: ["docs/draft/"]))
+}
+
 @Test func mixesPrefixAndGlob() {
     #expect(isExcluded("Library/foo.md", by: ["Library", "docs/draft-*.md"]))
     #expect(isExcluded("docs/draft-intro.md", by: ["Library", "docs/draft-*.md"]))
@@ -772,6 +789,16 @@ private func writeFile(_ path: String, _ content: String) {
     defer { try? FileManager.default.removeItem(atPath: dir) }
     let patterns = try loadProjectIgnore(root: dir)
     #expect(patterns.isEmpty)
+}
+
+@Test func projectIgnoreExistsDistinguishesAbsentFromEmpty() throws {
+    let dir = NSTemporaryDirectory() + "md-orphan-exists-\(UUID().uuidString)"
+    mkdir(dir, 0o755)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    #expect(!projectIgnoreExists(root: dir))                       // absent
+    try "".write(toFile: dir + "/.md-orphan", atomically: true, encoding: .utf8)
+    #expect(projectIgnoreExists(root: dir))                        // empty file still counts
 }
 
 // MARK: - cache

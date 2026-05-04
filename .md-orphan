@@ -1,0 +1,2 @@
+# md-orphan: defaults (.git, .build, etc.) cover everything; no project-specific
+# excludes needed. This file exists because md-orphan now requires one.

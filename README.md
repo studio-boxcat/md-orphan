@@ -98,16 +98,28 @@ The crawl follows cross-repo `.md` targets recursively — links inside those fi
 
 ## Per-repo ignore (`.md-orphan`)
 
-Place a `.md-orphan` file at any repo root to add ignore patterns specific to that repo. Loaded automatically for the entry repo and every cross-repo target visited during recursion.
+**Required.** Every entry repo must have a `.md-orphan` file at its root listing project-specific ignore patterns. Running md-orphan against a repo without one exits 1 with a clear error message. If you have nothing to add beyond the built-in defaults, an empty file (`touch .md-orphan`) satisfies the requirement.
+
+Loaded automatically for the entry repo and every cross-repo target visited during recursion. Cross-repo targets without their own `.md-orphan` fall back to defaults only — no hard-fail on cross-repo absence.
 
 ```
 # Comments and blank lines are ignored.
-Library/
+Pods/                       # bare basename — matches at ANY depth (proj-ios/Pods/ etc.)
+Packages/
 docs/draft-*.md
-proj-ios/Pods
+docs/internal/              # path-anchored — only matches at root
 ```
 
-Pattern syntax matches `--exclude`: prefix match by default, glob with `*` / `?` / `[…]` (does not cross `/`), trailing `/` for dir-prefix. No negation (use `--exclude` to add patterns from the CLI). Built-in defaults (`.git`, `.svn`, `.hg`, `node_modules`, `.build`, `DerivedData`, `Library`, `Pods`, `target`, `vendor`, `.venv`, `__pycache__`) apply on top — disable with `--no-default-excludes`.
+Pattern syntax (gitignore-flavored):
+
+- Trailing `/` makes it a directory pattern.
+- **Bare basename + trailing `/`** (`Pods/`, `Library/`) — matches that directory **at any depth** in the tree.
+- **Path-containing + trailing `/`** (`docs/internal/`) — anchored at the repo root.
+- Patterns with `*`, `?`, `[…]` are matched as `fnmatch(3)` globs (PATHNAME mode — `*` doesn't cross `/`).
+- Plain patterns (no `/`, no glob) match as path prefix at root.
+- No negation. Use CLI `--exclude` to add CLI-time patterns.
+
+Built-in defaults (`.git`, `.svn`, `.hg`, `node_modules`, `.build`, `DerivedData`, `Library`, `Pods`, `target`, `vendor`, `.venv`, `__pycache__`) apply on top and use the same nested-matching semantics. Disable with `--no-default-excludes`.
 
 ## Cache
 

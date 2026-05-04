@@ -23,9 +23,13 @@ public func baseName(_ path: String) -> String {
 }
 
 /// Check if a relative path matches any exclude pattern.
-/// Plain patterns match as path prefix (e.g. "Library" matches "Library/foo/bar.md").
-/// Trailing "/" treats pattern as directory prefix (e.g. "assets/loc/*/" matches everything under matching dirs).
-/// Patterns with *, ?, [ are matched as globs via fnmatch(3).
+///
+/// Pattern semantics (gitignore-flavored):
+/// - Trailing `/` makes it a directory pattern (`Library/`, `Pods/`).
+///   - Bare basename (no `/` in middle, e.g. `Library/`) matches at ANY depth.
+///   - Path-containing (`assets/loc/`) is anchored at root.
+/// - Patterns with `*`, `?`, `[` are matched as globs via `fnmatch(3)` (PATHNAME mode — `*` doesn't cross `/`).
+/// - Plain patterns without trailing `/` match as path prefix at root (`Library` matches `Library/foo`).
 public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
     func isGlob(_ s: String) -> Bool { s.contains("*") || s.contains("?") || s.contains("[") }
     for pattern in patterns {
@@ -38,7 +42,15 @@ public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
                     let dir = parts[..<depth].joined(separator: "/")
                     if fnmatch(prefix, dir, FNM_PATHNAME) == 0 { return true }
                 }
+            } else if !prefix.contains("/") {
+                // Bare basename — match anywhere in tree (gitignore semantics).
+                // Equivalent to scanning `relPath`'s segments for an exact match.
+                if relPath == prefix { return true }
+                if relPath.hasPrefix(prefix + "/") { return true }
+                if relPath.contains("/" + prefix + "/") { return true }
+                if relPath.hasSuffix("/" + prefix) { return true }
             } else {
+                // Path-anchored at root.
                 if relPath.hasPrefix(pattern) { return true }
             }
         } else if isGlob(pattern) {

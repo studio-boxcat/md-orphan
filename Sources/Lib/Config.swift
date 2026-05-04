@@ -132,8 +132,14 @@ public let defaultExcludes: [String] = [
     "__pycache__/",
 ]
 
+/// Returns true iff `<root>/.md-orphan` exists.
+public func projectIgnoreExists(root: String) -> Bool {
+    FileManager.default.fileExists(atPath: root + "/.md-orphan")
+}
+
 /// Read `<root>/.md-orphan`, return one pattern per line. `#` line-comments and blanks ignored.
 /// Returns empty array if the file doesn't exist. Throws on read error.
+/// Callers that require the file (e.g. CLI on entry repo) should check `projectIgnoreExists` first.
 public func loadProjectIgnore(root: String) throws -> [String] {
     let path = root + "/.md-orphan"
     guard FileManager.default.fileExists(atPath: path) else { return [] }

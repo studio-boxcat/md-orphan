@@ -65,6 +65,16 @@ struct MdOrphan: ParsableCommand {
         catch let e as ConfigError { throw ValidationError("\(e)") }
 
         let root = dirName(resolvedEntries[0])
+        guard projectIgnoreExists(root: root) else {
+            throw ValidationError(
+                "\(root)/.md-orphan: missing\n" +
+                "Every md-orphan-checked repo needs a `.md-orphan` file at its root listing project-specific\n" +
+                "ignore patterns (gitignore-style line patterns). Built-in defaults handle .git, node_modules,\n" +
+                "Library, Pods, etc., but project-specific dirs (Unity Packages, vendored docs, build outputs)\n" +
+                "must be enumerated explicitly. Create the file with `touch \(root)/.md-orphan` if you have\n" +
+                "no extras."
+            )
+        }
         let crawlOptions = CrawlOptions(
             repos: globalConfig.repos,
             useDefaultExcludes: !noDefaultExcludes,
