@@ -5,164 +5,168 @@ import Testing
 // MARK: - extractLinks
 
 @Test func extractsStandardLink() {
-    let links = extractLinks(from: "See [guide](docs/guide.md) for details")
+    let links = extractLinks(from: "See [guide](docs/guide.md) for details").map(\.target)
     #expect(links == ["docs/guide.md"])
 }
 
 @Test func extractsMultipleLinks() {
-    let links = extractLinks(from: "[a](one.md) text [b](two.md)")
+    let links = extractLinks(from: "[a](one.md) text [b](two.md)").map(\.target)
     #expect(links == ["one.md", "two.md"])
 }
 
 @Test func stripsFragment() {
-    let links = extractLinks(from: "[ref](page.md#section)")
+    let links = extractLinks(from: "[ref](page.md#section)").map(\.target)
     #expect(links == ["page.md"])
 }
 
 @Test func handlesRelativeDot() {
-    let links = extractLinks(from: "[x](./local.md)")
+    let links = extractLinks(from: "[x](./local.md)").map(\.target)
     #expect(links == ["./local.md"])
 }
 
 @Test func handlesParentTraversal() {
-    let links = extractLinks(from: "[x](../other/file.md)")
+    let links = extractLinks(from: "[x](../other/file.md)").map(\.target)
     #expect(links == ["../other/file.md"])
 }
 
 @Test func skipsHttpUrls() {
-    let links = extractLinks(from: "[site](https://example.com/page.md)")
+    let links = extractLinks(from: "[site](https://example.com/page.md)").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func skipsHttpUrls2() {
-    let links = extractLinks(from: "[site](http://example.com/page.md)")
+    let links = extractLinks(from: "[site](http://example.com/page.md)").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func extractsNonMarkdownLinks() {
-    let links = extractLinks(from: "[img](photo.png) [script](app.ts)")
+    let links = extractLinks(from: "[img](photo.png) [script](app.ts)").map(\.target)
     #expect(links == ["photo.png", "app.ts"])
 }
 
 @Test func skipsHtmlTags() {
-    let links = extractLinks(from: "<a href=\"page.md\">link</a>")
+    let links = extractLinks(from: "<a href=\"page.md\">link</a>").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func handlesEmptyInput() {
-    let links = extractLinks(from: "")
+    let links = extractLinks(from: "").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func handlesNoLinks() {
-    let links = extractLinks(from: "Just some plain text without any links.")
+    let links = extractLinks(from: "Just some plain text without any links.").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func handlesMultipleFragments() {
     // Only the first # counts
-    let links = extractLinks(from: "[x](page.md#one#two)")
+    let links = extractLinks(from: "[x](page.md#one#two)").map(\.target)
     #expect(links == ["page.md"])
 }
 
 @Test func skipsLinkSpanningLines() {
-    let links = extractLinks(from: "[text](broken\nlink.md)")
+    let links = extractLinks(from: "[text](broken\nlink.md)").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func handlesAdjacentLinks() {
-    let links = extractLinks(from: "[a](a.md)[b](b.md)")
+    let links = extractLinks(from: "[a](a.md)[b](b.md)").map(\.target)
     #expect(links == ["a.md", "b.md"])
 }
 
 @Test func skipsShortPaths() {
     // ".md" has no filename before the extension
-    let links = extractLinks(from: "[x](.md)")
+    let links = extractLinks(from: "[x](.md)").map(\.target)
     #expect(links.isEmpty)
 }
 
 // MARK: - extractLinks (wiki links)
 
 @Test func extractsWikiLink() {
-    let links = extractLinks(from: "See [[guide.md]] for details")
+    let links = extractLinks(from: "See [[guide.md]] for details").map(\.target)
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithAlias() {
-    let links = extractLinks(from: "See [[guide.md|the guide]] for details")
+    let links = extractLinks(from: "See [[guide.md|the guide]] for details").map(\.target)
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithFragment() {
-    let links = extractLinks(from: "See [[guide.md#section]] here")
+    let links = extractLinks(from: "See [[guide.md#section]] here").map(\.target)
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithFragmentAndAlias() {
-    let links = extractLinks(from: "See [[guide.md#section|display]] here")
+    let links = extractLinks(from: "See [[guide.md#section|display]] here").map(\.target)
     #expect(links == ["guide.md"])
 }
 
 @Test func extractsWikiLinkWithPath() {
-    let links = extractLinks(from: "See [[docs/guide.md]] for details")
+    let links = extractLinks(from: "See [[docs/guide.md]] for details").map(\.target)
     #expect(links == ["docs/guide.md"])
 }
 
 @Test func skipsWikiLinkWithoutExtension() {
-    let links = extractLinks(from: "See [[guide]] here")
+    let links = extractLinks(from: "See [[guide]] here").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func extractsWikiLinkToNonMd() {
-    let links = extractLinks(from: "See [[image.png]] here")
+    let links = extractLinks(from: "See [[image.png]] here").map(\.target)
     #expect(links == ["image.png"])
 }
 
 @Test func extractsMixedLinks() {
-    let links = extractLinks(from: "[[wiki.md]] and [standard](standard.md)")
+    let links = extractLinks(from: "[[wiki.md]] and [standard](standard.md)").map(\.target)
     #expect(links == ["wiki.md", "standard.md"])
 }
 
 @Test func skipsEmptyWikiLink() {
-    let links = extractLinks(from: "See [[]] here")
+    let links = extractLinks(from: "See [[]] here").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func skipsWikiLinkSpanningLines() {
-    let links = extractLinks(from: "See [[broken\nlink]] here")
+    let links = extractLinks(from: "See [[broken\nlink]] here").map(\.target)
     #expect(links.isEmpty)
 }
 
 @Test func extractsAdjacentWikiLinks() {
-    let links = extractLinks(from: "[[one.md]][[two.md]]")
+    let links = extractLinks(from: "[[one.md]][[two.md]]").map(\.target)
     #expect(links == ["one.md", "two.md"])
 }
 
-// MARK: - extractLinksWithFragments
+// MARK: - Link.fragment extraction
+
+private func targetsAndFragments(_ s: String) -> [(String, String?)] {
+    extractLinks(from: s).map { ($0.target, $0.fragment) }
+}
 
 @Test func fragmentFromStandardLink() {
-    let links = extractLinksWithFragments(from: "[ref](page.md#section)")
-    #expect(links == [MdLink(path: "page.md", fragment: "section")])
+    let pairs = targetsAndFragments("[ref](page.md#section)")
+    #expect(pairs.count == 1 && pairs[0] == ("page.md", "section"))
 }
 
 @Test func fragmentFromWikiLink() {
-    let links = extractLinksWithFragments(from: "[[guide.md#core-classes]]")
-    #expect(links == [MdLink(path: "guide.md", fragment: "core-classes")])
+    let pairs = targetsAndFragments("[[guide.md#core-classes]]")
+    #expect(pairs.count == 1 && pairs[0] == ("guide.md", "core-classes"))
 }
 
 @Test func wikiLinkFragmentWithAlias() {
-    let links = extractLinksWithFragments(from: "[[guide.md#section|display]]")
-    #expect(links == [MdLink(path: "guide.md", fragment: "section")])
+    let pairs = targetsAndFragments("[[guide.md#section|display]]")
+    #expect(pairs.count == 1 && pairs[0] == ("guide.md", "section"))
 }
 
 @Test func noFragmentWhenAbsent() {
-    let links = extractLinksWithFragments(from: "[ref](page.md)")
-    #expect(links == [MdLink(path: "page.md", fragment: nil)])
+    let pairs = targetsAndFragments("[ref](page.md)")
+    #expect(pairs.count == 1 && pairs[0] == ("page.md", nil))
 }
 
 @Test func emptyFragmentTreatedAsNone() {
-    let links = extractLinksWithFragments(from: "[ref](page.md#)")
-    #expect(links == [MdLink(path: "page.md", fragment: nil)])
+    let pairs = targetsAndFragments("[ref](page.md#)")
+    #expect(pairs.count == 1 && pairs[0] == ("page.md", nil))
 }
 
 // MARK: - extractHeadings
@@ -692,7 +696,7 @@ private func writeFile(_ path: String, _ content: String) {
 
         Outside again: [[other.md]]
         """
-        let paths = extractLinks(from: src)
+        let paths = extractLinks(from: src).map(\.target)
         #expect(paths == ["real.md", "other.md"])
     }
 
@@ -700,7 +704,7 @@ private func writeFile(_ path: String, _ content: String) {
         // Regression: a row mixing double-backtick code spans and a wiki link.
         // The backtick scanner must not eat past the [[ marker.
         let src = "| Inline code | `` `path.ext` `` (no repo) | see [[TODO.md]] |"
-        let paths = extractLinks(from: src)
+        let paths = extractLinks(from: src).map(\.target)
         #expect(paths == ["TODO.md"])
     }
 }
@@ -800,7 +804,7 @@ extension BfsCrawlTests {
     guard let result = cache.read(filePath: canonicalPath, repoRoot: canonicalDir) else {
         Issue.record("read after change failed"); return
     }
-    #expect(result.links.map(\.path) == ["b.md", "c.md"])
+    #expect(result.links.map(\.target) == ["b.md", "c.md"])
 }
 
 @Test func cacheFilePathHashesCanonicalRoot() {
@@ -852,7 +856,7 @@ func benchmarkMeowTower() {
     for path in idx.mdFiles.values {
         let abs = idx.root + "/" + path
         guard let (_, buf) = readFile(path: abs) else { continue }
-        totalLinks += extractLinksDetailed(buf).count
+        totalLinks += extractLinks(buf).count
         totalHeadings += extractHeadings(buf).count
     }
     print("read+extract \(idx.mdFiles.count) md: \(String(format: "%.3f", Date().timeIntervalSince(t0)))s | links=\(totalLinks) headings=\(totalHeadings)")

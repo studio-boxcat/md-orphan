@@ -168,29 +168,25 @@ private func decodeUTF8(_ base: UnsafePointer<UInt8>, from: Int, len: Int) -> St
     String(decoding: UnsafeBufferPointer(start: base + from, count: len), as: UTF8.self)
 }
 
-public struct MdLink: Equatable {
-    public let path: String
+/// One link extracted from markdown. Carries enough byte-offset info to feed the cache layer
+/// and `--fix` byte rewriter without a separate "cached" or "detailed" variant.
+public struct Link: Codable, Equatable {
+    public enum Kind: Codable, Equatable {
+        case wiki                       // [[target]]
+        case standard                   // [text](target)
+        case crossRepo(repo: String)    // `target` (repo)
+    }
+
+    public let kind: Kind
+    public let target: String   // path before fragment / alias
     public let fragment: String?
-}
+    public let pathStart: Int   // byte offset of `target` start in source
+    public let pathEnd: Int     // exclusive
 
-public enum LinkKind: Equatable {
-    case wiki                  // [[path]]
-    case standard              // [text](path)
-    case crossRepo(String)     // `path` (repo-name)
-}
-
-/// Link with byte positions for in-place rewriting (used by the cache layer too).
-public struct MdLinkDetail: Equatable {
-    public let path: String
-    public let fragment: String?
-    public let kind: LinkKind
-    public let pathStart: Int  // byte offset of path start in source
-    public let pathEnd: Int    // byte offset of path end (exclusive)
-
-    public init(path: String, fragment: String?, kind: LinkKind, pathStart: Int, pathEnd: Int) {
-        self.path = path
-        self.fragment = fragment
+    public init(kind: Kind, target: String, fragment: String?, pathStart: Int, pathEnd: Int) {
         self.kind = kind
+        self.target = target
+        self.fragment = fragment
         self.pathStart = pathStart
         self.pathEnd = pathEnd
     }
@@ -198,18 +194,10 @@ public struct MdLinkDetail: Equatable {
 
 /// Scan raw UTF-8 bytes for markdown links to local files.
 /// Manual byte scan — Swift Regex is 28-33x slower: https://forums.swift.org/t/slow-regex-performance/75768
-public func extractLinksWithFragments(_ buf: UnsafeBufferPointer<UInt8>) -> [MdLink] {
-    extractLinksDetailed(buf).map { MdLink(path: $0.path, fragment: $0.fragment) }
-}
-
-public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
-    extractLinksDetailed(buf).map(\.path)
-}
-
-public func extractLinksDetailed(_ buf: UnsafeBufferPointer<UInt8>) -> [MdLinkDetail] {
+public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [Link] {
     guard let base = buf.baseAddress, buf.count > 4 else { return [] }
     let count = buf.count
-    var links: [MdLinkDetail] = []
+    var links: [Link] = []
     var i = 0
     var inFence = false
 
@@ -253,7 +241,7 @@ public func extractLinksDetailed(_ buf: UnsafeBufferPointer<UInt8>) -> [MdLinkDe
 
 /// Parse [[page]], [[page|alias]], [[page#section]] wiki links.
 private func scanWikiLink(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLinkDetail]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [Link]
 ) -> Int {
     let start = i + 2
     var end = start
@@ -288,10 +276,10 @@ private func scanWikiLink(
         let fragLen = fragEnd - hashPos - 1
         if fragLen > 0 { fragment = decodeUTF8(base, from: hashPos + 1, len: fragLen) }
     }
-    links.append(MdLinkDetail(
-        path: decodeUTF8(base, from: start, len: nameLen),
-        fragment: fragment,
+    links.append(Link(
         kind: .wiki,
+        target: decodeUTF8(base, from: start, len: nameLen),
+        fragment: fragment,
         pathStart: start,
         pathEnd: nameEnd
     ))
@@ -300,7 +288,7 @@ private func scanWikiLink(
 
 /// Parse [text](path.md#fragment) standard links.
 private func scanStandardLink(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLinkDetail]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [Link]
 ) -> Int {
     let start = i + 2
     var end = start
@@ -328,10 +316,10 @@ private func scanStandardLink(
         let fragLen = end - fragPos - 1
         if fragLen > 0 { fragment = decodeUTF8(base, from: fragPos + 1, len: fragLen) }
     }
-    links.append(MdLinkDetail(
-        path: decodeUTF8(base, from: start, len: pathLen),
-        fragment: fragment,
+    links.append(Link(
         kind: .standard,
+        target: decodeUTF8(base, from: start, len: pathLen),
+        fragment: fragment,
         pathStart: start,
         pathEnd: pathEnd
     ))
@@ -342,7 +330,7 @@ private func scanStandardLink(
 /// Recognizes `path.ext` (repo) and `path.ext#fragment` (repo).
 /// Bare `path.ext` without trailing ` (repo)` is currently ignored (inline-code style is deferred).
 private func scanBacktickRef(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLinkDetail]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [Link]
 ) -> Int {
     // Skip multi-backtick spans (``foo``, ```bar```) — only single-backtick code spans handled.
     if i + 1 < count && base[i + 1] == 0x60 { return i + 1 }
@@ -393,10 +381,10 @@ private func scanBacktickRef(
         if fragLen > 0 { fragment = decodeUTF8(base, from: hashPos + 1, len: fragLen) }
     }
     let repo = decodeUTF8(base, from: repoStart, len: repoEnd - repoStart)
-    links.append(MdLinkDetail(
-        path: decodeUTF8(base, from: pathStart, len: nameLen),
+    links.append(Link(
+        kind: .crossRepo(repo: repo),
+        target: decodeUTF8(base, from: pathStart, len: nameLen),
         fragment: fragment,
-        kind: .crossRepo(repo),
         pathStart: pathStart,
         pathEnd: nameEnd
     ))
@@ -404,15 +392,9 @@ private func scanBacktickRef(
 }
 
 /// Convenience: extract links from a String.
-public func extractLinks(from string: String) -> [String] {
+public func extractLinks(from string: String) -> [Link] {
     var str = string
     return str.withUTF8 { extractLinks($0) }
-}
-
-/// Convenience: extract links with fragments from a String.
-public func extractLinksWithFragments(from string: String) -> [MdLink] {
-    var str = string
-    return str.withUTF8 { extractLinksWithFragments($0) }
 }
 
 /// Convert heading text to GitHub-style anchor ID.
@@ -675,7 +657,7 @@ struct CrawlState {
 
     // MARK: - Link resolution
 
-    mutating func resolve(_ link: MdLinkDetail, source: BfsQueueItem) {
+    mutating func resolve(_ link: Link, source: BfsQueueItem) {
         switch link.kind {
         case .wiki, .standard:
             resolveSameRepo(link, source: source)
@@ -684,27 +666,27 @@ struct CrawlState {
         }
     }
 
-    private mutating func resolveSameRepo(_ link: MdLinkDetail, source: BfsQueueItem) {
+    private mutating func resolveSameRepo(_ link: Link, source: BfsQueueItem) {
         let current = indices[source.repoRoot] ?? entryIndex
-        guard let resolved = resolveLink(link.path, relativeTo: source.path, root: current.root) else {
+        guard let resolved = resolveLink(link.target, relativeTo: source.path, root: current.root) else {
             return
         }
-        let isMd = link.path.hasSuffix(".md")
+        let isMd = link.target.hasSuffix(".md")
         var canonical = realPath(resolved)
 
         // Basename fallback only for .md links.
         if canonical == nil && isMd {
-            let basename = baseName(link.path)
+            let basename = baseName(link.target)
             if let candidates = current.byName[basename], candidates.count == 1 {
                 canonical = realPath(candidates[0])
             } else if let candidates = current.byName[basename], candidates.count > 1 {
-                issues.append(LinkIssue(link: link.path, source: source.path,
+                issues.append(LinkIssue(link: link.target, source: source.path,
                                         kind: .ambiguous(candidates.count)))
                 return
             }
         }
         guard let canonical else {
-            issues.append(LinkIssue(link: link.path, source: source.path, kind: .broken))
+            issues.append(LinkIssue(link: link.target, source: source.path, kind: .broken))
             return
         }
 
@@ -718,7 +700,7 @@ struct CrawlState {
         guard isMd else { return }
 
         if let fragment = link.fragment, !headings(for: canonical).contains(fragment) {
-            issues.append(LinkIssue(link: link.path, source: source.path,
+            issues.append(LinkIssue(link: link.target, source: source.path,
                                     kind: .brokenAnchor(fragment)))
         }
 
@@ -727,15 +709,15 @@ struct CrawlState {
         enqueueResolved(canonical: canonical, owningRoot: owningRoot)
     }
 
-    private mutating func resolveCrossRepo(_ link: MdLinkDetail, source: BfsQueueItem, repoName: String) {
+    private mutating func resolveCrossRepo(_ link: Link, source: BfsQueueItem, repoName: String) {
         guard let repoRoot = resolvedRepos[repoName] else {
-            issues.append(LinkIssue(link: link.path, source: source.path,
+            issues.append(LinkIssue(link: link.target, source: source.path,
                                     kind: .unknownRepo(repo: repoName)))
             return
         }
 
         // Cross-repo paths are repo-root-relative; normalize ./ and ../ but reject root escape.
-        let rawCombined = link.path.hasPrefix("/") ? repoRoot + link.path : repoRoot + "/" + link.path
+        let rawCombined = link.target.hasPrefix("/") ? repoRoot + link.target : repoRoot + "/" + link.target
         var segments: [String] = []
         var escaped = false
         for seg in rawCombined.split(separator: "/", omittingEmptySubsequences: true) {
@@ -749,23 +731,23 @@ struct CrawlState {
         let normalized = "/" + segments.joined(separator: "/")
         let withinRoot = !escaped && (normalized == repoRoot || normalized.hasPrefix(repoRoot + "/"))
 
-        let isMd = link.path.hasSuffix(".md")
+        let isMd = link.target.hasSuffix(".md")
         var canonical: String? = withinRoot ? realPath(normalized) : nil
         let repoIndex = indexFor(repoRoot)
 
         // Basename fallback in target repo — also handles `../` escapes for style violations.
         if canonical == nil && isMd {
-            let basename = baseName(link.path)
+            let basename = baseName(link.target)
             if let candidates = repoIndex.byName[basename], candidates.count == 1 {
                 canonical = realPath(candidates[0])
             } else if let candidates = repoIndex.byName[basename], candidates.count > 1 {
-                issues.append(LinkIssue(link: link.path, source: source.path,
+                issues.append(LinkIssue(link: link.target, source: source.path,
                                         kind: .ambiguous(candidates.count)))
                 return
             }
         }
         guard let canonical else {
-            issues.append(LinkIssue(link: link.path, source: source.path,
+            issues.append(LinkIssue(link: link.target, source: source.path,
                                     kind: .crossRepoBroken(repo: repoName)))
             return
         }
@@ -779,7 +761,7 @@ struct CrawlState {
         guard isMd else { return }
 
         if let fragment = link.fragment, !headings(for: canonical).contains(fragment) {
-            issues.append(LinkIssue(link: link.path, source: source.path,
+            issues.append(LinkIssue(link: link.target, source: source.path,
                                     kind: .brokenAnchor(fragment)))
         }
 
@@ -791,7 +773,7 @@ struct CrawlState {
     }
 
     private mutating func emitStyleIfNeeded(
-        link: MdLinkDetail, source: String, canonical: String,
+        link: Link, source: String, canonical: String,
         repoRoot: String, byName: [String: [String]], scope: LinkIssue.StyleScope
     ) {
         let relTarget = String(canonical.dropFirst(repoRoot.count + 1))
@@ -802,9 +784,9 @@ struct CrawlState {
         } else {
             canonicalForm = relTarget
         }
-        guard link.path != canonicalForm else { return }
+        guard link.target != canonicalForm else { return }
         issues.append(LinkIssue(
-            link: link.path, source: source,
+            link: link.target, source: source,
             kind: .style(scope: scope, suggested: canonicalForm,
                          pathStart: link.pathStart, pathEnd: link.pathEnd)
         ))

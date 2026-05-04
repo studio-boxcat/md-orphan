@@ -1,25 +1,20 @@
 import Darwin
 import Foundation
 
-/// Per-file extraction cache. Bumped when on-disk format changes.
-let cacheSchemaVersion = 1
-/// Bumped independently when the link/heading parser output shape changes (without schema bump).
-/// Bump on ANY scanner behavior change, even bug fixes — old cached results may reflect the prior
-/// (buggy) extraction even when (mtime, size, content_hash) all match the current file.
-let cacheParserVersion = 2
+/// Bumped on any change to the on-disk JSON shape. Files written under a different
+/// schemaVersion are treated as a cache miss and silently overwritten.
+let cacheSchemaVersion = 2
 
 /// One cache file per repo lives at $XDG_CONFIG_HOME/md-orphan/cache/<hash>.json.
 /// Filename is fnv1a64 of the canonical root path, so two repos with identical basenames
 /// in different parents don't collide.
 public struct LinkCache: Codable {
     public var schemaVersion: Int
-    public var parserVersion: Int
     public var displayName: String   // human-readable, for debug — file is keyed by hash
     public var entries: [String: CacheEntry]   // key: relative path within the repo
 
     public init(displayName: String) {
         self.schemaVersion = cacheSchemaVersion
-        self.parserVersion = cacheParserVersion
         self.displayName = displayName
         self.entries = [:]
     }
@@ -29,51 +24,8 @@ public struct CacheEntry: Codable {
     public let mtimeNs: Int64
     public let size: Int64
     public let contentHash: UInt64
-    public let links: [CachedLink]
+    public let links: [Link]
     public let headings: [String]
-}
-
-public struct CachedLink: Codable {
-    public let path: String
-    public let fragment: String?
-    public let kindTag: String     // "wiki" | "standard" | "crossRepo"
-    public let crossRepoName: String?
-    public let pathStart: Int
-    public let pathEnd: Int
-
-    init(_ d: MdLinkDetail) {
-        self.path = d.path
-        self.fragment = d.fragment
-        self.pathStart = d.pathStart
-        self.pathEnd = d.pathEnd
-        switch d.kind {
-        case .wiki:
-            self.kindTag = "wiki"
-            self.crossRepoName = nil
-        case .standard:
-            self.kindTag = "standard"
-            self.crossRepoName = nil
-        case .crossRepo(let r):
-            self.kindTag = "crossRepo"
-            self.crossRepoName = r
-        }
-    }
-
-    func toDetail() -> MdLinkDetail? {
-        let kind: LinkKind
-        switch kindTag {
-        case "wiki": kind = .wiki
-        case "standard": kind = .standard
-        case "crossRepo":
-            guard let r = crossRepoName else { return nil }
-            kind = .crossRepo(r)
-        default: return nil
-        }
-        return MdLinkDetail(
-            path: path, fragment: fragment, kind: kind,
-            pathStart: pathStart, pathEnd: pathEnd
-        )
-    }
 }
 
 // MARK: - Cache directory + filename
@@ -121,7 +73,7 @@ public func loadLinkCache(canonicalRoot: String, displayName: String) -> LinkCac
     guard let decoded = try? JSONDecoder().decode(LinkCache.self, from: data) else {
         return LinkCache(displayName: displayName)
     }
-    if decoded.schemaVersion != cacheSchemaVersion || decoded.parserVersion != cacheParserVersion {
+    if decoded.schemaVersion != cacheSchemaVersion {
         return LinkCache(displayName: displayName)
     }
     return decoded
@@ -151,7 +103,7 @@ public func saveLinkCache(_ cache: LinkCache, canonicalRoot: String) {
 /// Extracted data for a file: links + headings + the source bytes' inode.
 public struct ExtractedFile {
     public let inode: ino_t
-    public let links: [MdLinkDetail]
+    public let links: [Link]
     public let headings: Set<String>
 }
 
@@ -179,7 +131,7 @@ public final class ExtractionCache {
         else {
             return ExtractedFile(
                 inode: inode,
-                links: extractLinksDetailed(buf),
+                links: extractLinks(buf),
                 headings: extractHeadings(buf)
             )
         }
@@ -191,7 +143,7 @@ public final class ExtractionCache {
         guard stat(filePath, &st) == 0 else {
             return ExtractedFile(
                 inode: inode,
-                links: extractLinksDetailed(buf),
+                links: extractLinks(buf),
                 headings: extractHeadings(buf)
             )
         }
@@ -202,20 +154,15 @@ public final class ExtractionCache {
         let cache = ensureLoaded(canonicalRoot: repoRoot)
         if let entry = cache.entries[relKey],
            entry.mtimeNs == mtimeNs, entry.size == size, entry.contentHash == hash {
-            let links = entry.links.compactMap { $0.toDetail() }
-            // If conversion failed for any link (shouldn't happen normally), fall through
-            // to fresh extraction so we don't return partial results.
-            if links.count == entry.links.count {
-                return ExtractedFile(inode: inode, links: links, headings: Set(entry.headings))
-            }
+            return ExtractedFile(inode: inode, links: entry.links, headings: Set(entry.headings))
         }
 
         // Cache miss: extract + update.
-        let links = extractLinksDetailed(buf)
+        let links = extractLinks(buf)
         let headings = extractHeadings(buf)
         let newEntry = CacheEntry(
             mtimeNs: mtimeNs, size: size, contentHash: hash,
-            links: links.map(CachedLink.init),
+            links: links,
             headings: Array(headings).sorted()
         )
         caches[repoRoot]!.entries[relKey] = newEntry
