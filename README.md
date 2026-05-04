@@ -132,7 +132,7 @@ Disable with `--no-cache`.
 - `Sources/CLI/main.swift` — ArgumentParser entry point + output rendering + `--fix`
 - `Tests/` — Swift Testing test suite
 - `dist/` — Pre-built release binary
-- See [[architecture.md]] for the architecture overhaul design
+- See [[architecture.md]] for module layout + design rationale, and [[performance.md]] for benchmarks
 
 ## Algorithm
 
@@ -144,17 +144,4 @@ Edge cases: missing entry point → exit 1; broken link → exit 1; circular lin
 
 ## Performance
 
-Profiled on a Unity-style repo with ~109k files (Library/Pods excluded by defaults), 132 `.md` files reachable from entry:
-
-| Phase | Time | Notes |
-|---|---|---|
-| `fts` walk (`indexRepo`) | ~370 ms | Kernel-side dirent traversal dominates |
-| Read + extract 132 `.md` | ~10 ms | Manual byte scanner, ~0.07 ms/file |
-| BFS resolve + style + output | ~150 ms | |
-| **End-to-end** | **~540 ms** | |
-
-Notes:
-
-- The fts walk dominates. Default excludes (`Library/`, `Pods/`, `node_modules/`, `.build/`, ...) cut the file count drastically — disabling them via `--no-default-excludes` doubles total runtime.
-- `indexRepo` keeps `byName` `.md`-only by default. Adding all extensions costs ~800ms on a Unity-sized repo, so wiki/cross-repo style for non-`.md` files (e.g. `[[RecordingEnv.cs]]`) is currently not flagged. Tracked in [[TODO.md]].
-- The per-file extraction cache exists and is correct (mtime + size + fnv1a64 content hash, atomic writes, schema-version invalidation), but on this workload it's ≈break-even because extraction itself is only 10ms total. Disable with `--no-cache`. It will become useful on much larger doc trees.
+~7 ms self-check, ~500 ms on a Unity-scale 109k-file repo with defaults applied. Numbers, per-phase breakdown, and what the cache actually buys: [[performance.md]].
