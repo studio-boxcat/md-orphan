@@ -798,6 +798,56 @@ extension BfsCrawlTests {
     #expect(fnv1a64Hex("hello") == fnv1a64Hex("hello"))
     #expect(fnv1a64Hex("hello") != fnv1a64Hex("hellp"))
 }
+
+@Test func cacheJSONRoundTripsViaDisk() throws {
+    // Write through saveLinkCache, read back via loadLinkCache, verify Codable shape stable.
+    let tmpRoot = NSTemporaryDirectory() + "md-orphan-cache-rt-\(UUID().uuidString)"
+    let canonicalRoot = "/" + tmpRoot.split(separator: "/", omittingEmptySubsequences: true).joined(separator: "/")
+
+    var cache = LinkCache(displayName: "round-trip")
+    cache.entries["index.md"] = CacheEntry(
+        mtimeNs: 1_700_000_000_000_000_000,
+        size: 42,
+        contentHash: 0xdeadbeef,
+        links: [
+            Link(kind: .wiki,                 target: "foo.md", fragment: nil,    pathStart: 5, pathEnd: 11),
+            Link(kind: .standard,             target: "bar.md", fragment: "sec",  pathStart: 20, pathEnd: 26),
+            Link(kind: .crossRepo(repo: "r"), target: "baz.md", fragment: nil,    pathStart: 30, pathEnd: 36),
+        ],
+        headings: ["intro", "details"]
+    )
+
+    // Override XDG so saveLinkCache writes under our tmp.
+    let origXDG = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
+    setenv("XDG_CONFIG_HOME", tmpRoot, 1)
+    defer {
+        if let origXDG { setenv("XDG_CONFIG_HOME", origXDG, 1) } else { unsetenv("XDG_CONFIG_HOME") }
+        try? FileManager.default.removeItem(atPath: tmpRoot)
+    }
+
+    saveLinkCache(cache, canonicalRoot: canonicalRoot)
+    let loaded = loadLinkCache(canonicalRoot: canonicalRoot, displayName: "round-trip")
+
+    #expect(loaded.schemaVersion == cacheSchemaVersion)
+    #expect(loaded.entries.count == 1)
+    let entry = loaded.entries["index.md"]
+    #expect(entry?.contentHash == 0xdeadbeef)
+    #expect(entry?.links.count == 3)
+    #expect(entry?.links[0].kind == .wiki)
+    #expect(entry?.links[1].kind == .standard)
+    #expect(entry?.links[2].kind == .crossRepo(repo: "r"))
+    #expect(entry?.links[1].fragment == "sec")
+}
+
+@Test func expandPathUnclosedBraceThrows() {
+    setenv("MD_ORPHAN_RT_X", "/x", 1)
+    defer { unsetenv("MD_ORPHAN_RT_X") }
+    var threw = false
+    do { _ = try expandPath("${MD_ORPHAN_RT_X/sub", repoName: "r") }
+    catch ConfigError.unclosedBrace { threw = true }
+    catch { Issue.record("expected unclosedBrace, got \(error)") }
+    #expect(threw)
+}
 }
 
 // MARK: - dirName

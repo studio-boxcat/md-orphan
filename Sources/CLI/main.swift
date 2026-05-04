@@ -84,7 +84,7 @@ struct MdOrphan: ParsableCommand {
 
         let names = entryPoints.map { baseName($0) }.joined(separator: ", ")
         let relSource = { (issue: LinkIssue) -> String in
-            issue.source.hasPrefix(root + "/") ? String(issue.source.dropFirst(root.count + 1)) : issue.source
+            relPath(issue.source, under: root) ?? issue.source
         }
 
         var failed = false
@@ -222,7 +222,7 @@ private func renderStyle(link: String, suggested: String, scope: LinkIssue.Style
 
 /// Apply style fixes by rewriting just the path bytes inside [[...]] or `...`.
 /// Replacements applied per file in descending offset order so earlier offsets stay valid.
-/// Atomic write (.atomicWrite) so a crash mid-write can't truncate the source.
+/// Atomic write (`.atomic` — Foundation's tmp + rename) so a crash mid-write can't truncate the source.
 private func applyStyleFixes(_ issues: [LinkIssue]) {
     let bySource = Dictionary(grouping: issues, by: \.source)
     for (source, sourceIssues) in bySource {

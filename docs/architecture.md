@@ -1,170 +1,155 @@
 > **Related:** [[README.md]], [[TODO.md]]
 
-# md-orphan architecture (Phase-2 draft)
+# md-orphan architecture
 
-End-state design before refactor. Phase 4 finalizes against what shipped.
+How the codebase is organized after the cross-repo / cache / style-rule overhaul. Why each cut sits where it does.
+
+## Background
+
+The tool started as a flat single-file Swift CLI: walk the tree, extract links, BFS, report orphans. Adding cross-repo references, link-style canonicalization, fenced-code skipping, and a per-file extraction cache grew `MdOrphan.swift` to ~600 LOC mixing four concerns. The Phase 1 audit surfaced the obvious smells: a 128-line `bfsCrawl` body, two helpers with 10 and 11 parameters and 5 and 4 inout slots respectively, three `MdLink`/`MdLinkDetail`/`CachedLink` structs that all describe the same thing at different lifecycle points.
+
+## Prior art
+
+Three peer tools at comparable scale informed the cut:
+
+- **mlc** (Rust, ~2-3k LOC) — flat module layout: `main.rs`, `cli.rs`, `file_traversal.rs`, `markup.rs`, plus `link_extractors/` and `link_validators/`. Confirms the **extract / validate** seam recurs at this scale ([source](https://github.com/becheran/mlc/tree/master/src)).
+- **awesome_bot** (Ruby, ~1.5k LOC) — `lib/awesome_bot/{check,links,output,result,cli}.rb`. Files-as-namespaces, no pipeline abstraction ([source](https://github.com/dkhamsing/awesome_bot/tree/master/lib/awesome_bot)).
+- **markdown-link-check** (JS, ~300 LOC `index.js`) — full coordination layer in one file ([source](https://github.com/tcort/markdown-link-check/blob/master/index.js)).
+- **lychee** (Rust, ~15k LOC) — directory-per-concern under `lychee-lib/src/{extract,checker,filter,collector}/`. Earns the depth via async + 10+ formats × protocols. Out of scope for us ([source](https://github.com/lycheeverse/lychee/tree/master/lychee-lib/src)).
+
+Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesome_bot. **Skipped**: lychee's pipeline traits and per-protocol modules.
 
 ## Module layout
 
 ```
 Sources/Lib/
-  Extract.swift     — byte-level link/heading/fence scanners + Link, Heading types
-  Crawl.swift       — bfsCrawl + LinkIssue + CrawlOptions + LinkResolver state
-  Discovery.swift   — fts walk + RepoIndex + path utilities (realPath, dirName, baseName, isExcluded)
-  Config.swift      — global JSON, .md-orphan, expandPath
-  Cache.swift       — ExtractionCache (per-repo content-hash keyed)
+  Util.swift       — path helpers + readFile + readBuffer + scanner-internal helpers (~115 LOC)
+  Extract.swift    — Link type + byte-level link/heading/fence scanners            (~290 LOC)
+  Crawl.swift      — bfsCrawl + CrawlState + LinkIssue + CrawlOptions + resolveLink (~365 LOC)
+  Discovery.swift  — fts walk + RepoIndex + indexRepo                              (~110 LOC)
+  Config.swift     — global JSON config + .md-orphan + expandPath                  (~140 LOC)
+  Cache.swift      — ExtractionCache (mtime + size + content-hash keyed)           (~200 LOC)
 Sources/CLI/
-  main.swift        — ArgumentParser command, output rendering, --fix byte rewriter
+  main.swift       — ArgumentParser command, output rendering, --fix byte rewriter (~250 LOC)
 ```
 
-5 lib files, each focused. Down from current 4 files where the largest (`MdOrphan.swift`, 600 LOC) mixes utilities + scanning + resolution + BFS.
+6 files, each focused. Total ~1.2k LOC; each file under 400. Library types and public-API surface fit on one screen.
 
-Why not subdirectories: at ~1.5k LOC, peer tools (mlc ~2k, awesome_bot ~1.5k) all stay flat. lychee directories its `lychee-lib/src/` but earns it with async + 10+ formats — not our problem. ([lychee source](https://github.com/lycheeverse/lychee/tree/master/lychee-lib/src), [mlc source](https://github.com/becheran/mlc/tree/master/src))
+Why not subdirectories: peer tools at our scale stay flat. Adding `Lib/extract/` for one file or `Lib/parsing/` for two has the cohesion penalty of misleading concern names.
 
-## Type unification: one Link
+Why `Util.swift` (not `Discovery.swift`) for `realPath`/`dirName`/`baseName`/`isExcluded`: these are stdlib-shaped path utilities used everywhere. Putting them under "Discovery" misleads.
 
-Today three structs describe the same thing at three lifecycle points:
+## Use cases
 
-- `MdLink { path, fragment }` — public test surface
-- `MdLinkDetail { path, fragment, kind: LinkKind, pathStart, pathEnd }` — extraction output
-- `CachedLink { path, fragment, kindTag, crossRepoName, pathStart, pathEnd }` — cache form
+Two real consumers, ranked by surface area needed:
 
-Collapse to one:
+1. **CLI (`Sources/CLI/main.swift`)** — drives the whole pipeline. Calls `loadGlobalConfig`, `bfsCrawl(entryPoints:, root:)`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.pathStart..<Link.pathEnd`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
+2. **Tests (`Tests/MdOrphanTests.swift`, 96 tests)** — uses `@testable import` and asserts on the internal extractors (`extractLinks`, `extractHeadings`), the resolver (`resolveLink`), exclusion matching (`isExcluded`), the BFS results, the cache round-trip, and a few config helpers (`expandPath`, `loadProjectIgnore`).
 
-```swift
-struct Link: Codable, Equatable {
-    enum Kind: Codable, Equatable {
-        case wiki                       // [[target]]
-        case standard                   // [text](target)
-        case crossRepo(repo: String)    // `target` (repo)
-    }
-    let kind: Kind
-    let target: String           // path before fragment
-    let fragment: String?        // anchor or nil
-    let pathStart: Int           // byte offset of `target` within source file
-    let pathEnd: Int             // exclusive
-}
+No other consumers. No plugin story, no library users at the moment.
+
+Public API after demotion (18 symbols): `Link`, `LinkIssue`, `CrawlOptions`, `ExtractionCache`, `ExtractedFile`, `RepoIndex`, `GlobalConfig`, `ConfigError`, `bfsCrawl` (two overloads), `indexRepo`, `resolveLink`, `isExcluded`, `realPath`, `dirName`, `baseName`, `loadGlobalConfig`, `loadProjectIgnore`, `defaultConfigPath`, `defaultExcludes`, `expandPath`, `extractLinks` (two overloads), `extractHeadings` (two overloads), `anchorId`, `readFile`.
+
+## Data flow
+
+```
+                   CLI (main.swift)
+                         │
+                         ▼
+              bfsCrawl(entryPaths, root, options, cache)
+                         │
+                         ├─► indexRepo(root)  ──►  RepoIndex { mdFiles, byName }
+                         │
+                         └─► CrawlState (struct, mutating methods)
+                                ├─► seed(entryPaths)
+                                ├─► loop: dequeue → cache.read(file) → resolve(link)
+                                │                         │
+                                │                         ├─► Extract.swift scanners
+                                │                         └─► extractLinks([Link]) + extractHeadings
+                                │
+                                └─► pruneCache()
 ```
 
-One struct flows extractor → cache → resolver → `--fix` byte rewriter. Codable derives the cache shape automatically. The convenience `extractLinks(from: String) -> [String]` API stays for tests / external callers; internally everything is `[Link]`.
+`Link` flows extractor → cache → resolver → `--fix` byte rewriter as one struct. No conversion at boundaries. `Codable` derives the on-disk cache shape directly — no separate `CachedLink` mirror type.
 
-## Crawl state encapsulation
+## Crawl state
 
-Today `bfsCrawl` is 128 lines with three nested closures (`indexFor`, `repoRootContaining`, `headings`), and dispatches to `processSameRepoLink` (10 params, 5 inout) / `processCrossRepoLink` (11 params, 4 inout). Inout-soup that's hard to extend.
-
-Replace with a `CrawlState` reference-typed value:
+`bfsCrawl` is a 10-line driver over a `CrawlState` struct. Methods on the struct mutate through `mutating self` rather than passing 5 inout parameters between free functions:
 
 ```swift
-final class CrawlState {
-    let entryRoot: String
-    let resolvedRepos: [String: String]
-    let options: CrawlOptions
-    let cache: ExtractionCache
-
-    var queue: [QueueItem] = []
-    var queuedEntryPaths: Set<String> = []
-    var crossRepoVisited: Set<String> = []
-    var reachable: Set<ino_t> = []
-    var issues: [LinkIssue] = []
-    var headingCache: [String: Set<String>] = [:]
-    var indices: [String: RepoIndex] = [:]
-
-    func enqueue(_ canonical: String, owningRoot: String)
-    func record(_ issue: LinkIssue)
-    func headings(for canonical: String) -> Set<String>
-    func indexFor(_ canonicalRoot: String) -> RepoIndex
-    func repoRootContaining(_ path: String) -> String?
-}
-```
-
-`bfsCrawl` becomes a 30-line driver:
-
-```swift
-func bfsCrawl(entryPaths: [String], root: String, options: CrawlOptions, cache: ExtractionCache)
+public func bfsCrawl(entryPaths: [String], index: RepoIndex,
+                     options: CrawlOptions, cache: ExtractionCache)
     -> (reachable: Set<ino_t>, issues: [LinkIssue])
 {
-    let state = CrawlState(entryRoot: root, options: options, cache: cache)
+    var state = CrawlState(entryIndex: index, options: options, cache: cache)
     state.seed(entryPaths)
-    while let item = state.dequeue() {
-        guard let extracted = state.read(item) else { continue }
-        for link in extracted.links { state.resolve(link, in: item) }
-    }
+    while let item = state.dequeue() { state.visit(item) }
     state.pruneCache()
     return (state.reachable, state.issues)
 }
 ```
 
-`state.resolve(link, in:)` dispatches on `Link.Kind` to small private methods. Each is ~30 lines because the state mutations are method calls instead of inout params.
+`CrawlState` is a `struct`, not a `class` — single-threaded, single-owner, no identity, dropped at end of `bfsCrawl`. The Phase 2 review pushed for struct over class to keep the "no shared instance, no statics" property explicit.
 
-## Discovery unification
-
-Delete `discoverFiles`. Make `bfsCrawl` always walk via `indexRepo`. The legacy `allFiles:` parameter on `bfsCrawl` (currently kept for test/back-compat) goes away — tests adapt to `bfsCrawl(entryPaths:, root:, options:)`.
-
-`indexRepo` keeps its current `.md`-only `byName` default + `includeAllExtensions` opt-in (deferred non-`.md` style support — see [[TODO.md]]).
-
-## Path resolution
-
-Both `resolveLink` (relative-to-source) and the cross-repo path-walking inside `processCrossRepoLink` walk segments and strip `..`. Extract a single helper:
-
-```swift
-/// Normalize segments, return nil if the result escapes constraintRoot.
-func normalizeWithinRoot(_ rawCombined: String, constraintRoot: String) -> String?
-```
-
-Same algorithm, two callers: `resolveSameRepo` (combined = sourceDir + link) and `resolveCrossRepo` (combined = repoRoot + link).
-
-Fix the latent symlink bug surfaced in audit: cross-repo roots from config get `realPath` once during `CrawlState.init`, not lazily on lookup. Eliminates the unresolved/canonical mismatch.
-
-## Public vs internal surface
-
-Currently several internals are `public` only because tests reach for them. Tests already use `@testable import MdOrphanLib` — they can see `internal` symbols. Demote:
-
-| Symbol | Now | After |
-|---|---|---|
-| `MdLinkDetail` | public | deleted (replaced by `Link`) |
-| `LinkKind` | public | folded into `Link.Kind` |
-| `extractLinksDetailed` | public | internal |
-| `cacheDirectory`, `cacheFilePath` | public | internal |
-| `fnv1a64`, `fnv1a64Hex` | public | internal |
-| `homeDir` | public | internal |
-| `registerDisplayName` | public | deleted (unused) |
-| `loadLinkCache`, `saveLinkCache` | public | internal |
-| `MdLink` | public | replaced by `Link` (also public) |
-
-Public stays: `bfsCrawl`, `CrawlOptions`, `LinkIssue`, `ExtractionCache`, `extractLinks(from:)`, `extractLinksWithFragments(from:)`, `extractHeadings(from:)`, `resolveLink`, `isExcluded`, `realPath`, `dirName`, `baseName`, `loadGlobalConfig`, `loadProjectIgnore`, `defaultConfigPath`, `defaultExcludes`, `RepoIndex`, `indexRepo`.
+Two visited sets:
+- `reachable: Set<ino_t>` — entry-repo orphan tracking. Inode-keyed for symlink/hardlink dedup.
+- `crossRepoVisited: Set<String>` — canonical paths in cross-repo target trees. They get verified + style-checked but never enter `reachable` (orphan detection is scoped to the entry repo).
 
 ## Persisted state
 
-- **Cache JSON**: shape unchanged (mtimeNs, size, contentHash, links[], headings[]). `Link.Codable` produces the same field names → no on-disk migration. Bump `cacheParserVersion` 2 → 3 so any in-the-wild caches written by the old parser are invalidated regardless.
-- **Global config JSON**: unchanged.
-- **`.md-orphan`**: unchanged.
+| File | Path | Shape |
+|---|---|---|
+| Global config | `$XDG_CONFIG_HOME/md-orphan/md-orphan.json` (fallback `~/.config/...`) | `{"repos": {name: path}}` or flat `{name: path}` — both accepted; `$VAR` / `~/` expansion |
+| Per-repo ignore | `<repo>/.md-orphan` | gitignore-style line patterns; `#` comments |
+| Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
 
-## Pitfalls preserved (don't lose these in refactor)
+**Cache schema** (`schemaVersion: 2`):
 
-These bugs were paid for in the current code; the new design must not lose the fix:
+```json
+{
+  "schemaVersion": 2,
+  "displayName": "md-orphan",
+  "entries": {
+    "README.md": {
+      "mtimeNs": 1...,
+      "size": 1234,
+      "contentHash": 17...,
+      "links": [{"kind": {"wiki": {}}, "target": "TODO.md", "fragment": null, "pathStart": 1995, "pathEnd": 2002}],
+      "headings": ["overview", "usage"]
+    }
+  }
+}
+```
 
-1. `realpath` mismatch on macOS `/var/folders` ↔ `/private/var/folders` — root + entry paths must be canonicalized at `CrawlState.init` (already done for entry root + cross-repo roots).
-2. Unclosed-backtick scanner regression — `scanBacktickRef` must `return i + 1` (advance one byte) when no closing backtick is found, never `return end + 1` (would eat past end-of-buffer).
-3. `readBuffer` is a process-global; per-file extraction must complete before another `readFile` call. `ExtractionCache.read` already extracts immediately; preserve.
-4. `parserVersion` must bump on ANY scanner change, not just structural ones — old caches may have correct mtime+size+hash but wrong byte offsets if the scanner reordered output.
+Cache validation requires `(mtime_ns, size, content_hash)` to all match. Schema mismatch → silent invalidate (cache is regenerable).
+
+## Pitfalls — avoided in this design
+
+These bugs were paid for during Phase 1; the structure must keep them out:
+
+1. **macOS `realpath` symlink mismatch** (`/var/folders` ↔ `/private/var/folders`). All paths handed to `CrawlState` are canonicalized once at `init` via `realPath`. Mixing canonical and raw paths breaks `hasPrefix` checks. Touched once during the cross-repo refactor; preserved by the new design.
+2. **`scanBacktickRef` runaway**. An unclosed `` ` `` followed by no newline before EOF used to advance to `count + 1`, eating the rest of the file (including any later `[[wiki]]` links on the same row). Fix: scanner returns `i + 1` (advance one byte, treat lone backtick as literal) on every no-close branch — never `end + 1`. See `Extract.swift:scanBacktickRef`.
+3. **Global `readBuffer` aliasing**. The buffer at `Util.swift:readBuffer` is process-wide and clobbered by every `readFile` call. Per-file extraction must complete before another `readFile` runs. `ExtractionCache.read` extracts links + headings synchronously inside one `readFile` window; preserve that pattern. Tests using `readFile` are `.serialized` for the same reason.
+4. **Cache content drift across parser changes**. Old cached byte offsets can be valid against an unchanged file but reflect the prior (buggy) parser. `cacheSchemaVersion` MUST bump on any scanner output change, not just on JSON-shape changes. The Phase 3 commit B bump (1 → 2) demonstrated this.
+5. **Cross-repo `..` escape**. A path like `../docs/foo.md` inside `` ` ` (some-repo) `` escapes the target repo root. Resolution falls back to basename lookup in the target repo's `byName`. The escape is reported as a style violation (canonical form = bare basename), not a hard error. See `Crawl.swift:resolveCrossRepo`.
 
 ## Non-goals
 
-- No `Pipeline` / `Stage` protocol. We have one of each.
-- No `Reporter` trait — one binary, two output modes (text + `--fix`), no plugin story.
-- No subdirectory carve-up of `Sources/Lib/`. Flat at this scale.
-- No move toward async/parallel. Single-threaded fts + read is the right shape; the reference tools at our scale also don't parallelize.
-- No backwards-compat shim for `MdLink`/`MdLinkDetail` removal — tests update atomically.
-
-## Open questions
-
-- Whether to keep `discoverFiles` as a thin alias for `indexRepo(...).mdFiles` for one release as a compatibility hint. Recommend: no — delete cleanly.
-- Whether `extractLinks(from: String)` etc. convenience APIs add value when CLI doesn't use them. Tests do. Keep until proven dead.
-- Whether `CLI/main.swift` should grow a `runOrphanCheck` library entry that the CLI delegates to. Use-case audit said the formatting + `--fix` are CLI-shaped; not worth pulling in. Defer.
+- **No `Pipeline` / `Stage` protocol.** We have one of each.
+- **No `Reporter` trait.** One binary, two output modes (text + `--fix`); no plugin story.
+- **No subdirectory carve-up of `Sources/Lib/`.** Flat at this scale.
+- **No async / parallel work.** Single-threaded fts + read is the right shape; reference tools at our scale also don't parallelize. Re-evaluate if profiling identifies a parallelizable hot path.
+- **No backwards-compat shims.** When `MdLink` / `MdLinkDetail` / `CachedLink` were collapsed into `Link`, the old types were deleted in the same commit; tests adapted atomically.
+- **No standard-link style rule.** `[text](path)` is renderer-relative — applying basename canonicalization would silently break GitHub rendering. Wiki and cross-repo backtick refs only.
 
 ## References
 
-- [lychee — async link checker, ~15k LOC](https://github.com/lycheeverse/lychee/tree/master/lychee-lib/src)
-- [mlc — closest-scale peer, ~2-3k LOC](https://github.com/becheran/mlc/tree/master/src)
-- [markdown-link-check — coordination layer in <300 LOC](https://github.com/tcort/markdown-link-check/blob/master/index.js)
+- [Phase 1 plan-agent review notes (in conversation history)]
+- [mlc — closest-scale peer](https://github.com/becheran/mlc/tree/master/src)
 - [awesome_bot — flat lib/ at ~1.5k LOC](https://github.com/dkhamsing/awesome_bot/tree/master/lib/awesome_bot)
+- [markdown-link-check — coordination in <300 LOC](https://github.com/tcort/markdown-link-check/blob/master/index.js)
+- [lychee — what we don't need to be (15k LOC, async, multi-format)](https://github.com/lycheeverse/lychee/tree/master/lychee-lib/src)
+- [Swift Forums on TaskGroup overhead at small scales](https://forums.swift.org/t/taskgroup-and-parallelism/51039)
+- [APFS dirent traversal benchmarks (FTS_NOSTAT vs alternatives)](http://blog.tempel.org/2019/04/dir-read-performance.html)
+- [Why we don't use `getattrlistbulk` (Apple Forums)](https://developer.apple.com/forums/thread/656787)
+- [`Swift Regex 28-33× slower than manual scan`](https://forums.swift.org/t/slow-regex-performance/75768)

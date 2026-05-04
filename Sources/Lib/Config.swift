@@ -10,6 +10,7 @@ public enum ConfigError: Error, CustomStringConvertible {
     case malformedJSON(path: String, message: String)
     case missingReposKey(path: String)
     case repoPathExpansion(name: String, raw: String, missingVar: String)
+    case unclosedBrace(name: String, raw: String)
 
     public var description: String {
         switch self {
@@ -17,6 +18,8 @@ public enum ConfigError: Error, CustomStringConvertible {
         case .missingReposKey(let p): return "\(p): missing 'repos' object"
         case .repoPathExpansion(let n, let r, let v):
             return "repo '\(n)' path '\(r)': undefined env var $\(v)"
+        case .unclosedBrace(let n, let r):
+            return "repo '\(n)' path '\(r)': unclosed `${` brace expansion"
         }
     }
 }
@@ -99,13 +102,16 @@ public func expandPath(_ raw: String, repoName: String) throws -> String {
             j = s.index(after: j)
         }
         nameEnd = j
+        if braced && (nameEnd == s.endIndex || s[nameEnd] != "}") {
+            throw ConfigError.unclosedBrace(name: repoName, raw: raw)
+        }
         let name = String(s[nameStart..<nameEnd])
         if name.isEmpty { result.append(c); i = after; continue }
         guard let val = ProcessInfo.processInfo.environment[name] else {
             throw ConfigError.repoPathExpansion(name: repoName, raw: raw, missingVar: name)
         }
         result.append(val)
-        i = braced && nameEnd < s.endIndex ? s.index(after: nameEnd) : nameEnd
+        i = braced ? s.index(after: nameEnd) : nameEnd
     }
     return result
 }

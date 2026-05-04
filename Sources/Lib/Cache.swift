@@ -79,22 +79,23 @@ func loadLinkCache(canonicalRoot: String, displayName: String) -> LinkCache {
     return decoded
 }
 
-/// Save cache atomically. Cache loss isn't fatal — silently swallow write errors.
+/// Save cache atomically. Cache loss isn't fatal, but log to stderr so silent failures
+/// (read-only home, full disk, EACCES) don't disappear into the void.
 func saveLinkCache(_ cache: LinkCache, canonicalRoot: String) {
     let dir = cacheDirectory()
-    _ = mkdir(dir, 0o755)  // best-effort; ignores EEXIST
-    // Also create parent .config/md-orphan if missing
-    var components = dir.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-    components.removeLast()
-    let parent = "/" + components.joined(separator: "/")
-    _ = mkdir(parent, 0o755)
+    do {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    } catch {
+        fputs("md-orphan: warning: cannot create cache dir \(dir): \(error)\n", stderr)
+        return
+    }
 
     let path = cacheFilePath(forCanonicalRoot: canonicalRoot)
     do {
         let data = try JSONEncoder().encode(cache)
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
     } catch {
-        // Cache is regenerable; do not surface errors.
+        fputs("md-orphan: warning: cannot write cache \(path): \(error)\n", stderr)
     }
 }
 
@@ -135,7 +136,11 @@ public final class ExtractionCache {
             )
         }
 
-        let relKey = filePath == repoRoot ? "" : String(filePath.dropFirst(repoRoot.count + 1))
+        guard let relKey = relPath(filePath, under: repoRoot) else {
+            // Defensive: caller should only invoke with `filePath` under `repoRoot`. Fall back
+            // to fresh extraction if this invariant ever breaks.
+            return ExtractedFile(inode: inode, links: extractLinks(buf), headings: extractHeadings(buf))
+        }
 
         // Stat for mtime + size. Buffer read above already gave us inode + size.
         var st = stat()
@@ -146,7 +151,8 @@ public final class ExtractionCache {
                 headings: extractHeadings(buf)
             )
         }
-        let mtimeNs = Int64(st.st_mtimespec.tv_sec) &* 1_000_000_000 &+ Int64(st.st_mtimespec.tv_nsec)
+        // Checked arithmetic — overflow here means corrupt stat data, not a value to silently wrap.
+        let mtimeNs = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
         let size = Int64(st.st_size)
         let hash = fnv1a64(buf)
 

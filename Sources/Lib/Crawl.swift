@@ -169,7 +169,6 @@ struct CrawlState {
         } else {
             guard crossRepoVisited.insert(item.path).inserted else { return }
         }
-        // Cache source headings — cheap because we already have the bytes.
         headingCache[item.path] = result.headings
 
         for link in result.links { resolve(link, source: item) }
@@ -221,7 +220,10 @@ struct CrawlState {
     }
 
     private mutating func resolveSameRepo(_ link: Link, source: BfsQueueItem) {
-        let current = indices[source.repoRoot] ?? entryIndex
+        // `source.repoRoot` was either the entry root (always indexed) or a cross-repo root
+        // populated by `resolveCrossRepo` before the file was enqueued. `indexFor` is defensive:
+        // re-indexes if the invariant ever breaks instead of silently using `entryIndex`.
+        let current = indexFor(source.repoRoot)
         guard let resolved = resolveLink(link.target, relativeTo: source.path, root: current.root) else {
             return
         }
@@ -330,7 +332,7 @@ struct CrawlState {
         link: Link, source: String, canonical: String,
         repoRoot: String, byName: [String: [String]], scope: LinkIssue.StyleScope
     ) {
-        let relTarget = String(canonical.dropFirst(repoRoot.count + 1))
+        guard let relTarget = relPath(canonical, under: repoRoot) else { return }
         let basename = baseName(relTarget)
         let canonicalForm: String
         if let cands = byName[basename], cands.count == 1 {

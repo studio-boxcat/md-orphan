@@ -50,6 +50,14 @@ public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
     return false
 }
 
+/// Strip `root + "/"` prefix from `path` when present. Returns "" when `path == root`.
+/// Returns nil when `path` is outside `root` (caller decides what to do).
+public func relPath(_ path: String, under root: String) -> String? {
+    if path == root { return "" }
+    if path.hasPrefix(root + "/") { return String(path.dropFirst(root.count + 1)) }
+    return nil
+}
+
 // MARK: - File reading
 
 private var readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 256 * 1024)
