@@ -51,11 +51,22 @@ Disable with `--no-cache` to skip cache machinery entirely.
 
 ## Parallel cross-repo discovery
 
-When the entry files reference cross-repo targets, those repos are indexed in parallel via `DispatchQueue.concurrentPerform`. Wall-clock cost for N referenced repos is `max(walk_time)` instead of `sum(walk_time)`.
+When the entry files reference cross-repo targets directly, those repos are indexed in parallel via `DispatchQueue.concurrentPerform`. Wall-clock cost for N **first-level** referenced repos is `max(walk_time)` instead of `sum(walk_time)`.
 
-The prefetch only walks repos actually referenced from the seeded entry files (not every configured repo) — reading entry files in `CrawlState.seed`, extracting cross-repo names, then dispatching. Transitively-discovered cross-repos (referenced from a cross-repo file rather than the entry) fall back to lazy serial via `indexFor`; this is the rare path.
+The prefetch reads the seeded entry files in `CrawlState.seed`, extracts cross-repo names, and dispatches `indexRepo` for those targets in parallel. **Transitively-discovered cross-repos** (refs from a cross-repo file rather than the entry, or from same-repo files reachable from the entry) fall back to lazy serial via `indexFor`.
 
-For projects with no cross-repo refs, prescan finds zero targets and no parallel walks run — same wall clock as the single-repo case.
+Measured on meow-tower (`~/Develop/meow-tower/CLAUDE.md`):
+
+| Scenario | Time | Where parallel engages |
+|---|---|---|
+| meow-tower entry, transitive cross-repos to 3 real repos | 510-660 ms | not engaged — entry CLAUDE.md has 0 first-level cross-repo refs; meow-toolbox/meow-game-server/meow-dev-media discovered transitively from `docs/specs/*` and walked serially |
+| Synthetic entry directly referencing 3 cross-repos | 525-640 ms | engaged — 105% CPU on first run, 3 parallel walks |
+
+The wins are modest in practice because most projects reference cross-repos transitively (cross-repo refs scattered across the doc tree, not concentrated in the entry file). For projects that DO concentrate cross-repo refs in the entry CLAUDE.md, parallel discovery saves the sum of cross-repo walk times.
+
+For projects with no cross-repo refs anywhere, prescan finds zero targets and no parallel work runs.
+
+Tracked in [[TODO.md]]: extending to transitive cross-repos via level-synchronous BFS could save ~100-200 ms more on meow-tower-like setups, at the cost of trading FIFO crawl order for level-by-level batching.
 
 ## What dominates
 
@@ -92,6 +103,6 @@ The benchmark hardcodes `~/Develop/meow-tower` — adapt for other repos.
 
 See [[TODO.md]] for:
 
+- Extending parallel discovery to transitive cross-repos (level-synchronous BFS)
 - Directory-level mtime cache (skip `readdir` for unchanged dirs)
-- Parallel cross-repo discovery (one `indexRepo` per cross-repo target)
 - Non-`.md` style support cost analysis (~30× current `indexRepo` time)
