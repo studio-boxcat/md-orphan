@@ -129,6 +129,7 @@ Disable with `--no-cache`.
 - `Sources/CLI/main.swift` — ArgumentParser entry point
 - `Tests/` — Swift Testing test suite
 - `dist/` — Pre-built release binary
+- See [[architecture.md]] for the in-flight architecture overhaul
 
 ## Algorithm
 

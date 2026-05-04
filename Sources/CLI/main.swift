@@ -10,7 +10,7 @@ struct MdOrphan: ParsableCommand {
     )
 
     @Argument(help: "One or more markdown entry points")
-    var entryPoints: [String]
+    var entryPoints: [String] = []
 
     @Option(name: .long, help: "Exclude paths by prefix or glob; * and ? don't cross / (comma-separated, repeatable)")
     var exclude: [String] = []
@@ -30,7 +30,18 @@ struct MdOrphan: ParsableCommand {
     @Flag(name: .long, help: "Disable per-file extraction cache")
     var noCache = false
 
+    @Flag(name: .long, help: "Print the nearest CLAUDE.md (walks up from cwd): full path, blank line, contents")
+    var claude = false
+
     func run() throws {
+        if claude {
+            try runClaude()
+            return
+        }
+        guard !entryPoints.isEmpty else {
+            throw ValidationError("missing entry point")
+        }
+
         let resolvedEntries = try entryPoints.map { ep -> String in
             guard let abs = realPath(ep) else {
                 throw ValidationError("\(ep): no such file")
@@ -173,6 +184,35 @@ struct MdOrphan: ParsableCommand {
         } else if verbose {
             print("\u{2705} All \(allFiles.count) markdown files are reachable from \(names)")
         }
+    }
+}
+
+/// Walk up from cwd until a CLAUDE.md (or AGENTS.md fallback — they're often symlinked together)
+/// is found. Print its absolute canonical path on the first line, a blank line, then its contents.
+/// Exit non-zero if nothing is found between cwd and `/`.
+extension MdOrphan {
+    fileprivate func runClaude() throws {
+        let cwd = FileManager.default.currentDirectoryPath
+        var dir = cwd
+        while !dir.isEmpty, dir != "/" {
+            for name in ["CLAUDE.md", "AGENTS.md"] {
+                let candidate = dir + "/" + name
+                if FileManager.default.fileExists(atPath: candidate) {
+                    let canonical = realPath(candidate) ?? candidate
+                    print(canonical)
+                    print()
+                    if let data = try? Data(contentsOf: URL(fileURLWithPath: canonical)),
+                       let text = String(data: data, encoding: .utf8) {
+                        print(text, terminator: text.hasSuffix("\n") ? "" : "\n")
+                    }
+                    return
+                }
+            }
+            guard let slash = dir.lastIndex(of: "/") else { break }
+            dir = String(dir[..<slash])
+        }
+        fputs("md-orphan --claude: no CLAUDE.md or AGENTS.md found from \(cwd) up to /\n", stderr)
+        throw ExitCode(1)
     }
 }
 
