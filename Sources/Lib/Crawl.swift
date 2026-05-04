@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 
 // MARK: - Public types
 
@@ -66,10 +67,13 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 
 /// BFS from entry points across same-repo and (optionally) cross-repo references.
 ///
-/// Visited tracking is split:
-///  - **Entry repo**: inode-keyed (`reachable`). Used for orphan detection + symlink/hardlink dedup.
-///  - **Cross-repo**: canonical-path-keyed. Cross-repo files are visited + verified + style-checked
+/// Visited tracking is split by repo scope, both keyed by canonical absolute path:
+///  - **Entry repo**: `reachable` set. Used for orphan detection.
+///  - **Cross-repo**: `crossRepoVisited` set. Cross-repo files are verified + style-checked
 ///    but never enter `reachable` (orphan detection is scoped to the entry repo).
+///
+/// Symlinks pointing to the same `.md` from two paths resolve to one canonical via `realPath`,
+/// so path-based dedup handles them. Hardlinks (rare in doc trees) are processed twice.
 ///
 /// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
 public func bfsCrawl(
@@ -77,7 +81,7 @@ public func bfsCrawl(
     index: RepoIndex,
     options: CrawlOptions = .init(),
     cache: ExtractionCache = ExtractionCache(enabled: false)
-) -> (reachable: Set<ino_t>, issues: [LinkIssue]) {
+) -> (reachable: Set<String>, issues: [LinkIssue]) {
     var state = CrawlState(entryIndex: index, options: options, cache: cache)
     state.seed(entryPaths)
     while let item = state.dequeue() {
@@ -93,7 +97,7 @@ public func bfsCrawl(
     root: String,
     options: CrawlOptions = .init(),
     cache: ExtractionCache = ExtractionCache(enabled: false)
-) -> (index: RepoIndex, reachable: Set<ino_t>, issues: [LinkIssue]) {
+) -> (index: RepoIndex, reachable: Set<String>, issues: [LinkIssue]) {
     let projectIgnore = (try? loadProjectIgnore(root: root)) ?? []
     let exclude = options.extraExcludes + projectIgnore
     let idx = indexRepo(root: root, exclude: exclude, useDefaultExcludes: options.useDefaultExcludes)
@@ -122,7 +126,7 @@ struct CrawlState {
     var cursor: Int = 0
     var queuedEntryPaths: Set<String> = []                  // dedup before read, entry repo
     var crossRepoVisited: Set<String> = []                  // canonical paths for cross-repo files
-    var reachable: Set<ino_t> = []                          // entry-repo orphan tracking
+    var reachable: Set<String> = []                         // canonical paths visited in entry repo
     var issues: [LinkIssue] = []
     var headingCache: [String: Set<String>] = [:]
 
@@ -165,7 +169,7 @@ struct CrawlState {
             return
         }
         if item.isEntryRepo {
-            guard reachable.insert(result.inode).inserted else { return }
+            guard reachable.insert(item.path).inserted else { return }
         } else {
             guard crossRepoVisited.insert(item.path).inserted else { return }
         }
@@ -362,8 +366,39 @@ struct CrawlState {
 
     mutating func pruneCache() {
         for (root, idx) in indices {
-            let keep = Set(idx.mdFiles.values)
-            cache.prune(canonicalRoot: root, keepRelativePaths: keep)
+            cache.prune(canonicalRoot: root, keepRelativePaths: idx.mdFiles)
+        }
+    }
+}
+
+// MARK: - --fix byte rewriter
+
+/// Rewrite the path bytes inside `[[...]]` or `` `...` `` for every `.style` issue.
+/// Replacements per source file are applied in descending byte-offset order so earlier offsets
+/// stay valid. Atomic write (`.atomic` — Foundation's tmp + rename) so a crash mid-write can't
+/// truncate the source. Failures are logged to stderr; non-style issues are ignored.
+public func applyStyleFixes(_ issues: [LinkIssue]) {
+    let bySource = Dictionary(grouping: issues, by: \.source)
+    for (source, sourceIssues) in bySource {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: source)) else {
+            fputs("md-orphan: warning: cannot read \(source) for --fix\n", stderr)
+            continue
+        }
+        var bytes = [UInt8](data)
+        let sorted = sourceIssues.sorted {
+            guard case .style(_, _, let a, _) = $0.kind,
+                  case .style(_, _, let b, _) = $1.kind else { return false }
+            return a > b
+        }
+        for issue in sorted {
+            guard case .style(_, let suggested, let start, let end) = issue.kind else { continue }
+            guard start <= end, end <= bytes.count else { continue }
+            bytes.replaceSubrange(start..<end, with: Array(suggested.utf8))
+        }
+        do {
+            try Data(bytes).write(to: URL(fileURLWithPath: source), options: .atomic)
+        } catch {
+            fputs("md-orphan: warning: cannot write \(source): \(error)\n", stderr)
         }
     }
 }

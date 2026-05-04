@@ -63,11 +63,11 @@ public func relPath(_ path: String, under root: String) -> String? {
 private var readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 256 * 1024)
 private var readBufferCapacity = 256 * 1024
 
-/// Read file contents into the reusable buffer. Returns (inode, buffer slice).
+/// Read file contents into the reusable buffer. Returns the buffer slice.
 /// Buffer is only valid until the next call — callers must extract any needed data
 /// before invoking `readFile` again.
 /// read() beats mmap for small files — https://medium.com/cosmos-code/mmap-vs-read-a-performance-comparison-for-efficient-file-access-3e5337bd1e25
-public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
+public func readFile(path: String) -> UnsafeBufferPointer<UInt8>? {
     path.withCString { cstr in
         let fd = open(cstr, O_RDONLY)
         guard fd >= 0 else { return nil }
@@ -77,11 +77,7 @@ public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
         guard fstat(fd, &s) == 0 else { return nil }
 
         let size = Int(s.st_size)
-        let inode = s.st_ino
-
-        if size == 0 {
-            return (inode, UnsafeBufferPointer(start: nil, count: 0))
-        }
+        if size == 0 { return UnsafeBufferPointer(start: nil, count: 0) }
 
         if size > readBufferCapacity {
             readBuffer.deallocate()
@@ -96,7 +92,7 @@ public func readFile(path: String) -> (ino_t, UnsafeBufferPointer<UInt8>)? {
             totalRead += n
         }
 
-        return (inode, UnsafeBufferPointer(start: UnsafePointer(readBuffer), count: totalRead))
+        return UnsafeBufferPointer(start: UnsafePointer(readBuffer), count: totalRead)
     }
 }
 

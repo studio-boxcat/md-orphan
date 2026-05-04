@@ -53,7 +53,7 @@ Disable with `--no-cache` to skip cache machinery entirely.
 
 1. **Per-file `String` allocations during the walk** — was the original 810 ms regression. Fixed in `Discovery.swift` by skipping non-`.md` `String(cString:)`/`dropFirst` work before allocation. 810 ms → 540 ms.
 2. **fts dirent traversal cost** — kernel-side, no user-space optimization fixes this. Default excludes skip the big subtrees (`Library/`, `Pods/`, `node_modules/`, `.build/`, `DerivedData/`).
-3. **Per-`.md` `stat(2)`** — needed for inode (orphan dedup). `FTS_NOSTAT` skips fts's own stat but we add one back. Could investigate `entry.pointee.fts_statp` to drop the extra syscall, but it'd require dropping `FTS_NOSTAT` which is fastest on APFS for the common-case dirs we walk.
+3. ~~**Per-`.md` `stat(2)`**~~ — **removed.** `RepoIndex.mdFiles` is now a `Set<String>` of relpaths; orphan dedup uses canonical paths via `realPath` lazily on un-matched candidates only. Net wall-clock change is in the noise (saved ~1ms in indexRepo, paid back as ~0–1ms in the orphan filter for the rare symlinked `.md`).
 
 ## What doesn't help
 

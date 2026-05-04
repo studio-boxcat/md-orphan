@@ -31,11 +31,6 @@ Cache writes are last-writer-wins. If users start running two `md-orphan` invoca
 ### XDG nit
 `expandPath` understands `$VAR` and leading `~/`. It does not currently expand `~user/` (other-user homes). Nobody asked, but worth mentioning.
 
-### End-to-end `--fix` test
-The Phase 5 code review flagged that no test exercises the byte-rewriter path on a fixture file (`applyStyleFixes` in `main.swift`). Add: write a fixture with mixed wiki/cross-repo style violations, run the binary with `--fix`, assert (a) atomic write didn't truncate the file on a forced-fail mid-write, (b) the rewrite is idempotent (running `--fix` twice yields the same bytes).
-
 ### Multiple entry points spanning sibling dirs
 `main.swift:67` does `let root = dirName(resolvedEntries[0])` — if the user passes `a/index.md b/index.md` where `a/` and `b/` are siblings, the second entry is treated as living under `a/`'s root (broken-link-prone). Either (a) reject multi-entry across sibling dirs, or (b) compute a common ancestor. Pre-existing edge case; not a regression.
 
-### Drop the `stat()` call after fts walk
-`Discovery.swift:indexRepo` uses `FTS_NOSTAT` (fastest fts mode on APFS) and then issues a separate `stat(2)` per `.md` file to grab the inode. Could use `entry.pointee.fts_statp.pointee.st_ino` instead — but that requires dropping `FTS_NOSTAT`, which trades one stat for one-per-directory (likely net wash; profile to confirm before changing).

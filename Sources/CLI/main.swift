@@ -77,9 +77,16 @@ struct MdOrphan: ParsableCommand {
         )
         defer { cache.save() }
 
+        // mdFiles holds lexical relpaths (one per fts entry — symlinks count as their own entry).
+        // `reachable` holds canonical paths (resolved via realPath in CrawlState). Symlinks: the
+        // direct prefix-join misses, so we fall back to realPath only for un-matched candidates.
         let orphans = entryIndex.mdFiles
-            .filter { !reachable.contains($0.key) }
-            .map(\.value)
+            .filter { rel in
+                let abs = entryIndex.root + "/" + rel
+                if reachable.contains(abs) { return false }
+                if let canonical = realPath(abs), reachable.contains(canonical) { return false }
+                return true
+            }
             .sorted()
 
         let names = entryPoints.map { baseName($0) }.joined(separator: ", ")
@@ -220,31 +227,3 @@ private func renderStyle(link: String, suggested: String, scope: LinkIssue.Style
     }
 }
 
-/// Apply style fixes by rewriting just the path bytes inside [[...]] or `...`.
-/// Replacements applied per file in descending offset order so earlier offsets stay valid.
-/// Atomic write (`.atomic` — Foundation's tmp + rename) so a crash mid-write can't truncate the source.
-private func applyStyleFixes(_ issues: [LinkIssue]) {
-    let bySource = Dictionary(grouping: issues, by: \.source)
-    for (source, sourceIssues) in bySource {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: source)) else {
-            fputs("md-orphan: warning: cannot read \(source) for --fix\n", stderr)
-            continue
-        }
-        var bytes = [UInt8](data)
-        let sorted = sourceIssues.sorted {
-            guard case .style(_, _, let a, _) = $0.kind,
-                  case .style(_, _, let b, _) = $1.kind else { return false }
-            return a > b
-        }
-        for issue in sorted {
-            guard case .style(_, let suggested, let start, let end) = issue.kind else { continue }
-            guard start <= end, end <= bytes.count else { continue }
-            bytes.replaceSubrange(start..<end, with: Array(suggested.utf8))
-        }
-        do {
-            try Data(bytes).write(to: URL(fileURLWithPath: source), options: .atomic)
-        } catch {
-            fputs("md-orphan: warning: cannot write \(source): \(error)\n", stderr)
-        }
-    }
-}

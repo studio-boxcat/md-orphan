@@ -3,13 +3,13 @@ import Foundation
 
 public struct RepoIndex: Equatable {
     public let root: String                  // canonical (realpath'd) absolute root
-    public let mdFiles: [ino_t: String]       // inode → relPath, .md files only (orphan reachability)
-    public let byName: [String: [String]]    // basename → [absPath], all extensions (style/uniqueness)
+    public let mdFiles: Set<String>           // relPaths of .md files (orphan reachability set)
+    public let byName: [String: [String]]    // basename → [absPath]; .md only by default
     public let exclude: [String]             // effective patterns applied
 
     public init(
         root: String,
-        mdFiles: [ino_t: String],
+        mdFiles: Set<String>,
         byName: [String: [String]],
         exclude: [String]
     ) {
@@ -42,12 +42,12 @@ public func indexRepo(
     var argv: [UnsafeMutablePointer<CChar>?] = [rootCStr, nil]
 
     guard let stream = fts_open(&argv, FTS_PHYSICAL | FTS_NOCHDIR | FTS_NOSTAT, nil) else {
-        return RepoIndex(root: resolved, mdFiles: [:], byName: [:], exclude: effective)
+        return RepoIndex(root: resolved, mdFiles: [], byName: [:], exclude: effective)
     }
     defer { fts_close(stream) }
 
     let rootLen = resolved.utf8.count
-    var mdFiles: [ino_t: String] = [:]
+    var mdFiles: Set<String> = []
     var byName: [String: [String]] = [:]
 
     while let entry = fts_read(stream) {
@@ -98,9 +98,7 @@ public func indexRepo(
         byName[basename, default: []].append(absPath)
 
         if isMd {
-            var s = stat()
-            guard stat(entry.pointee.fts_path, &s) == 0 else { continue }
-            mdFiles[s.st_ino] = relPath
+            mdFiles.insert(relPath)
         }
     }
 

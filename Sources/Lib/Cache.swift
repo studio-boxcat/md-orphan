@@ -101,9 +101,8 @@ func saveLinkCache(_ cache: LinkCache, canonicalRoot: String) {
 
 // MARK: - Cache-aware extraction
 
-/// Extracted data for a file: links + headings + the source bytes' inode.
+/// Extracted data for a file: links + headings.
 public struct ExtractedFile {
-    public let inode: ino_t
     public let links: [Link]
     public let headings: Set<String>
 }
@@ -124,32 +123,24 @@ public final class ExtractionCache {
     /// outside the repo root (e.g. an entry file passed by absolute path) — in that case
     /// caching is skipped and we always extract fresh.
     public func read(filePath: String, repoRoot: String) -> ExtractedFile? {
-        guard let (inode, buf) = readFile(path: filePath) else { return nil }
+        guard let buf = readFile(path: filePath) else { return nil }
 
         guard enabled,
               filePath == repoRoot || filePath.hasPrefix(repoRoot + "/")
         else {
-            return ExtractedFile(
-                inode: inode,
-                links: extractLinks(buf),
-                headings: extractHeadings(buf)
-            )
+            return ExtractedFile(links: extractLinks(buf), headings: extractHeadings(buf))
         }
 
         guard let relKey = relPath(filePath, under: repoRoot) else {
             // Defensive: caller should only invoke with `filePath` under `repoRoot`. Fall back
             // to fresh extraction if this invariant ever breaks.
-            return ExtractedFile(inode: inode, links: extractLinks(buf), headings: extractHeadings(buf))
+            return ExtractedFile(links: extractLinks(buf), headings: extractHeadings(buf))
         }
 
-        // Stat for mtime + size. Buffer read above already gave us inode + size.
+        // Stat for mtime + size — needed for cache validation key.
         var st = stat()
         guard stat(filePath, &st) == 0 else {
-            return ExtractedFile(
-                inode: inode,
-                links: extractLinks(buf),
-                headings: extractHeadings(buf)
-            )
+            return ExtractedFile(links: extractLinks(buf), headings: extractHeadings(buf))
         }
         // Checked arithmetic — overflow here means corrupt stat data, not a value to silently wrap.
         let mtimeNs = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
@@ -159,7 +150,7 @@ public final class ExtractionCache {
         let cache = ensureLoaded(canonicalRoot: repoRoot)
         if let entry = cache.entries[relKey],
            entry.mtimeNs == mtimeNs, entry.size == size, entry.contentHash == hash {
-            return ExtractedFile(inode: inode, links: entry.links, headings: Set(entry.headings))
+            return ExtractedFile(links: entry.links, headings: Set(entry.headings))
         }
 
         // Cache miss: extract + update.
@@ -172,7 +163,7 @@ public final class ExtractionCache {
         )
         caches[repoRoot]!.entries[relKey] = newEntry
         dirty.insert(repoRoot)
-        return ExtractedFile(inode: inode, links: links, headings: headings)
+        return ExtractedFile(links: links, headings: headings)
     }
 
     /// Drop entries for files no longer under the repo (auto-prune).

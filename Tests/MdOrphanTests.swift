@@ -685,6 +685,50 @@ private func writeFile(_ path: String, _ content: String) {
         let paths = extractLinks(from: src).map(\.target)
         #expect(paths == ["TODO.md"])
     }
+
+    // MARK: - --fix end-to-end
+
+    @Test func applyStyleFixesRewritesWikiAndCrossRepoAndIsIdempotent() {
+        withTempDir { rootBase in
+            // Two repos: entry "a" with a fixture index file holding a wiki + cross-repo style violation;
+            // target "b" providing the cross-repo target.
+            mkdir("\(rootBase)/a", 0o755)
+            mkdir("\(rootBase)/a/docs", 0o755)
+            mkdir("\(rootBase)/b", 0o755)
+            mkdir("\(rootBase)/b/docs", 0o755)
+
+            let original = "x [[docs/guide.md]] y `docs/foo.md` (b) z"
+            let indexPath = "\(rootBase)/a/index.md"
+            writeFile(indexPath, original)
+            writeFile("\(rootBase)/a/docs/guide.md", "")
+            writeFile("\(rootBase)/b/docs/foo.md", "")
+
+            let opts = CrawlOptions(repos: ["b": "\(rootBase)/b"])
+
+            // First pass: 2 style issues expected, fix applied.
+            let (_, _, first) = bfsCrawl(entryPaths: [indexPath], root: "\(rootBase)/a", options: opts)
+            let firstStyle = first.filter { if case .style = $0.kind { return true }; return false }
+            #expect(firstStyle.count == 2)
+            applyStyleFixes(firstStyle)
+
+            // Verify rewritten content.
+            let rewritten = (try? String(contentsOfFile: indexPath, encoding: .utf8)) ?? ""
+            #expect(rewritten == "x [[guide.md]] y `foo.md` (b) z")
+
+            // Atomic write didn't truncate or duplicate.
+            #expect(rewritten.count < original.count)
+            #expect(!rewritten.isEmpty)
+
+            // Idempotency: a second pass yields zero style issues, file content unchanged.
+            let (_, _, second) = bfsCrawl(entryPaths: [indexPath], root: "\(rootBase)/a", options: opts)
+            let secondStyle = second.filter { if case .style = $0.kind { return true }; return false }
+            #expect(secondStyle.isEmpty)
+
+            applyStyleFixes(secondStyle)  // no-op
+            let stillRewritten = (try? String(contentsOfFile: indexPath, encoding: .utf8)) ?? ""
+            #expect(stillRewritten == rewritten)
+        }
+    }
 }
 
 // MARK: - config + ignore
@@ -881,9 +925,9 @@ func benchmarkMeowTower() {
     t0 = Date()
     var totalLinks = 0
     var totalHeadings = 0
-    for path in idx.mdFiles.values {
+    for path in idx.mdFiles {
         let abs = idx.root + "/" + path
-        guard let (_, buf) = readFile(path: abs) else { continue }
+        guard let buf = readFile(path: abs) else { continue }
         totalLinks += extractLinks(buf).count
         totalHeadings += extractHeadings(buf).count
     }
