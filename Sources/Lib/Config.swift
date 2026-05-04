@@ -29,7 +29,7 @@ public func defaultConfigPath() -> String {
     return base + "/md-orphan/md-orphan.json"
 }
 
-public func homeDir() -> String {
+func homeDir() -> String {
     if let h = ProcessInfo.processInfo.environment["HOME"], !h.isEmpty { return h }
     return NSHomeDirectory()
 }

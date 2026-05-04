@@ -30,19 +30,19 @@ public struct CacheEntry: Codable {
 
 // MARK: - Cache directory + filename
 
-public func cacheDirectory() -> String {
+func cacheDirectory() -> String {
     let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
     let base = (xdg?.isEmpty == false ? xdg! : (homeDir() + "/.config"))
     return base + "/md-orphan/cache"
 }
 
-public func cacheFilePath(forCanonicalRoot canonicalRoot: String) -> String {
+func cacheFilePath(forCanonicalRoot canonicalRoot: String) -> String {
     return cacheDirectory() + "/" + fnv1a64Hex(canonicalRoot) + ".json"
 }
 
 /// fnv1a-64 of a UTF-8 string. Used for cache filenames and for content-equivalence checks.
 @inline(__always)
-public func fnv1a64Hex(_ s: String) -> String {
+func fnv1a64Hex(_ s: String) -> String {
     var h: UInt64 = 0xcbf29ce484222325
     for byte in s.utf8 {
         h ^= UInt64(byte)
@@ -52,7 +52,7 @@ public func fnv1a64Hex(_ s: String) -> String {
 }
 
 @inline(__always)
-public func fnv1a64(_ buf: UnsafeBufferPointer<UInt8>) -> UInt64 {
+func fnv1a64(_ buf: UnsafeBufferPointer<UInt8>) -> UInt64 {
     var h: UInt64 = 0xcbf29ce484222325
     guard let base = buf.baseAddress else { return h }
     for i in 0..<buf.count {
@@ -65,7 +65,7 @@ public func fnv1a64(_ buf: UnsafeBufferPointer<UInt8>) -> UInt64 {
 // MARK: - Load / save
 
 /// Load cache for a canonical repo root. Returns a fresh empty cache on any error or version mismatch.
-public func loadLinkCache(canonicalRoot: String, displayName: String) -> LinkCache {
+func loadLinkCache(canonicalRoot: String, displayName: String) -> LinkCache {
     let path = cacheFilePath(forCanonicalRoot: canonicalRoot)
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
         return LinkCache(displayName: displayName)
@@ -80,7 +80,7 @@ public func loadLinkCache(canonicalRoot: String, displayName: String) -> LinkCac
 }
 
 /// Save cache atomically. Cache loss isn't fatal — silently swallow write errors.
-public func saveLinkCache(_ cache: LinkCache, canonicalRoot: String) {
+func saveLinkCache(_ cache: LinkCache, canonicalRoot: String) {
     let dir = cacheDirectory()
     _ = mkdir(dir, 0o755)  // best-effort; ignores EEXIST
     // Also create parent .config/md-orphan if missing
