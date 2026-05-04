@@ -106,3 +106,66 @@ public func indexRepo(
 
     return RepoIndex(root: resolved, mdFiles: mdFiles, byName: byName, exclude: effective)
 }
+
+/// Walk `root` with fts, return [inode: relativePath] for all .md files.
+/// Lighter-weight alternative to `indexRepo` when only the .md inode map is needed.
+/// fts_open with FTS_NOSTAT is fastest on APFS — http://blog.tempel.org/2019/04/dir-read-performance.html
+/// Avoid getattrlistbulk — https://developer.apple.com/forums/thread/656787
+public func discoverFiles(root: String, exclude: [String] = []) -> [ino_t: String] {
+    let rootCStr = strdup(root)!
+    defer { free(rootCStr) }
+    var argv: [UnsafeMutablePointer<CChar>?] = [rootCStr, nil]
+
+    guard let stream = fts_open(&argv, FTS_PHYSICAL | FTS_NOCHDIR | FTS_NOSTAT, nil) else {
+        return [:]
+    }
+    defer { fts_close(stream) }
+
+    let rootLen = root.utf8.count
+    var allFiles: [ino_t: String] = [:]
+
+    while let entry = fts_read(stream) {
+        let info = Int32(entry.pointee.fts_info)
+        let nameLen = Int(entry.pointee.fts_namelen)
+        let namePtr = entry.pointee.fts_path
+            .advanced(by: Int(entry.pointee.fts_pathlen) - nameLen)
+
+        if info == FTS_D {
+            if nameLen > 1 && namePtr.pointee == 0x2E {
+                fts_set(stream, entry, FTS_SKIP)
+                continue
+            }
+            if !exclude.isEmpty {
+                let absPath = String(cString: entry.pointee.fts_path)
+                let relPath = absPath.utf8.count > rootLen + 1
+                    ? String(absPath.dropFirst(rootLen + 1))
+                    : ""
+                if !relPath.isEmpty && isExcluded(relPath, by: exclude) {
+                    fts_set(stream, entry, FTS_SKIP)
+                }
+            }
+            continue
+        }
+
+        guard info == FTS_F || info == FTS_SL || info == FTS_NSOK else { continue }
+
+        guard nameLen >= 3,
+              namePtr[nameLen - 3] == 0x2E,
+              namePtr[nameLen - 2] == 0x6D,
+              namePtr[nameLen - 1] == 0x64
+        else { continue }
+
+        let absPath = String(cString: entry.pointee.fts_path)
+        let relPath = absPath.utf8.count > rootLen + 1
+            ? String(absPath.dropFirst(rootLen + 1))
+            : absPath
+
+        if !exclude.isEmpty && isExcluded(relPath, by: exclude) { continue }
+
+        var s = stat()
+        guard stat(entry.pointee.fts_path, &s) == 0 else { continue }
+        allFiles[s.st_ino] = relPath
+    }
+
+    return allFiles
+}

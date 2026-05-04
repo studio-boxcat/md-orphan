@@ -122,14 +122,16 @@ Disable with `--no-cache`.
 
 ## Structure
 
-- `Sources/Lib/MdOrphan.swift` — Link/heading extractors, BFS crawl, resolution
-- `Sources/Lib/Discovery.swift` — fts-based file walking + per-repo `RepoIndex`
-- `Sources/Lib/Config.swift` — Global JSON config + per-repo `.md-orphan` parsing
-- `Sources/Lib/Cache.swift` — Per-file extraction cache (mtime+size+hash keyed)
-- `Sources/CLI/main.swift` — ArgumentParser entry point
+- `Sources/Lib/Util.swift` — path helpers (`realPath`, `dirName`, `baseName`, `isExcluded`) + `readFile`
+- `Sources/Lib/Extract.swift` — `Link` type + byte-level link/heading/fence scanners
+- `Sources/Lib/Crawl.swift` — `bfsCrawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolveLink`
+- `Sources/Lib/Discovery.swift` — fts walks: `indexRepo` + `RepoIndex` + `discoverFiles`
+- `Sources/Lib/Config.swift` — global JSON config + per-repo `.md-orphan` parsing
+- `Sources/Lib/Cache.swift` — per-file extraction cache (mtime + size + content-hash keyed)
+- `Sources/CLI/main.swift` — ArgumentParser entry point + output rendering + `--fix`
 - `Tests/` — Swift Testing test suite
 - `dist/` — Pre-built release binary
-- See [[architecture.md]] for the in-flight architecture overhaul
+- See [[architecture.md]] for the architecture overhaul design
 
 ## Algorithm
 
