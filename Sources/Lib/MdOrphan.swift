@@ -173,21 +173,76 @@ public struct MdLink: Equatable {
     public let fragment: String?
 }
 
+public enum LinkKind: Equatable {
+    case wiki                  // [[path]]
+    case standard              // [text](path)
+    case crossRepo(String)     // `path` (repo-name)
+}
+
+/// Link with byte positions for in-place rewriting (used by the cache layer too).
+public struct MdLinkDetail: Equatable {
+    public let path: String
+    public let fragment: String?
+    public let kind: LinkKind
+    public let pathStart: Int  // byte offset of path start in source
+    public let pathEnd: Int    // byte offset of path end (exclusive)
+
+    public init(path: String, fragment: String?, kind: LinkKind, pathStart: Int, pathEnd: Int) {
+        self.path = path
+        self.fragment = fragment
+        self.kind = kind
+        self.pathStart = pathStart
+        self.pathEnd = pathEnd
+    }
+}
+
 /// Scan raw UTF-8 bytes for markdown links to local files.
 /// Manual byte scan — Swift Regex is 28-33x slower: https://forums.swift.org/t/slow-regex-performance/75768
 public func extractLinksWithFragments(_ buf: UnsafeBufferPointer<UInt8>) -> [MdLink] {
+    extractLinksDetailed(buf).map { MdLink(path: $0.path, fragment: $0.fragment) }
+}
+
+public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
+    extractLinksDetailed(buf).map(\.path)
+}
+
+public func extractLinksDetailed(_ buf: UnsafeBufferPointer<UInt8>) -> [MdLinkDetail] {
     guard let base = buf.baseAddress, buf.count > 4 else { return [] }
     let count = buf.count
-    var links: [MdLink] = []
+    var links: [MdLinkDetail] = []
     var i = 0
+    var inFence = false
 
-    while i < count - 1 {
-        if base[i] == 0x5B, base[i + 1] == 0x5B {
-            i = scanWikiLink(base, count: count, at: i, into: &links)
+    while i < count {
+        // Code-fence detection at line start (\n or BOF followed by ```).
+        // Skip indented fences — only flush-left ``` toggles fence state.
+        let atLineStart = (i == 0 || base[i - 1] == 0x0A)
+        if atLineStart && i + 2 < count
+            && base[i] == 0x60 && base[i + 1] == 0x60 && base[i + 2] == 0x60 {
+            inFence.toggle()
+            // Skip to end of line so the fence's own info-string isn't scanned.
+            while i < count && base[i] != 0x0A { i += 1 }
+            if i < count { i += 1 }
             continue
         }
-        if base[i] == 0x5D, base[i + 1] == 0x28 {
-            i = scanStandardLink(base, count: count, at: i, into: &links)
+
+        if inFence {
+            i += 1
+            continue
+        }
+
+        if i < count - 1 {
+            if base[i] == 0x5B, base[i + 1] == 0x5B {
+                i = scanWikiLink(base, count: count, at: i, into: &links)
+                continue
+            }
+            if base[i] == 0x5D, base[i + 1] == 0x28 {
+                i = scanStandardLink(base, count: count, at: i, into: &links)
+                continue
+            }
+        }
+        if base[i] == 0x60 {
+            i = scanBacktickRef(base, count: count, at: i, into: &links)
             continue
         }
         i += 1
@@ -196,13 +251,9 @@ public func extractLinksWithFragments(_ buf: UnsafeBufferPointer<UInt8>) -> [MdL
     return links
 }
 
-public func extractLinks(_ buf: UnsafeBufferPointer<UInt8>) -> [String] {
-    extractLinksWithFragments(buf).map(\.path)
-}
-
 /// Parse [[page]], [[page|alias]], [[page#section]] wiki links.
 private func scanWikiLink(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLink]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLinkDetail]
 ) -> Int {
     let start = i + 2
     var end = start
@@ -237,13 +288,19 @@ private func scanWikiLink(
         let fragLen = fragEnd - hashPos - 1
         if fragLen > 0 { fragment = decodeUTF8(base, from: hashPos + 1, len: fragLen) }
     }
-    links.append(MdLink(path: decodeUTF8(base, from: start, len: nameLen), fragment: fragment))
+    links.append(MdLinkDetail(
+        path: decodeUTF8(base, from: start, len: nameLen),
+        fragment: fragment,
+        kind: .wiki,
+        pathStart: start,
+        pathEnd: nameEnd
+    ))
     return end + 2
 }
 
 /// Parse [text](path.md#fragment) standard links.
 private func scanStandardLink(
-    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLink]
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLinkDetail]
 ) -> Int {
     let start = i + 2
     var end = start
@@ -271,8 +328,79 @@ private func scanStandardLink(
         let fragLen = end - fragPos - 1
         if fragLen > 0 { fragment = decodeUTF8(base, from: fragPos + 1, len: fragLen) }
     }
-    links.append(MdLink(path: decodeUTF8(base, from: start, len: pathLen), fragment: fragment))
+    links.append(MdLinkDetail(
+        path: decodeUTF8(base, from: start, len: pathLen),
+        fragment: fragment,
+        kind: .standard,
+        pathStart: start,
+        pathEnd: pathEnd
+    ))
     return end + 1
+}
+
+/// Parse `path` (repo-name) cross-repo backtick refs. Returns next scan index.
+/// Recognizes `path.ext` (repo) and `path.ext#fragment` (repo).
+/// Bare `path.ext` without trailing ` (repo)` is currently ignored (inline-code style is deferred).
+private func scanBacktickRef(
+    _ base: UnsafePointer<UInt8>, count: Int, at i: Int, into links: inout [MdLinkDetail]
+) -> Int {
+    // Skip multi-backtick spans (``foo``, ```bar```) — only single-backtick code spans handled.
+    if i + 1 < count && base[i + 1] == 0x60 { return i + 1 }
+
+    let pathStart = i + 1
+    var end = pathStart
+    while end < count {
+        let b = base[end]
+        if b == 0x60 { break }
+        if b == 0x0A || b == 0x0D { return i + 1 }  // unclosed backtick on this line → advance past it
+        end += 1
+    }
+    guard end < count, base[end] == 0x60, end > pathStart else { return i + 1 }
+
+    // After the closing backtick, look for " (repo-name)".
+    let afterClose = end + 1
+    guard afterClose + 2 < count, base[afterClose] == 0x20, base[afterClose + 1] == 0x28 else {
+        // Bare `path.ext` — inline-code style (deferred); skip past the closing backtick.
+        return afterClose
+    }
+    let repoStart = afterClose + 2
+    var repoEnd = repoStart
+    while repoEnd < count {
+        let rb = base[repoEnd]
+        if rb == 0x29 { break }
+        // Repo names: [A-Za-z0-9_-]
+        let isAlpha = (rb >= 0x41 && rb <= 0x5A) || (rb >= 0x61 && rb <= 0x7A)
+        let isDigit = rb >= 0x30 && rb <= 0x39
+        if !(isAlpha || isDigit || rb == 0x5F || rb == 0x2D) { return afterClose }
+        repoEnd += 1
+    }
+    guard repoEnd < count, base[repoEnd] == 0x29, repoEnd > repoStart else { return afterClose }
+
+    // Path inside backticks: split on first '#' for fragment.
+    var hashPos = -1
+    for j in pathStart..<end {
+        if base[j] == 0x23 { hashPos = j; break }
+    }
+    let nameEnd = hashPos >= 0 ? hashPos : end
+    let nameLen = nameEnd - pathStart
+    guard nameLen > 0, hasExtension(base, from: pathStart, len: nameLen) else {
+        return repoEnd + 1
+    }
+
+    var fragment: String? = nil
+    if hashPos >= 0 {
+        let fragLen = end - hashPos - 1
+        if fragLen > 0 { fragment = decodeUTF8(base, from: hashPos + 1, len: fragLen) }
+    }
+    let repo = decodeUTF8(base, from: repoStart, len: repoEnd - repoStart)
+    links.append(MdLinkDetail(
+        path: decodeUTF8(base, from: pathStart, len: nameLen),
+        fragment: fragment,
+        kind: .crossRepo(repo),
+        pathStart: pathStart,
+        pathEnd: nameEnd
+    ))
+    return repoEnd + 1
 }
 
 /// Convenience: extract links from a String.
@@ -372,85 +500,347 @@ public func resolveLink(_ link: String, relativeTo sourceFile: String, root: Str
 /// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
 /// When a link can't be resolved relative to its file, falls back to basename lookup in allFiles.
 public struct LinkIssue: Equatable {
-    public enum Kind: Equatable { case broken, ambiguous(Int), brokenAnchor(String) }
+    public enum StyleScope: Equatable {
+        case wiki                       // [[path]]
+        case crossRepo(repo: String)    // `path` (repo)
+    }
+    public enum Kind: Equatable {
+        case broken
+        case ambiguous(Int)
+        case brokenAnchor(String)
+        case style(scope: StyleScope, suggested: String, pathStart: Int, pathEnd: Int)
+        case unknownRepo(repo: String)
+        case crossRepoBroken(repo: String)
+    }
     public let link: String
     public let source: String
     public let kind: Kind
 }
 
-public func bfsCrawl(entryPaths: [String], root: String, allFiles: [ino_t: String] = [:]) -> (reachable: Set<ino_t>, issues: [LinkIssue]) {
-    // Build basename → absolute path lookup for fallback resolution
-    var byName: [String: [String]] = [:]
-    for (_, relPath) in allFiles {
-        byName[baseName(relPath), default: []].append(root + "/" + relPath)
+public struct CrawlOptions {
+    /// repo-name → absolute root (already env/tilde-expanded; will be realpath'd internally).
+    public var repos: [String: String]
+    public var useDefaultExcludes: Bool
+    /// CLI --exclude entries; layered on top of <repo>/.md-orphan and built-in defaults.
+    public var extraExcludes: [String]
+
+    public init(repos: [String: String] = [:], useDefaultExcludes: Bool = true, extraExcludes: [String] = []) {
+        self.repos = repos
+        self.useDefaultExcludes = useDefaultExcludes
+        self.extraExcludes = extraExcludes
+    }
+}
+
+/// BFS from entry points across same-repo and (optionally) cross-repo references.
+///
+/// Visited tracking is split:
+///  - **Entry repo**: inode-keyed (`reachable`). Used for orphan detection + symlink/hardlink dedup.
+///  - **Cross-repo**: canonical-path-keyed. Cross-repo files are visited + verified + style-checked
+///    but never enter `reachable` (orphan detection is scoped to the entry repo).
+///
+/// Single-threaded — TaskGroup overhead exceeds I/O at this scale: https://forums.swift.org/t/taskgroup-and-parallelism/51039
+public func bfsCrawl(
+    entryPaths: [String],
+    root: String,
+    allFiles: [ino_t: String] = [:],
+    options: CrawlOptions = .init(),
+    cache: ExtractionCache = ExtractionCache(enabled: false)
+) -> (reachable: Set<ino_t>, issues: [LinkIssue]) {
+    // Resolve root + entry paths to canonical (realpath). Mixing resolved/unresolved paths
+    // breaks prefix checks (e.g. macOS /var/folders → /private/var/folders symlink).
+    let resolvedRoot = realPath(root) ?? root
+    let canonicalEntries = entryPaths.map { realPath($0) ?? $0 }
+
+    // Entry-repo index: synthesize from `allFiles` (legacy/test path) or build fresh via indexRepo.
+    let entryIndex: RepoIndex
+    if !allFiles.isEmpty {
+        var byName: [String: [String]] = [:]
+        for (_, relPath) in allFiles {
+            byName[baseName(relPath), default: []].append(resolvedRoot + "/" + relPath)
+        }
+        entryIndex = RepoIndex(root: resolvedRoot, mdFiles: allFiles, byName: byName, exclude: [])
+    } else {
+        let projectIgnore = (try? loadProjectIgnore(root: resolvedRoot)) ?? []
+        let exclude = options.extraExcludes + projectIgnore
+        entryIndex = indexRepo(root: resolvedRoot, exclude: exclude,
+                               useDefaultExcludes: options.useDefaultExcludes)
     }
 
-    var reachable = Set<ino_t>()
+    // Resolve cross-repo paths from config to canonical roots; map repo-name → canonical root.
+    var resolvedRepos: [String: String] = [:]
+    for (name, raw) in options.repos {
+        resolvedRepos[name] = realPath(raw) ?? raw
+    }
+
+    // Lazy index cache, keyed by canonical root path.
+    var indices: [String: RepoIndex] = [resolvedRoot: entryIndex]
+    func indexFor(repoRoot: String) -> RepoIndex {
+        if let cached = indices[repoRoot] { return cached }
+        let projectIgnore = (try? loadProjectIgnore(root: repoRoot)) ?? []
+        let exclude = options.extraExcludes + projectIgnore
+        let idx = indexRepo(root: repoRoot, exclude: exclude,
+                            useDefaultExcludes: options.useDefaultExcludes)
+        indices[repoRoot] = idx
+        return idx
+    }
+
+    var queue: [BfsQueueItem] = canonicalEntries.map {
+        BfsQueueItem(path: $0, repoRoot: resolvedRoot, isEntryRepo: true)
+    }
+    var queuedEntryPaths = Set(canonicalEntries)   // dedup before read for entry repo
+    var crossRepoVisited = Set<String>()           // canonical paths for cross-repo files
+    var reachable = Set<ino_t>()                   // entry-repo orphan tracking
     var issues: [LinkIssue] = []
-    var queued = Set(entryPaths)
-    var queue = entryPaths
     var headingCache: [String: Set<String>] = [:]
     var idx = 0
 
+    /// Lookup canonical headings for a target file, with caching. The owning repo's root is used
+    /// for ExtractionCache scoping so headings come from the cache when available.
+    func headings(for canonical: String) -> Set<String> {
+        if let cached = headingCache[canonical] { return cached }
+        let owningRoot = repoRootContaining(canonical) ?? resolvedRoot
+        let h: Set<String>
+        if let result = cache.read(filePath: canonical, repoRoot: owningRoot) {
+            h = result.headings
+        } else {
+            h = []
+        }
+        headingCache[canonical] = h
+        return h
+    }
+
+    /// Determine which configured repo a canonical absolute path belongs to. Returns repo root or nil.
+    func repoRootContaining(_ path: String) -> String? {
+        if path == resolvedRoot || path.hasPrefix(resolvedRoot + "/") { return resolvedRoot }
+        for (_, root) in resolvedRepos {
+            if path == root || path.hasPrefix(root + "/") { return root }
+        }
+        return nil
+    }
+
     while idx < queue.count {
-        let filePath = queue[idx]
+        let item = queue[idx]
         idx += 1
 
-        guard let (inode, content) = readFile(path: filePath) else {
-            fputs("md-orphan: warning: cannot read \(filePath)\n", stderr)
+        guard let result = cache.read(filePath: item.path, repoRoot: item.repoRoot) else {
+            fputs("md-orphan: warning: cannot read \(item.path)\n", stderr)
             continue
         }
 
-        guard reachable.insert(inode).inserted else { continue }
+        if item.isEntryRepo {
+            guard reachable.insert(result.inode).inserted else { continue }
+        } else {
+            guard crossRepoVisited.insert(item.path).inserted else { continue }
+        }
 
-        for link in extractLinksWithFragments(content) {
-            guard let resolved = resolveLink(link.path, relativeTo: filePath, root: root) else {
-                continue
-            }
-            let isMd = link.path.hasSuffix(".md")
-            var canonical = realPath(resolved)
+        // Source-file headings populate the cache too (cheap because we already have the bytes).
+        headingCache[item.path] = result.headings
 
-            // Basename fallback only for .md links
-            if canonical == nil && isMd {
-                let basename = baseName(link.path)
-                if let candidates = byName[basename], candidates.count == 1 {
-                    canonical = realPath(candidates[0])
-                } else if let candidates = byName[basename], candidates.count > 1 {
-                    issues.append(LinkIssue(link: link.path, source: filePath, kind: .ambiguous(candidates.count)))
-                    continue
-                }
-            }
+        let currentIndex = indices[item.repoRoot] ?? entryIndex
 
-            guard let canonical else {
-                issues.append(LinkIssue(link: link.path, source: filePath, kind: .broken))
-                continue
-            }
-
-            // Only crawl .md files for further links
-            guard isMd else { continue }
-
-            // Lazy anchor check: only read target for headings when fragment present
-            if let fragment = link.fragment {
-                let headings: Set<String>
-                if let cached = headingCache[canonical] {
-                    headings = cached
-                } else if let (_, targetBuf) = readFile(path: canonical) {
-                    headings = extractHeadings(targetBuf)
-                    headingCache[canonical] = headings
-                } else {
-                    headings = []
-                    headingCache[canonical] = headings
-                }
-                if !headings.contains(fragment) {
-                    issues.append(LinkIssue(link: link.path, source: filePath, kind: .brokenAnchor(fragment)))
-                }
-            }
-
-            if queued.insert(canonical).inserted {
-                queue.append(canonical)
+        for link in result.links {
+            switch link.kind {
+            case .wiki, .standard:
+                processSameRepoLink(
+                    link: link, sourceFile: item.path, current: currentIndex,
+                    queue: &queue, queuedEntryPaths: &queuedEntryPaths,
+                    crossRepoVisited: &crossRepoVisited, issues: &issues,
+                    headingsLookup: headings, repoRootContaining: repoRootContaining
+                )
+            case .crossRepo(let repoName):
+                processCrossRepoLink(
+                    link: link, sourceFile: item.path, repoName: repoName,
+                    resolvedRepos: resolvedRepos, indexFor: indexFor,
+                    queue: &queue, crossRepoVisited: &crossRepoVisited,
+                    queuedEntryPaths: &queuedEntryPaths, entryRoot: resolvedRoot,
+                    issues: &issues, headingsLookup: headings
+                )
             }
         }
+    }
+
+    // Auto-prune cache entries for files no longer present in any indexed repo.
+    for (root, idx) in indices {
+        let keep = Set(idx.mdFiles.values)
+        cache.prune(canonicalRoot: root, keepRelativePaths: keep)
     }
 
     return (reachable, issues)
 }
+
+// MARK: - Internal link processing
+
+private func processSameRepoLink(
+    link: MdLinkDetail,
+    sourceFile: String,
+    current: RepoIndex,
+    queue: inout [BfsQueueItem],
+    queuedEntryPaths: inout Set<String>,
+    crossRepoVisited: inout Set<String>,
+    issues: inout [LinkIssue],
+    headingsLookup: (String) -> Set<String>,
+    repoRootContaining: (String) -> String?
+) {
+    guard let resolved = resolveLink(link.path, relativeTo: sourceFile, root: current.root) else {
+        return
+    }
+    let isMd = link.path.hasSuffix(".md")
+    var canonical = realPath(resolved)
+
+    // Basename fallback only for .md links.
+    if canonical == nil && isMd {
+        let basename = baseName(link.path)
+        if let candidates = current.byName[basename], candidates.count == 1 {
+            canonical = realPath(candidates[0])
+        } else if let candidates = current.byName[basename], candidates.count > 1 {
+            issues.append(LinkIssue(link: link.path, source: sourceFile,
+                                    kind: .ambiguous(candidates.count)))
+            return
+        }
+    }
+
+    guard let canonical else {
+        issues.append(LinkIssue(link: link.path, source: sourceFile, kind: .broken))
+        return
+    }
+
+    // Style check applies only to wiki links and only when target lives in the same repo.
+    if link.kind == .wiki, canonical.hasPrefix(current.root + "/") {
+        let relTarget = String(canonical.dropFirst(current.root.count + 1))
+        let basename = baseName(relTarget)
+        let canonicalForm: String
+        if let cands = current.byName[basename], cands.count == 1 {
+            canonicalForm = basename
+        } else {
+            canonicalForm = relTarget
+        }
+        if link.path != canonicalForm {
+            issues.append(LinkIssue(
+                link: link.path, source: sourceFile,
+                kind: .style(scope: .wiki, suggested: canonicalForm,
+                             pathStart: link.pathStart, pathEnd: link.pathEnd)
+            ))
+        }
+    }
+
+    // Only crawl .md files further.
+    guard isMd else { return }
+
+    if let fragment = link.fragment {
+        if !headingsLookup(canonical).contains(fragment) {
+            issues.append(LinkIssue(link: link.path, source: sourceFile,
+                                    kind: .brokenAnchor(fragment)))
+        }
+    }
+
+    // Enqueue: same-repo target stays in entry-repo dedup; if it crosses into another configured
+    // repo (rare), funnel into cross-repo visit set.
+    let owningRoot = repoRootContaining(canonical) ?? current.root
+    if owningRoot == current.root {
+        if queuedEntryPaths.insert(canonical).inserted {
+            queue.append(BfsQueueItem(path: canonical, repoRoot: current.root, isEntryRepo: true))
+        }
+    } else if !crossRepoVisited.contains(canonical) {
+        queue.append(BfsQueueItem(path: canonical, repoRoot: owningRoot, isEntryRepo: false))
+    }
+}
+
+private func processCrossRepoLink(
+    link: MdLinkDetail,
+    sourceFile: String,
+    repoName: String,
+    resolvedRepos: [String: String],
+    indexFor: (String) -> RepoIndex,
+    queue: inout [BfsQueueItem],
+    crossRepoVisited: inout Set<String>,
+    queuedEntryPaths: inout Set<String>,
+    entryRoot: String,
+    issues: inout [LinkIssue],
+    headingsLookup: (String) -> Set<String>
+) {
+    guard let repoRoot = resolvedRepos[repoName] else {
+        issues.append(LinkIssue(link: link.path, source: sourceFile,
+                                kind: .unknownRepo(repo: repoName)))
+        return
+    }
+
+    // Cross-repo paths are repo-root-relative (no source-file-relative resolution).
+    // Normalize ./ ../ but reject if escapes the target repo root.
+    let rawCombined = link.path.hasPrefix("/") ? repoRoot + link.path : repoRoot + "/" + link.path
+    var segments: [String] = []
+    var escaped = false
+    for seg in rawCombined.split(separator: "/", omittingEmptySubsequences: true) {
+        switch seg {
+        case ".": continue
+        case "..":
+            if !segments.isEmpty { segments.removeLast() } else { escaped = true; break }
+        default: segments.append(String(seg))
+        }
+    }
+    let normalized = "/" + segments.joined(separator: "/")
+    let withinRoot = !escaped && (normalized == repoRoot || normalized.hasPrefix(repoRoot + "/"))
+
+    let isMd = link.path.hasSuffix(".md")
+    var canonical: String? = withinRoot ? realPath(normalized) : nil
+    let repoIndex = indexFor(repoRoot)
+
+    // Basename fallback within target repo (.md only) — also handles `../` escape style violations.
+    if canonical == nil && isMd {
+        let basename = baseName(link.path)
+        if let candidates = repoIndex.byName[basename], candidates.count == 1 {
+            canonical = realPath(candidates[0])
+        } else if let candidates = repoIndex.byName[basename], candidates.count > 1 {
+            issues.append(LinkIssue(link: link.path, source: sourceFile,
+                                    kind: .ambiguous(candidates.count)))
+            return
+        }
+    }
+
+    guard let canonical else {
+        issues.append(LinkIssue(link: link.path, source: sourceFile,
+                                kind: .crossRepoBroken(repo: repoName)))
+        return
+    }
+
+    // Style: cross-repo path canonicalizes to basename if unique in target repo, else repo-root-relative.
+    if canonical.hasPrefix(repoRoot + "/") {
+        let relTarget = String(canonical.dropFirst(repoRoot.count + 1))
+        let basename = baseName(relTarget)
+        let canonicalForm: String
+        if let cands = repoIndex.byName[basename], cands.count == 1 {
+            canonicalForm = basename
+        } else {
+            canonicalForm = relTarget
+        }
+        if link.path != canonicalForm {
+            issues.append(LinkIssue(
+                link: link.path, source: sourceFile,
+                kind: .style(scope: .crossRepo(repo: repoName), suggested: canonicalForm,
+                             pathStart: link.pathStart, pathEnd: link.pathEnd)
+            ))
+        }
+    }
+
+    guard isMd else { return }
+
+    if let fragment = link.fragment {
+        if !headingsLookup(canonical).contains(fragment) {
+            issues.append(LinkIssue(link: link.path, source: sourceFile,
+                                    kind: .brokenAnchor(fragment)))
+        }
+    }
+
+    // Enqueue. If the cross-repo target happens to live inside the entry repo (e.g. self-ref via
+    // config), funnel into entry-repo dedup so reachability stays consistent.
+    if canonical == entryRoot || canonical.hasPrefix(entryRoot + "/") {
+        if queuedEntryPaths.insert(canonical).inserted {
+            queue.append(BfsQueueItem(path: canonical, repoRoot: entryRoot, isEntryRepo: true))
+        }
+    } else {
+        if !crossRepoVisited.contains(canonical) {
+            queue.append(BfsQueueItem(path: canonical, repoRoot: repoRoot, isEntryRepo: false))
+        }
+    }
+}
+
+struct BfsQueueItem { let path: String; let repoRoot: String; let isEntryRepo: Bool }

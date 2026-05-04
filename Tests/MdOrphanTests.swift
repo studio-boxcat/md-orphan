@@ -446,6 +446,376 @@ private func writeFile(_ path: String, _ content: String) {
             }
         }
     }
+
+    @Test func wikiStyleRelativePathFlagged() {
+        withTempDir { root in
+            mkdir("\(root)/docs", 0o755)
+            mkdir("\(root)/docs/dev", 0o755)
+            mkdir("\(root)/docs/system", 0o755)
+            writeFile("\(root)/docs/dev/index.md", "see [[../system/foo.md]]")
+            writeFile("\(root)/docs/system/foo.md", "hi")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root, allFiles: allFiles)
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.count == 1)
+            if case .style(_, let suggested, _, _) = style[0].kind {
+                #expect(suggested == "foo.md")
+            } else {
+                Issue.record("Expected style, got \(style[0].kind)")
+            }
+        }
+    }
+
+    @Test func wikiStyleRedundantRepoPathFlagged() {
+        withTempDir { root in
+            mkdir("\(root)/docs", 0o755)
+            writeFile("\(root)/index.md", "see [[docs/foo.md]]")
+            writeFile("\(root)/docs/foo.md", "hi")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.count == 1)
+            if case .style(_, let suggested, _, _) = style[0].kind {
+                #expect(suggested == "foo.md")
+            }
+        }
+    }
+
+    @Test func wikiStyleDuplicateBasenameKeepsPath() {
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            writeFile("\(root)/index.md", "see [[a/foo.md]] and [[b/foo.md]]")
+            writeFile("\(root)/a/foo.md", "x")
+            writeFile("\(root)/b/foo.md", "y")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles)
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.isEmpty)
+        }
+    }
+
+    @Test func wikiStyleAlreadyCanonicalNotFlagged() {
+        withTempDir { root in
+            mkdir("\(root)/docs", 0o755)
+            writeFile("\(root)/docs/index.md", "see [[foo.md]]")
+            writeFile("\(root)/docs/foo.md", "hi")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/index.md"], root: root, allFiles: allFiles)
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.isEmpty)
+        }
+    }
+
+    @Test func wikiStylePreservesFragmentAndAlias() {
+        withTempDir { root in
+            mkdir("\(root)/docs", 0o755)
+            mkdir("\(root)/docs/dev", 0o755)
+            mkdir("\(root)/docs/system", 0o755)
+            writeFile("\(root)/docs/dev/index.md", "see [[../system/foo.md#bar|alias]]")
+            writeFile("\(root)/docs/system/foo.md", "# Bar\n")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root, allFiles: allFiles)
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.count == 1)
+            if case .style(_, let suggested, let s, let e) = style[0].kind {
+                #expect(suggested == "foo.md")
+                // The replaced range covers only `../system/foo.md`, not the fragment or alias
+                let content = "see [[../system/foo.md#bar|alias]]"
+                let bytes = Array(content.utf8)
+                let slice = String(decoding: bytes[s..<e], as: UTF8.self)
+                #expect(slice == "../system/foo.md")
+            }
+        }
+    }
+
+    @Test func wikiStyleStandardLinkNotFlagged() {
+        // Style rule applies only to wiki [[...]] links, not [text](...) standard links.
+        withTempDir { root in
+            mkdir("\(root)/docs", 0o755)
+            mkdir("\(root)/docs/dev", 0o755)
+            mkdir("\(root)/docs/system", 0o755)
+            writeFile("\(root)/docs/dev/index.md", "[x](../system/foo.md)")
+            writeFile("\(root)/docs/system/foo.md", "hi")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(entryPaths: ["\(root)/docs/dev/index.md"], root: root, allFiles: allFiles)
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.isEmpty)
+        }
+    }
+
+    // MARK: - cross-repo crawl
+
+    @Test func crossRepoUnknownRepoFlagged() {
+        withTempDir { root in
+            writeFile("\(root)/index.md", "see `foo.md` (no-such-repo)")
+            let allFiles = discoverFiles(root: root)
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/index.md"], root: root, allFiles: allFiles,
+                options: CrawlOptions(repos: [:])
+            )
+            let unknowns = issues.filter { if case .unknownRepo = $0.kind { return true }; return false }
+            #expect(unknowns.count == 1)
+            if case .unknownRepo(let repo) = unknowns[0].kind {
+                #expect(repo == "no-such-repo")
+            }
+        }
+    }
+
+    @Test func crossRepoBrokenLinkFlagged() {
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            writeFile("\(root)/a/index.md", "see `missing.md` (b)")
+            writeFile("\(root)/b/other.md", "")
+            let allFiles = discoverFiles(root: "\(root)/a")
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+                options: CrawlOptions(repos: ["b": "\(root)/b"])
+            )
+            let broken = issues.filter { if case .crossRepoBroken = $0.kind { return true }; return false }
+            #expect(broken.count == 1)
+            if case .crossRepoBroken(let r) = broken[0].kind {
+                #expect(r == "b")
+            }
+        }
+    }
+
+    @Test func crossRepoStyleViolationSuggestsBasename() {
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            mkdir("\(root)/b/docs", 0o755)
+            writeFile("\(root)/a/index.md", "see `docs/foo.md` (b)")
+            writeFile("\(root)/b/docs/foo.md", "# Foo")
+            let allFiles = discoverFiles(root: "\(root)/a")
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+                options: CrawlOptions(repos: ["b": "\(root)/b"])
+            )
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.count == 1)
+            if case .style(let scope, let suggested, _, _) = style[0].kind {
+                #expect(suggested == "foo.md")
+                if case .crossRepo(let r) = scope { #expect(r == "b") } else {
+                    Issue.record("expected crossRepo scope")
+                }
+            }
+        }
+    }
+
+    @Test func crossRepoEscapingPathFallsBackToBasename() {
+        // `../docs/foo.md` (b) escapes the b root; basename fallback resolves it,
+        // and style suggestion is the canonical basename.
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            mkdir("\(root)/b/docs", 0o755)
+            writeFile("\(root)/a/index.md", "see `../docs/foo.md` (b)")
+            writeFile("\(root)/b/docs/foo.md", "")
+            let allFiles = discoverFiles(root: "\(root)/a")
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+                options: CrawlOptions(repos: ["b": "\(root)/b"])
+            )
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.count == 1)
+            if case .style(_, let suggested, _, _) = style[0].kind {
+                #expect(suggested == "foo.md")
+            }
+        }
+    }
+
+    @Test func crossRepoCanonicalNotFlagged() {
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            writeFile("\(root)/a/index.md", "see `foo.md` (b)")
+            writeFile("\(root)/b/foo.md", "")
+            let allFiles = discoverFiles(root: "\(root)/a")
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+                options: CrawlOptions(repos: ["b": "\(root)/b"])
+            )
+            let style = issues.filter { if case .style = $0.kind { return true }; return false }
+            #expect(style.isEmpty)
+        }
+    }
+
+    @Test func crossRepoFollowedRecursivelyForBrokenLinkInTarget() {
+        // A → cross-repo B/page.md → references B/missing.md (broken).
+        // The broken link inside the cross-repo target should be reported.
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            writeFile("\(root)/a/index.md", "see `page.md` (b)")
+            writeFile("\(root)/b/page.md", "[here](missing.md)")
+            let allFiles = discoverFiles(root: "\(root)/a")
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+                options: CrawlOptions(repos: ["b": "\(root)/b"])
+            )
+            let broken = issues.filter { $0.kind == .broken }
+            #expect(broken.count == 1)
+            #expect(broken[0].link == "missing.md")
+        }
+    }
+
+    @Test func crossRepoFragmentValidatedAgainstTargetHeadings() {
+        withTempDir { root in
+            mkdir("\(root)/a", 0o755)
+            mkdir("\(root)/b", 0o755)
+            writeFile("\(root)/a/index.md", "see `foo.md#missing-section` (b)")
+            writeFile("\(root)/b/foo.md", "# Real Heading")
+            let allFiles = discoverFiles(root: "\(root)/a")
+            let (_, issues) = bfsCrawl(
+                entryPaths: ["\(root)/a/index.md"], root: "\(root)/a", allFiles: allFiles,
+                options: CrawlOptions(repos: ["b": "\(root)/b"])
+            )
+            let anchors = issues.filter { if case .brokenAnchor = $0.kind { return true }; return false }
+            #expect(anchors.count == 1)
+            if case .brokenAnchor(let frag) = anchors[0].kind {
+                #expect(frag == "missing-section")
+            }
+        }
+    }
+
+    // MARK: - fenced code block skipping
+
+    @Test func fencedCodeBlockSkipped() {
+        let src = """
+        See [[real.md]]
+
+        ```
+        Inside fence: [[fake.md]] and `path.md` (some-repo)
+        ```
+
+        Outside again: [[other.md]]
+        """
+        let paths = extractLinks(from: src)
+        #expect(paths == ["real.md", "other.md"])
+    }
+
+    @Test func wikiLinkAfterDoubleBacktickInlineCode() {
+        // Regression: a row mixing double-backtick code spans and a wiki link.
+        // The backtick scanner must not eat past the [[ marker.
+        let src = "| Inline code | `` `path.ext` `` (no repo) | see [[TODO.md]] |"
+        let paths = extractLinks(from: src)
+        #expect(paths == ["TODO.md"])
+    }
+}
+
+// MARK: - config + ignore
+
+@Test func expandPathHomeAndEnv() throws {
+    setenv("MD_ORPHAN_TEST_X", "/tmp/something", 1)
+    defer { unsetenv("MD_ORPHAN_TEST_X") }
+    let result = try expandPath("$MD_ORPHAN_TEST_X/sub", repoName: "test")
+    #expect(result == "/tmp/something/sub")
+    let braced = try expandPath("${MD_ORPHAN_TEST_X}/sub", repoName: "test")
+    #expect(braced == "/tmp/something/sub")
+}
+
+@Test func expandPathMissingVarThrows() {
+    let didThrow: Bool
+    do {
+        _ = try expandPath("$NOPE_NOT_DEFINED_VAR/x", repoName: "r")
+        didThrow = false
+    } catch { didThrow = true }
+    #expect(didThrow)
+}
+
+@Test func loadProjectIgnoreParsesLines() throws {
+    let dir = NSTemporaryDirectory() + "md-orphan-ignore-\(UUID().uuidString)"
+    mkdir(dir, 0o755)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let path = dir + "/.md-orphan"
+    try """
+    # comment
+    Library/
+
+    docs/draft-*.md
+    """.write(toFile: path, atomically: true, encoding: .utf8)
+    let patterns = try loadProjectIgnore(root: dir)
+    #expect(patterns == ["Library/", "docs/draft-*.md"])
+}
+
+@Test func loadProjectIgnoreReturnsEmptyWhenAbsent() throws {
+    let dir = NSTemporaryDirectory() + "md-orphan-ignore-\(UUID().uuidString)"
+    mkdir(dir, 0o755)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let patterns = try loadProjectIgnore(root: dir)
+    #expect(patterns.isEmpty)
+}
+
+// MARK: - cache
+// Cache tests serialized with BfsCrawlTests because ExtractionCache.read uses readFile's global buffer.
+
+extension BfsCrawlTests {
+@Test func extractionCacheSerializesAndRoundtrips() {
+    let dir = NSTemporaryDirectory() + "md-orphan-cache-\(UUID().uuidString)"
+    mkdir(dir, 0o755)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    let content = "# Title\n\nSee [[other.md]] and [[third.md#sec]]"
+    let path = dir + "/index.md"
+    try? content.write(toFile: path, atomically: true, encoding: .utf8)
+
+    let canonicalDir = realPath(dir)!
+    let canonicalPath = canonicalDir + "/index.md"
+
+    let cache = ExtractionCache(enabled: true)
+    guard let first = cache.read(filePath: canonicalPath, repoRoot: canonicalDir) else {
+        Issue.record("first read failed"); return
+    }
+    #expect(first.links.count == 2)
+    #expect(first.headings.contains("title"))
+
+    // Second read with same content → cache hit returns identical structured output.
+    guard let second = cache.read(filePath: canonicalPath, repoRoot: canonicalDir) else {
+        Issue.record("second read failed"); return
+    }
+    #expect(second.links == first.links)
+    #expect(second.headings == first.headings)
+}
+
+@Test func extractionCacheInvalidatesOnContentChange() {
+    let dir = NSTemporaryDirectory() + "md-orphan-cache-inv-\(UUID().uuidString)"
+    mkdir(dir, 0o755)
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+
+    let path = dir + "/index.md"
+    try? "[[a.md]]".write(toFile: path, atomically: true, encoding: .utf8)
+
+    let canonicalDir = realPath(dir)!
+    let canonicalPath = canonicalDir + "/index.md"
+
+    let cache = ExtractionCache(enabled: true)
+    _ = cache.read(filePath: canonicalPath, repoRoot: canonicalDir)
+
+    // Sleep briefly so mtime differs even on coarse FS, then change content + size.
+    usleep(20_000)
+    try? "[[b.md]] and [[c.md]]".write(toFile: path, atomically: true, encoding: .utf8)
+
+    guard let result = cache.read(filePath: canonicalPath, repoRoot: canonicalDir) else {
+        Issue.record("read after change failed"); return
+    }
+    #expect(result.links.map(\.path) == ["b.md", "c.md"])
+}
+
+@Test func cacheFilePathHashesCanonicalRoot() {
+    let p1 = cacheFilePath(forCanonicalRoot: "/Users/jk/proj-a")
+    let p2 = cacheFilePath(forCanonicalRoot: "/Users/jk/proj-b")
+    #expect(p1 != p2)
+    #expect(p1.hasSuffix(".json"))
+    #expect(p1.contains("/cache/"))
+}
+
+@Test func fnv1a64Stability() {
+    // Spot-check determinism — same input → same hash.
+    #expect(fnv1a64Hex("hello") == fnv1a64Hex("hello"))
+    #expect(fnv1a64Hex("hello") != fnv1a64Hex("hellp"))
+}
 }
 
 // MARK: - dirName
@@ -460,4 +830,30 @@ private func writeFile(_ path: String, _ content: String) {
 
 @Test func dirNameNoSlash() {
     #expect(dirName("file.md") == ".")
+}
+
+// MARK: - benchmarks (skipped by default)
+
+@Test(.disabled("manual benchmark — temporarily un-disable and `swift test -c release --filter benchmarkMeowTower` to run"))
+func benchmarkMeowTower() {
+    let root = "/Users/jameskim/Develop/meow-tower"
+
+    var t0 = Date()
+    let idx = indexRepo(root: root, exclude: [], useDefaultExcludes: true)
+    print("indexRepo (defaults): \(String(format: "%.3f", Date().timeIntervalSince(t0)))s | md=\(idx.mdFiles.count) | basenames=\(idx.byName.count) | total=\(idx.byName.values.reduce(0) { $0 + $1.count })")
+
+    t0 = Date()
+    let idx2 = indexRepo(root: root, exclude: [], useDefaultExcludes: false)
+    print("indexRepo (no defaults): \(String(format: "%.3f", Date().timeIntervalSince(t0)))s | total=\(idx2.byName.values.reduce(0) { $0 + $1.count })")
+
+    t0 = Date()
+    var totalLinks = 0
+    var totalHeadings = 0
+    for path in idx.mdFiles.values {
+        let abs = idx.root + "/" + path
+        guard let (_, buf) = readFile(path: abs) else { continue }
+        totalLinks += extractLinksDetailed(buf).count
+        totalHeadings += extractHeadings(buf).count
+    }
+    print("read+extract \(idx.mdFiles.count) md: \(String(format: "%.3f", Date().timeIntervalSince(t0)))s | links=\(totalLinks) headings=\(totalHeadings)")
 }

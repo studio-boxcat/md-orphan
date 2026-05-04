@@ -1,4 +1,5 @@
 import ArgumentParser
+import Foundation
 import MdOrphanLib
 
 @main
@@ -17,6 +18,18 @@ struct MdOrphan: ParsableCommand {
     @Flag(name: [.long, .customShort("v")], help: "Show success message when all files are reachable")
     var verbose = false
 
+    @Flag(name: .long, help: "Rewrite link style issues in place")
+    var fix = false
+
+    @Option(name: .long, help: "Path to global config (default: $XDG_CONFIG_HOME/md-orphan/md-orphan.json)")
+    var config: String?
+
+    @Flag(name: .long, help: "Disable built-in default excludes (.git, node_modules, Library, .build, ...)")
+    var noDefaultExcludes = false
+
+    @Flag(name: .long, help: "Disable per-file extraction cache")
+    var noCache = false
+
     func run() throws {
         let resolvedEntries = try entryPoints.map { ep -> String in
             guard let abs = realPath(ep) else {
@@ -34,9 +47,29 @@ struct MdOrphan: ParsableCommand {
                 throw ValidationError("--exclude: unclosed '[' in pattern '\(p)'")
             }
         }
+
+        let configPath = config ?? defaultConfigPath()
+        let globalConfig: GlobalConfig
+        do { globalConfig = try loadGlobalConfig(path: configPath) }
+        catch let e as ConfigError { throw ValidationError("\(e)") }
+
         let root = dirName(resolvedEntries[0])
-        let allFiles = discoverFiles(root: root, exclude: excludePatterns)
-        let (reachable, issues) = bfsCrawl(entryPaths: resolvedEntries, root: root, allFiles: allFiles)
+        let projectIgnore = (try? loadProjectIgnore(root: root)) ?? []
+        let layeredExclude = excludePatterns + projectIgnore
+        let effective = noDefaultExcludes ? layeredExclude : (defaultExcludes + layeredExclude)
+        let allFiles = discoverFiles(root: root, exclude: effective)
+
+        let crawlOptions = CrawlOptions(
+            repos: globalConfig.repos,
+            useDefaultExcludes: !noDefaultExcludes,
+            extraExcludes: excludePatterns
+        )
+        let cache = ExtractionCache(enabled: !noCache)
+        let (reachable, issues) = bfsCrawl(
+            entryPaths: resolvedEntries, root: root,
+            allFiles: allFiles, options: crawlOptions, cache: cache
+        )
+        defer { cache.save() }
 
         let orphans = allFiles
             .filter { !reachable.contains($0.key) }
@@ -53,6 +86,9 @@ struct MdOrphan: ParsableCommand {
         let broken = issues.filter { $0.kind == .broken }
         let ambiguous = issues.filter { if case .ambiguous = $0.kind { return true }; return false }
         let brokenAnchors = issues.filter { if case .brokenAnchor = $0.kind { return true }; return false }
+        let unknownRepos = issues.filter { if case .unknownRepo = $0.kind { return true }; return false }
+        let crossRepoBroken = issues.filter { if case .crossRepoBroken = $0.kind { return true }; return false }
+        let styleIssues = issues.filter { if case .style = $0.kind { return true }; return false }
 
         if !broken.isEmpty {
             print("\u{1F517} \(broken.count) broken links:")
@@ -82,6 +118,48 @@ struct MdOrphan: ParsableCommand {
             failed = true
         }
 
+        if !unknownRepos.isEmpty {
+            print("\u{1F6AB} \(unknownRepos.count) unknown cross-repo references:")
+            for u in unknownRepos {
+                if case .unknownRepo(let r) = u.kind {
+                    print("  `\(u.link)` (\(r)) in \(relSource(u))")
+                }
+            }
+            failed = true
+        }
+
+        if !crossRepoBroken.isEmpty {
+            print("\u{1F517} \(crossRepoBroken.count) broken cross-repo links:")
+            for b in crossRepoBroken {
+                if case .crossRepoBroken(let r) = b.kind {
+                    print("  `\(b.link)` (\(r)) in \(relSource(b))")
+                }
+            }
+            failed = true
+        }
+
+        if !styleIssues.isEmpty {
+            let header = fix ? "fixed" : "issues"
+            print("\u{1F4DD} \(styleIssues.count) link style \(header):")
+            let sorted = styleIssues.sorted {
+                if $0.source != $1.source { return relSource($0) < relSource($1) }
+                guard case .style(_, _, let a, _) = $0.kind,
+                      case .style(_, _, let b, _) = $1.kind else { return false }
+                return a < b
+            }
+            for issue in sorted {
+                guard case .style(let scope, let suggested, _, _) = issue.kind else { continue }
+                let (lhs, rhs) = renderStyle(link: issue.link, suggested: suggested, scope: scope)
+                print("  \(relSource(issue)): \(lhs) -> \(rhs)")
+            }
+            if fix {
+                applyStyleFixes(styleIssues)
+            } else {
+                print("  (run with --fix to apply)")
+                failed = true
+            }
+        }
+
         if !orphans.isEmpty {
             print("\u{274C} \(orphans.count) orphan markdown files (not reachable from \(names)):")
             for path in orphans {
@@ -94,6 +172,44 @@ struct MdOrphan: ParsableCommand {
             throw ExitCode(1)
         } else if verbose {
             print("\u{2705} All \(allFiles.count) markdown files are reachable from \(names)")
+        }
+    }
+}
+
+private func renderStyle(link: String, suggested: String, scope: LinkIssue.StyleScope) -> (String, String) {
+    switch scope {
+    case .wiki:
+        return ("[[\(link)]]", "[[\(suggested)]]")
+    case .crossRepo(let repo):
+        return ("`\(link)` (\(repo))", "`\(suggested)` (\(repo))")
+    }
+}
+
+/// Apply style fixes by rewriting just the path bytes inside [[...]] or `...`.
+/// Replacements applied per file in descending offset order so earlier offsets stay valid.
+/// Atomic write (.atomicWrite) so a crash mid-write can't truncate the source.
+private func applyStyleFixes(_ issues: [LinkIssue]) {
+    let bySource = Dictionary(grouping: issues, by: \.source)
+    for (source, sourceIssues) in bySource {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: source)) else {
+            fputs("md-orphan: warning: cannot read \(source) for --fix\n", stderr)
+            continue
+        }
+        var bytes = [UInt8](data)
+        let sorted = sourceIssues.sorted {
+            guard case .style(_, _, let a, _) = $0.kind,
+                  case .style(_, _, let b, _) = $1.kind else { return false }
+            return a > b
+        }
+        for issue in sorted {
+            guard case .style(_, let suggested, let start, let end) = issue.kind else { continue }
+            guard start <= end, end <= bytes.count else { continue }
+            bytes.replaceSubrange(start..<end, with: Array(suggested.utf8))
+        }
+        do {
+            try Data(bytes).write(to: URL(fileURLWithPath: source), options: .atomic)
+        } catch {
+            fputs("md-orphan: warning: cannot write \(source): \(error)\n", stderr)
         }
     }
 }
