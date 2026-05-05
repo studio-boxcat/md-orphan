@@ -36,6 +36,11 @@ public func indexRepo(
 ) -> RepoIndex {
     let resolved = realPath(root) ?? root
     let effective = (useDefaultExcludes ? defaultExcludes : []) + exclude
+    let matcher = ExcludeMatcher(effective)
+    let needsFullPath = !(matcher.anchored.isEmpty
+                          && matcher.globs.isEmpty
+                          && matcher.plainPrefixes.isEmpty
+                          && matcher.trailingGlobs.isEmpty)
 
     let rootCStr = strdup(resolved)!
     defer { free(rootCStr) }
@@ -62,12 +67,24 @@ public func indexRepo(
                 fts_set(stream, entry, FTS_SKIP)
                 continue
             }
-            if !effective.isEmpty {
+            // Fast path: bare-basename check against the dir's name bytes only — no relPath alloc.
+            // Covers ~all default excludes (Library/, Pods/, node_modules/, …) and most user
+            // excludes. Only fall through to full relPath when the matcher has anchored/glob
+            // patterns that need the full path.
+            if !matcher.bareBasenames.isEmpty {
+                let bytes = UnsafeRawBufferPointer(start: namePtr, count: nameLen).bindMemory(to: UInt8.self)
+                let basename = String(decoding: bytes, as: UTF8.self)
+                if matcher.matchesBare(basename: basename) {
+                    fts_set(stream, entry, FTS_SKIP)
+                    continue
+                }
+            }
+            if needsFullPath {
                 let absPath = String(cString: entry.pointee.fts_path)
                 let relPath = absPath.utf8.count > rootLen + 1
                     ? String(absPath.dropFirst(rootLen + 1))
                     : ""
-                if !relPath.isEmpty && isExcluded(relPath, by: effective) {
+                if !relPath.isEmpty && matcher.matches(relPath: relPath) {
                     fts_set(stream, entry, FTS_SKIP)
                 }
             }
@@ -92,9 +109,9 @@ public func indexRepo(
             ? String(absPath.dropFirst(rootLen + 1))
             : absPath
 
-        if !effective.isEmpty && isExcluded(relPath, by: effective) { continue }
-
         let basename = String(decoding: bytes, as: UTF8.self)
+        if matcher.matches(relPath: relPath, basename: basename) { continue }
+
         byName[basename, default: []].append(absPath)
 
         if isMd {

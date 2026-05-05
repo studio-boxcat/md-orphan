@@ -62,6 +62,95 @@ public func isExcluded(_ relPath: String, by patterns: [String]) -> Bool {
     return false
 }
 
+/// Pre-compiled exclude matcher. Built once per `indexRepo` call; consulted ~4k+ times during
+/// the fts walk. Splits patterns into the three forms so the hot path (bare-basename match
+/// during directory prune) becomes a single `Set<String>.contains` lookup against the dir's
+/// basename — no `relPath` allocation, no per-pattern string ops.
+public struct ExcludeMatcher {
+    /// Trailing-slash bare-basename patterns (e.g. `Library/`, `Pods/`). Match anywhere in tree.
+    /// Stored without trailing slash.
+    let bareBasenames: Set<String>
+    /// Trailing-slash path-containing patterns (e.g. `docs/internal/`). Anchored at root.
+    let anchored: [String]
+    /// Patterns containing `*`, `?`, `[…]`. Matched via `fnmatch`.
+    let globs: [String]
+    /// Plain (no trailing slash, no glob) patterns — match as path prefix at root.
+    let plainPrefixes: [String]
+    /// Trailing-slash glob patterns (e.g. `assets/loc/*/`).
+    let trailingGlobs: [(prefix: String, depth: Int)]
+
+    public init(_ patterns: [String]) {
+        var bare: Set<String> = []
+        var anchored: [String] = []
+        var globs: [String] = []
+        var plain: [String] = []
+        var trailingGlobs: [(String, Int)] = []
+        for p in patterns {
+            let isGlob = p.contains("*") || p.contains("?") || p.contains("[")
+            if p.hasSuffix("/") {
+                let prefix = String(p.dropLast())
+                if isGlob {
+                    let depth = prefix.split(separator: "/", omittingEmptySubsequences: true).count
+                    trailingGlobs.append((prefix, depth))
+                } else if !prefix.contains("/") {
+                    bare.insert(prefix)
+                } else {
+                    anchored.append(p)
+                }
+            } else if isGlob {
+                globs.append(p)
+            } else {
+                plain.append(p)
+            }
+        }
+        self.bareBasenames = bare
+        self.anchored = anchored
+        self.globs = globs
+        self.plainPrefixes = plain
+        self.trailingGlobs = trailingGlobs
+    }
+
+    /// Fast basename-only check — matches a bare-basename pattern at any depth without
+    /// constructing the full relPath. Returns true if the bare set contains `basename`.
+    @inline(__always)
+    public func matchesBare(basename: String) -> Bool {
+        bareBasenames.contains(basename)
+    }
+
+    /// Full relPath check — used after `matchesBare` returns false, or when the caller
+    /// already has the relPath in hand (file-level checks).
+    public func matches(relPath: String, basename: String? = nil) -> Bool {
+        // Bare set: any path segment in relPath could match.
+        // The caller usually has `basename` already (fts gives it cheap); use it when present.
+        if let basename, bareBasenames.contains(basename) { return true }
+        if !bareBasenames.isEmpty {
+            // Fall back to scanning segments — needed when caller can't isolate basename
+            // (e.g. file-path check where the parent dir's basename matters too).
+            let segments = relPath.split(separator: "/", omittingEmptySubsequences: true)
+            for seg in segments {
+                if bareBasenames.contains(String(seg)) { return true }
+            }
+        }
+        for prefix in plainPrefixes {
+            if relPath == prefix || relPath.hasPrefix(prefix + "/") { return true }
+        }
+        for pattern in anchored {
+            if relPath.hasPrefix(pattern) { return true }
+        }
+        for pattern in globs {
+            if fnmatch(pattern, relPath, FNM_PATHNAME) == 0 { return true }
+        }
+        for (prefix, depth) in trailingGlobs {
+            let parts = relPath.split(separator: "/", omittingEmptySubsequences: true)
+            if parts.count > depth {
+                let dir = parts[..<depth].joined(separator: "/")
+                if fnmatch(prefix, dir, FNM_PATHNAME) == 0 { return true }
+            }
+        }
+        return false
+    }
+}
+
 /// Strip `root + "/"` prefix from `path` when present. Returns "" when `path == root`.
 /// Returns nil when `path` is outside `root` (caller decides what to do).
 public func relPath(_ path: String, under root: String) -> String? {
