@@ -2,6 +2,10 @@
 //!
 //! See `docs/architecture.md` (in the repo root) for module layout and design rationale.
 
+pub mod cache;
+pub mod config;
+pub mod crawl;
+pub mod discovery;
 pub mod exclude;
 pub mod extract;
 pub mod path;

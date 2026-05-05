@@ -1,5 +1,310 @@
-// Stub — populated in Phase D.
-fn main() {
-    eprintln!("md-orphan: Rust port not yet wired in");
-    std::process::exit(2);
+//! md-orphan CLI — Rust port of `Sources/CLI/main.swift`. Mirrors flags + output format
+//! byte-identically with the Swift binary so existing lefthook hooks + scripts continue working.
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::Parser;
+use md_orphan::cache::ExtractionCache;
+use md_orphan::config::{
+    default_config_path, load_global_config, project_ignore_exists,
+};
+use md_orphan::crawl::{
+    apply_style_fixes, bfs_crawl_at_root, CrawlOptions, IssueKind, LinkIssue, StyleScope,
+};
+use md_orphan::path::{base_name, dir_name, real_path, rel_path};
+use std::fs;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "md-orphan",
+    about = "Detect markdown files not reachable from entry points"
+)]
+struct Cli {
+    /// One or more markdown entry points
+    entry_points: Vec<String>,
+
+    /// Exclude paths by prefix or glob; * and ? don't cross / (comma-separated, repeatable)
+    #[arg(long)]
+    exclude: Vec<String>,
+
+    /// Show success message when all files are reachable
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
+    /// Rewrite link style issues in place
+    #[arg(long)]
+    fix: bool,
+
+    /// Path to global config (default: $XDG_CONFIG_HOME/md-orphan/md-orphan.json)
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Disable built-in default excludes (.git, node_modules, Library, .build, ...)
+    #[arg(long)]
+    no_default_excludes: bool,
+
+    /// Disable per-file extraction cache
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Print full path + contents of nearest CLAUDE.md (walks up from cwd)
+    #[arg(long)]
+    claude: bool,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(e) => {
+            eprintln!("md-orphan: {e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<bool> {
+    if cli.claude {
+        return run_claude();
+    }
+    if cli.entry_points.is_empty() {
+        bail!("missing entry point");
+    }
+
+    let resolved_entries: Vec<String> = cli
+        .entry_points
+        .iter()
+        .map(|ep| {
+            real_path(ep)
+                .map(|p| p.to_string_lossy().to_string())
+                .ok_or_else(|| anyhow!("{ep}: no such file"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let exclude_patterns: Vec<String> = cli
+        .exclude
+        .iter()
+        .flat_map(|s| s.split(',').map(|x| x.to_string()))
+        .collect();
+    for p in &exclude_patterns {
+        if p.contains("**") {
+            bail!("--exclude: '**' globstar not supported; * matches within a single directory");
+        }
+        if p.contains('[') && !p.contains(']') {
+            bail!("--exclude: unclosed '[' in pattern '{p}'");
+        }
+    }
+
+    let config_path = cli
+        .config
+        .map(PathBuf::from)
+        .unwrap_or_else(default_config_path);
+    let global_config = load_global_config(&config_path).with_context(|| "loading global config")?;
+
+    let root = dir_name(&resolved_entries[0]).to_string();
+    let root_path = std::path::Path::new(&root);
+    if !project_ignore_exists(root_path) {
+        bail!(
+            "{root}/.md-orphan: missing\nEvery md-orphan-checked repo needs a `.md-orphan` file at its root listing project-specific\n\
+ignore patterns (gitignore-style line patterns). Built-in defaults handle .git, node_modules,\n\
+Library, Pods, etc., but project-specific dirs (Unity Packages, vendored docs, build outputs)\n\
+must be enumerated explicitly. Create the file with `touch {root}/.md-orphan` if you have\n\
+no extras."
+        );
+    }
+
+    let crawl_options = CrawlOptions {
+        repos: global_config.repos,
+        use_default_excludes: !cli.no_default_excludes,
+        extra_excludes: exclude_patterns,
+    };
+    let mut cache = ExtractionCache::new(!cli.no_cache);
+    let (entry_index, reachable, issues) = bfs_crawl_at_root(
+        &resolved_entries,
+        &root,
+        &crawl_options,
+        &mut cache,
+    );
+
+    let entry_root_str = entry_index.root.to_string_lossy().to_string();
+    let orphans: Vec<String> = {
+        let mut v: Vec<String> = entry_index
+            .md_files
+            .iter()
+            .filter(|rel| {
+                let abs = format!("{}/{}", entry_root_str, rel);
+                if reachable.contains(&abs) {
+                    return false;
+                }
+                if let Some(canonical) = real_path(&abs) {
+                    if reachable.contains(&canonical.to_string_lossy().to_string()) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    };
+
+    let names = cli
+        .entry_points
+        .iter()
+        .map(|p| base_name(p).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rel_source = |issue: &LinkIssue| {
+        rel_path(&issue.source, &root).map(|s| s.to_string()).unwrap_or_else(|| issue.source.clone())
+    };
+
+    let mut failed = false;
+
+    let broken: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Broken)).collect();
+    let ambiguous: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Ambiguous(_))).collect();
+    let broken_anchors: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_))).collect();
+    let unknown_repos: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::UnknownRepo(_))).collect();
+    let cross_repo_broken: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::CrossRepoBroken(_))).collect();
+    let style_issues: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Style { .. })).collect();
+
+    if !broken.is_empty() {
+        println!("\u{1F517} {} broken links:", broken.len());
+        for b in &broken {
+            println!("  {} in {}", b.link, rel_source(b));
+        }
+        failed = true;
+    }
+    if !ambiguous.is_empty() {
+        println!("\u{26A0}\u{FE0F} {} ambiguous links:", ambiguous.len());
+        for a in &ambiguous {
+            if let IssueKind::Ambiguous(count) = a.kind {
+                println!("  {} in {} ({count} files match)", a.link, rel_source(a));
+            }
+        }
+        failed = true;
+    }
+    if !broken_anchors.is_empty() {
+        println!("\u{2693} {} broken anchors:", broken_anchors.len());
+        for a in &broken_anchors {
+            if let IssueKind::BrokenAnchor(frag) = &a.kind {
+                println!("  {}#{} in {}", a.link, frag, rel_source(a));
+            }
+        }
+        failed = true;
+    }
+    if !unknown_repos.is_empty() {
+        println!("\u{1F6AB} {} unknown cross-repo references:", unknown_repos.len());
+        for u in &unknown_repos {
+            if let IssueKind::UnknownRepo(r) = &u.kind {
+                println!("  `{}` ({r}) in {}", u.link, rel_source(u));
+            }
+        }
+        failed = true;
+    }
+    if !cross_repo_broken.is_empty() {
+        println!("\u{1F517} {} broken cross-repo links:", cross_repo_broken.len());
+        for b in &cross_repo_broken {
+            if let IssueKind::CrossRepoBroken(r) = &b.kind {
+                println!("  `{}` ({r}) in {}", b.link, rel_source(b));
+            }
+        }
+        failed = true;
+    }
+    if !style_issues.is_empty() {
+        let header = if cli.fix { "fixed" } else { "issues" };
+        println!("\u{1F4DD} {} link style {header}:", style_issues.len());
+        let mut sorted: Vec<&LinkIssue> = style_issues.clone();
+        sorted.sort_by(|a, b| {
+            let asrc = rel_source(a);
+            let bsrc = rel_source(b);
+            if asrc != bsrc {
+                return asrc.cmp(&bsrc);
+            }
+            let ai = match &a.kind {
+                IssueKind::Style { path_start, .. } => *path_start,
+                _ => 0,
+            };
+            let bi = match &b.kind {
+                IssueKind::Style { path_start, .. } => *path_start,
+                _ => 0,
+            };
+            ai.cmp(&bi)
+        });
+        for issue in &sorted {
+            if let IssueKind::Style { scope, suggested, .. } = &issue.kind {
+                let (lhs, rhs) = render_style(&issue.link, suggested, scope);
+                println!("  {}: {lhs} -> {rhs}", rel_source(issue));
+            }
+        }
+        if cli.fix {
+            let owned: Vec<LinkIssue> = style_issues.iter().map(|i| (*i).clone()).collect();
+            apply_style_fixes(&owned);
+        } else {
+            println!("  (run with --fix to apply)");
+            failed = true;
+        }
+    }
+
+    if !orphans.is_empty() {
+        println!(
+            "\u{274C} {} orphan markdown files (not reachable from {names}):",
+            orphans.len()
+        );
+        for path in &orphans {
+            println!("  {path}");
+        }
+        failed = true;
+    }
+
+    if !failed && cli.verbose {
+        println!(
+            "\u{2705} All {} markdown files are reachable from {names}",
+            entry_index.md_files.len()
+        );
+    }
+    Ok(!failed)
+}
+
+fn render_style(link: &str, suggested: &str, scope: &StyleScope) -> (String, String) {
+    match scope {
+        StyleScope::Wiki => (format!("[[{link}]]"), format!("[[{suggested}]]")),
+        StyleScope::CrossRepo { repo } => (
+            format!("`{link}` ({repo})"),
+            format!("`{suggested}` ({repo})"),
+        ),
+    }
+}
+
+/// Walk up from cwd, find nearest CLAUDE.md (or AGENTS.md fallback). Print abs path + contents.
+fn run_claude() -> Result<bool> {
+    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+    let mut dir = cwd.clone();
+    while !dir.is_empty() && dir != "/" {
+        for name in ["CLAUDE.md", "AGENTS.md"] {
+            let candidate = format!("{dir}/{name}");
+            if fs::metadata(&candidate).is_ok() {
+                let canonical = real_path(&candidate)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or(candidate.clone());
+                println!("{canonical}");
+                println!();
+                if let Ok(text) = fs::read_to_string(&canonical) {
+                    if text.ends_with('\n') {
+                        print!("{text}");
+                    } else {
+                        println!("{text}");
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        match dir.rfind('/') {
+            Some(idx) => dir.truncate(idx),
+            None => break,
+        }
+    }
+    bail!("--claude: no CLAUDE.md or AGENTS.md found from {cwd} up to /");
 }
