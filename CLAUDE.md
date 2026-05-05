@@ -39,7 +39,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 | `--config <path>` | Override global config (default `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`) |
 | `--no-default-excludes` | Disable built-in defaults (`.git`, `node_modules`, `Library`, `.build`, ...) |
 | `--no-cache` | Disable both the walk-result cache and the per-file extraction cache |
-| `--claude` | Print full path + contents of nearest `CLAUDE.md` (walks up from cwd) |
+| `--orient` | Print md-orphan's own `CLAUDE.md` (usage guide for this tool) |
 
 ## Link styles
 

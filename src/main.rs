@@ -11,7 +11,6 @@ use md_orphan::crawl::{
     apply_style_fixes, bfs_crawl_at_root, CrawlOptions, IssueKind, LinkIssue, StyleScope,
 };
 use md_orphan::path::{base_name, dir_name, real_path, rel_path};
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -48,9 +47,9 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
-    /// Print full path + contents of nearest CLAUDE.md (walks up from cwd)
+    /// Print md-orphan's own CLAUDE.md (usage guide for this tool)
     #[arg(long)]
-    claude: bool,
+    orient: bool,
 }
 
 fn main() -> ExitCode {
@@ -66,8 +65,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<bool> {
-    if cli.claude {
-        return run_claude();
+    if cli.orient {
+        return run_orient();
     }
     if cli.entry_points.is_empty() {
         bail!("missing entry point");
@@ -275,33 +274,13 @@ fn render_style(link: &str, suggested: &str, scope: &StyleScope) -> (String, Str
     }
 }
 
-/// Walk up from cwd, find nearest CLAUDE.md (or AGENTS.md fallback). Print abs path + contents.
-fn run_claude() -> Result<bool> {
-    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let mut dir = cwd.clone();
-    while !dir.is_empty() && dir != "/" {
-        for name in ["CLAUDE.md", "AGENTS.md"] {
-            let candidate = format!("{dir}/{name}");
-            if fs::metadata(&candidate).is_ok() {
-                let canonical = real_path(&candidate)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or(candidate.clone());
-                println!("{canonical}");
-                println!();
-                if let Ok(text) = fs::read_to_string(&canonical) {
-                    if text.ends_with('\n') {
-                        print!("{text}");
-                    } else {
-                        println!("{text}");
-                    }
-                }
-                return Ok(true);
-            }
-        }
-        match dir.rfind('/') {
-            Some(idx) => dir.truncate(idx),
-            None => break,
-        }
+/// Print md-orphan's own CLAUDE.md, embedded at compile time so the binary is self-contained.
+fn run_orient() -> Result<bool> {
+    const GUIDE: &str = include_str!("../CLAUDE.md");
+    if GUIDE.ends_with('\n') {
+        print!("{GUIDE}");
+    } else {
+        println!("{GUIDE}");
     }
-    bail!("--claude: no CLAUDE.md or AGENTS.md found from {cwd} up to /");
+    Ok(true)
 }
