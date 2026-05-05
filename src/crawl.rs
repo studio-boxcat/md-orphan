@@ -31,7 +31,6 @@ pub enum IssueKind {
         path_start: usize,
         path_end: usize,
     },
-    UnknownRepo(String),
     CrossRepoBroken(String),
 }
 
@@ -49,6 +48,8 @@ pub struct CrawlOptions {
     pub use_default_excludes: bool,
     /// CLI --exclude entries; layered on top of <repo>/.md-orphan and built-in defaults.
     pub extra_excludes: Vec<String>,
+    /// See [[walk_cache.rs]]. Toggled with the per-file cache by `--no-cache`.
+    pub use_walk_cache: bool,
 }
 
 impl CrawlOptions {
@@ -57,6 +58,7 @@ impl CrawlOptions {
             repos: HashMap::new(),
             use_default_excludes: true,
             extra_excludes: Vec::new(),
+            use_walk_cache: true,
         }
     }
 }
@@ -123,7 +125,7 @@ pub fn bfs_crawl_at_root(
     let project_ignore = load_project_ignore(Path::new(root)).unwrap_or_default();
     let mut exclude = options.extra_excludes.clone();
     exclude.extend(project_ignore);
-    let idx = index_repo(root, &exclude, options.use_default_excludes, false);
+    let idx = index_repo(root, &exclude, options.use_default_excludes, false, options.use_walk_cache);
     let (reachable, issues) = bfs_crawl(entry_paths, idx.clone(), options, cache);
     (idx, reachable, issues)
 }
@@ -218,6 +220,7 @@ impl<'c> CrawlState<'c> {
         let prefetched = Mutex::new(HashMap::<PathBuf, RepoIndex>::new());
         let extra_excludes = self.options.extra_excludes.clone();
         let use_defaults = self.options.use_default_excludes;
+        let use_walk_cache = self.options.use_walk_cache;
         std::thread::scope(|s| {
             for root in &to_index {
                 let prefetched = &prefetched;
@@ -227,7 +230,7 @@ impl<'c> CrawlState<'c> {
                     let mut excl = extra_excludes;
                     excl.extend(project_ignore);
                     let root_str = root.to_string_lossy();
-                    let idx = index_repo(&root_str, &excl, use_defaults, false);
+                    let idx = index_repo(&root_str, &excl, use_defaults, false, use_walk_cache);
                     prefetched.lock().unwrap().insert(root.clone(), idx);
                 });
             }
@@ -260,6 +263,13 @@ impl<'c> CrawlState<'c> {
             return;
         }
         self.heading_cache.insert(item.path.clone(), result.headings.clone());
+        // Scope: don't follow links inside cross-repo files. Those repos run their own
+        // md-orphan; their broken-link rot isn't this entry repo's responsibility. Headings
+        // are still cached above so anchor checks on entry-repo's direct refs into this file
+        // continue to work.
+        if !item.is_entry_repo {
+            return;
+        }
         for link in result.links {
             self.resolve_one(&link, item);
         }
@@ -276,6 +286,7 @@ impl<'c> CrawlState<'c> {
                 &excl,
                 self.options.use_default_excludes,
                 false,
+                self.options.use_walk_cache,
             );
             self.indices.insert(canonical_root.to_path_buf(), idx);
         }
@@ -397,12 +408,8 @@ impl<'c> CrawlState<'c> {
     }
 
     fn resolve_cross_repo(&mut self, link: &Link, source: &BfsQueueItem, repo_name: &str) {
+        // Parser pre-filters unknown names; this branch is unreachable from the CLI path.
         let Some(repo_root) = self.resolved_repos.get(repo_name).cloned() else {
-            self.issues.push(LinkIssue {
-                link: link.target.clone(),
-                source: source.path.clone(),
-                kind: IssueKind::UnknownRepo(repo_name.to_string()),
-            });
             return;
         };
         let repo_root_str = repo_root.to_string_lossy().to_string();
@@ -680,7 +687,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[a](missing.md)");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, _, issues) = bfs_crawl_at_root(
             &[canonical.join("index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
@@ -698,7 +705,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[a](other.md)");
         write(&canonical.join("other.md"), "hello");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, reachable, issues) = bfs_crawl_at_root(
             &[canonical.join("index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
@@ -715,7 +722,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[a](guide.md)");
         write(&canonical.join("docs/guide.md"), "hello");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, reachable, issues) = bfs_crawl_at_root(
             &[canonical.join("index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
@@ -733,7 +740,7 @@ mod tests {
         write(&canonical.join("index.md"), "[a](guide.md)");
         write(&canonical.join("a/guide.md"), "");
         write(&canonical.join("b/guide.md"), "");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, _, issues) = bfs_crawl_at_root(
             &[canonical.join("index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
@@ -756,7 +763,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[ref](other.md#missing-section)");
         write(&canonical.join("other.md"), "# Existing Section\n\nSome content");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, _, issues) = bfs_crawl_at_root(
             &[canonical.join("index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
@@ -779,7 +786,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("docs/dev/index.md"), "see [[../system/foo.md]]");
         write(&canonical.join("docs/system/foo.md"), "");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, _, issues) = bfs_crawl_at_root(
             &[canonical.join("docs/dev/index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
@@ -797,25 +804,158 @@ mod tests {
     }
 
     #[test]
-    fn cross_repo_unknown_repo_flagged() {
+    fn cross_repo_annotation_with_unknown_name_is_silent() {
+        // `foo.md` (no-such-repo) — looks like a cross-repo ref but the name isn't a configured
+        // repo, so the parser treats it as an inline-code annotation and emits no link.
         let dir = TempDir::new().unwrap();
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "see `foo.md` (no-such-repo)");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, _, issues) = bfs_crawl_at_root(
             &[canonical.join("index.md").to_string_lossy().to_string()],
             canonical.to_str().unwrap(),
             &CrawlOptions::new(),
             &mut cache,
         );
-        let unknowns: Vec<_> = issues
+        // No issues at all — annotation is silent (parser pre-filter), and the file has
+        // no other links to resolve.
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn cross_repo_ref_to_known_repo_with_missing_target_flagged() {
+        // `(known-repo)` IS configured but the target file doesn't exist → CrossRepoBroken.
+        // Confirms the parser-side filter doesn't mask real cross-repo errors.
+        let entry_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let entry = fs::canonicalize(entry_dir.path()).unwrap();
+        let target = fs::canonicalize(target_dir.path()).unwrap();
+        write(&entry.join(".md-orphan"), "");
+        write(&entry.join("index.md"), "see `missing.md` (known-repo)");
+        write(&target.join(".md-orphan"), "");
+        let mut repos = HashMap::new();
+        repos.insert("known-repo".to_string(), target.to_string_lossy().to_string());
+        let opts = CrawlOptions {
+            repos,
+            use_default_excludes: true,
+            extra_excludes: Vec::new(),
+            use_walk_cache: false,
+        };
+        let mut cache =
+            ExtractionCache::new(false, opts.repos.keys().cloned().collect());
+        let (_, _, issues) = bfs_crawl_at_root(
+            &[entry.join("index.md").to_string_lossy().to_string()],
+            entry.to_str().unwrap(),
+            &opts,
+            &mut cache,
+        );
+        let broken: Vec<_> = issues
             .iter()
-            .filter(|i| matches!(i.kind, IssueKind::UnknownRepo(_)))
+            .filter(|i| matches!(i.kind, IssueKind::CrossRepoBroken(_)))
             .collect();
-        assert_eq!(unknowns.len(), 1);
-        if let IssueKind::UnknownRepo(r) = &unknowns[0].kind {
-            assert_eq!(r, "no-such-repo");
-        }
+        assert_eq!(broken.len(), 1, "expected 1 CrossRepoBroken, got: {:?}", issues);
+    }
+
+    #[test]
+    fn cross_repo_files_internal_broken_links_not_reported() {
+        // Entry repo references a file in target repo; that file has its own broken link.
+        // The internal broken link is NOT meow-tower's responsibility — should be silent.
+        let entry_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let entry = fs::canonicalize(entry_dir.path()).unwrap();
+        let target = fs::canonicalize(target_dir.path()).unwrap();
+        write(&entry.join(".md-orphan"), "");
+        write(&entry.join("index.md"), "see `outgoing.md` (target-repo)");
+        write(&target.join(".md-orphan"), "");
+        write(&target.join("outgoing.md"), "[bad](nonexistent.md) intra-target broken link");
+        let opts = CrawlOptions {
+            repos: HashMap::from([(
+                "target-repo".to_string(),
+                target.to_string_lossy().to_string(),
+            )]),
+            use_default_excludes: true,
+            extra_excludes: Vec::new(),
+            use_walk_cache: false,
+        };
+        let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
+        let (_, _, issues) = bfs_crawl_at_root(
+            &[entry.join("index.md").to_string_lossy().to_string()],
+            entry.to_str().unwrap(),
+            &opts,
+            &mut cache,
+        );
+        // No broken-link or any other issue: outgoing.md exists in target-repo, and we
+        // don't recurse into target-repo files to find their own broken links.
+        assert!(issues.is_empty(), "expected silent, got: {:?}", issues);
+    }
+
+    #[test]
+    fn entry_repo_anchor_check_on_cross_repo_target_still_works() {
+        // Anchor verification on entry-repo's outgoing refs must still read the target file's
+        // headings. Skipping recursion ≠ skipping anchor verification on direct refs.
+        let entry_dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let entry = fs::canonicalize(entry_dir.path()).unwrap();
+        let target = fs::canonicalize(target_dir.path()).unwrap();
+        write(&entry.join(".md-orphan"), "");
+        write(&entry.join("index.md"), "see `outgoing.md#nope` (target-repo)");
+        write(&target.join(".md-orphan"), "");
+        write(&target.join("outgoing.md"), "# Real Section\n");
+        let opts = CrawlOptions {
+            repos: HashMap::from([(
+                "target-repo".to_string(),
+                target.to_string_lossy().to_string(),
+            )]),
+            use_default_excludes: true,
+            extra_excludes: Vec::new(),
+            use_walk_cache: false,
+        };
+        let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
+        let (_, _, issues) = bfs_crawl_at_root(
+            &[entry.join("index.md").to_string_lossy().to_string()],
+            entry.to_str().unwrap(),
+            &opts,
+            &mut cache,
+        );
+        let anchors: Vec<_> = issues
+            .iter()
+            .filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_)))
+            .collect();
+        assert_eq!(anchors.len(), 1, "expected 1 BrokenAnchor, got: {:?}", issues);
+    }
+
+    #[test]
+    fn cross_repo_ref_to_locally_missing_repo_is_silent() {
+        // Repo configured but its path doesn't exist on this machine — refs to it should be
+        // dropped at the parser layer, same as unknown-name annotations.
+        let entry_dir = TempDir::new().unwrap();
+        let entry = fs::canonicalize(entry_dir.path()).unwrap();
+        write(&entry.join(".md-orphan"), "");
+        write(&entry.join("index.md"), "see `foo.md` (some-repo)");
+        let mut cfg = crate::config::GlobalConfig {
+            repos: HashMap::from([(
+                "some-repo".to_string(),
+                "/tmp/__md_orphan_definitely_not_a_dir__".to_string(),
+            )]),
+        };
+        cfg.retain_existing();
+        // After retain, the missing repo is gone.
+        assert!(cfg.repos.is_empty());
+
+        let opts = CrawlOptions {
+            repos: cfg.repos,
+            use_default_excludes: true,
+            extra_excludes: Vec::new(),
+            use_walk_cache: false,
+        };
+        let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
+        let (_, _, issues) = bfs_crawl_at_root(
+            &[entry.join("index.md").to_string_lossy().to_string()],
+            entry.to_str().unwrap(),
+            &opts,
+            &mut cache,
+        );
+        assert!(issues.is_empty(), "expected silent, got: {:?}", issues);
     }
 
     #[test]
@@ -825,7 +965,7 @@ mod tests {
         let entry = canonical.join("a/index.md");
         write(&entry, "x [[docs/guide.md]] y");
         write(&canonical.join("a/docs/guide.md"), "");
-        let mut cache = ExtractionCache::new(false);
+        let mut cache = ExtractionCache::for_tests(false);
         let (_, _, issues) = bfs_crawl_at_root(
             &[entry.to_string_lossy().to_string()],
             canonical.join("a").to_str().unwrap(),
@@ -846,7 +986,7 @@ mod tests {
         assert_eq!(rewritten, "x [[guide.md]] y");
 
         // Idempotency: re-run yields no style issues.
-        let mut cache2 = ExtractionCache::new(false);
+        let mut cache2 = ExtractionCache::for_tests(false);
         let (_, _, issues2) = bfs_crawl_at_root(
             &[entry.to_string_lossy().to_string()],
             canonical.join("a").to_str().unwrap(),

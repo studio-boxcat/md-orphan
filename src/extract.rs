@@ -6,7 +6,7 @@
 
 use crate::path::{decode_utf8, has_extension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// One link extracted from markdown. Carries enough byte-offset info to feed the cache layer
@@ -35,8 +35,10 @@ pub enum LinkKind {
 
 // MARK: - Link extraction
 
-/// Scan raw UTF-8 bytes for markdown links.
-pub fn extract_links(buf: &[u8]) -> Vec<Link> {
+/// Scan raw UTF-8 bytes for markdown links. `repos` filters cross-repo backtick refs:
+/// only `` `path` (name) `` whose `name` is in the set is emitted as `LinkKind::CrossRepo`;
+/// non-matching annotations (e.g. `(GridView)`, `(Runtime)`, `(10)`) are treated as inline code.
+pub fn extract_links(buf: &[u8], repos: &HashSet<String>) -> Vec<Link> {
     if buf.len() <= 4 {
         return Vec::new();
     }
@@ -55,7 +57,6 @@ pub fn extract_links(buf: &[u8]) -> Vec<Link> {
             && buf[i + 2] == b'`'
         {
             in_fence = !in_fence;
-            // Skip to end of line so the fence's own info-string isn't scanned.
             while i < count && buf[i] != b'\n' {
                 i += 1;
             }
@@ -81,7 +82,7 @@ pub fn extract_links(buf: &[u8]) -> Vec<Link> {
             }
         }
         if buf[i] == b'`' {
-            i = scan_backtick_ref(buf, count, i, &mut links);
+            i = scan_backtick_ref(buf, count, i, &mut links, repos);
             continue;
         }
         i += 1;
@@ -90,9 +91,8 @@ pub fn extract_links(buf: &[u8]) -> Vec<Link> {
     links
 }
 
-/// Convenience: extract links from a `&str`.
 pub fn extract_links_str(s: &str) -> Vec<Link> {
-    extract_links(s.as_bytes())
+    extract_links(s.as_bytes(), &HashSet::new())
 }
 
 // MARK: - Per-syntax scanners
@@ -216,7 +216,13 @@ fn scan_standard_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>)
 }
 
 /// Parse `` `path` (repo-name) `` cross-repo backtick refs.
-fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
+fn scan_backtick_ref(
+    buf: &[u8],
+    count: usize,
+    i: usize,
+    links: &mut Vec<Link>,
+    repos: &HashSet<String>,
+) -> usize {
     // Skip multi-backtick spans (``foo``, ```bar```).
     if i + 1 < count && buf[i + 1] == b'`' {
         return i + 1;
@@ -236,7 +242,6 @@ fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) 
     if !(end < count && buf[end] == b'`' && end > path_start) {
         return i + 1;
     }
-    // After the closing backtick, look for " (repo-name)".
     let after_close = end + 1;
     if !(after_close + 2 < count && buf[after_close] == b' ' && buf[after_close + 1] == b'(') {
         return after_close;
@@ -248,10 +253,7 @@ fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) 
         if rb == b')' {
             break;
         }
-        // Repo names: [A-Za-z0-9_-]
-        let is_alpha = (rb >= b'A' && rb <= b'Z') || (rb >= b'a' && rb <= b'z');
-        let is_digit = rb >= b'0' && rb <= b'9';
-        if !(is_alpha || is_digit || rb == b'_' || rb == b'-') {
+        if !(rb.is_ascii_alphanumeric() || rb == b'_' || rb == b'-') {
             return after_close;
         }
         repo_end += 1;
@@ -259,7 +261,12 @@ fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) 
     if !(repo_end < count && buf[repo_end] == b')' && repo_end > repo_start) {
         return after_close;
     }
-    // Path inside backticks: split on first '#' for fragment.
+    // Repo-name bytes are validated ASCII alnum/_/- above, so str::from_utf8 is infallible.
+    // `contains` accepts a `&str`, so we avoid allocating a `String` for inline-code annotations.
+    let repo_str = std::str::from_utf8(&buf[repo_start..repo_end]).unwrap();
+    if !repos.contains(repo_str) {
+        return repo_end + 1;
+    }
     let mut hash_pos: Option<usize> = None;
     for j in path_start..end {
         if buf[j] == b'#' {
@@ -268,8 +275,7 @@ fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) 
         }
     }
     let name_end = hash_pos.unwrap_or(end);
-    let name_len = name_end - path_start;
-    if name_len == 0 || !has_extension(buf, path_start, name_len) {
+    if !is_valid_cross_repo_path(&buf[path_start..name_end]) {
         return repo_end + 1;
     }
     let fragment = hash_pos.and_then(|h| {
@@ -280,15 +286,32 @@ fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) 
             None
         }
     });
-    let repo = decode_utf8(buf, repo_start, repo_end - repo_start);
     links.push(Link {
-        kind: LinkKind::CrossRepo { repo },
-        target: decode_utf8(buf, path_start, name_len),
+        kind: LinkKind::CrossRepo { repo: repo_str.to_string() },
+        target: decode_utf8(buf, path_start, name_end - path_start),
         fragment,
         path_start,
         path_end: name_end,
     });
     repo_end + 1
+}
+
+/// Constraints on a cross-repo backtick path. Annotations like `foo bar.md`,
+/// `services/<name>.md`, `./foo.md`, `../foo.md`, `foo.ts` are rejected — they're either
+/// prose, docs placeholders, or non-`.md` source refs we don't index.
+fn is_valid_cross_repo_path(path: &[u8]) -> bool {
+    if !path.ends_with(b".md") || path.len() < 4 {
+        return false;
+    }
+    if path.starts_with(b"./") || path.starts_with(b"../") {
+        return false;
+    }
+    for &b in path {
+        if matches!(b, b' ' | b'\t' | b'<' | b'>' | b'{' | b'}') {
+            return false;
+        }
+    }
+    true
 }
 
 // MARK: - Heading extraction
@@ -375,6 +398,84 @@ mod tests {
             .into_iter()
             .map(|l| (l.target, l.fragment))
             .collect()
+    }
+
+    fn cross_repo_links(s: &str, repos: &[&str]) -> Vec<Link> {
+        let set: HashSet<String> = repos.iter().map(|r| (*r).to_string()).collect();
+        extract_links(s.as_bytes(), &set)
+    }
+
+    // -- known-repo filter (cross-repo backtick refs) --
+
+    #[test]
+    fn cross_repo_emitted_when_name_is_known() {
+        let links = cross_repo_links("see `foo.md` (meow-tower)", &["meow-tower"]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "foo.md");
+        assert_eq!(links[0].kind, LinkKind::CrossRepo { repo: "meow-tower".into() });
+    }
+
+    #[test]
+    fn cross_repo_filtered_when_name_is_unknown() {
+        // `view.name` (GridView) — annotation, not a cross-repo ref.
+        assert!(cross_repo_links("`view.name` (GridView)", &["meow-tower"]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_filtered_for_numeric_annotation() {
+        assert!(cross_repo_links("`UISortingOrder.Activity` (10)", &["meow-tower"]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_filtered_when_repo_set_is_empty() {
+        assert!(cross_repo_links("`foo.md` (meow-tower)", &[]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_filter_does_not_consume_following_links() {
+        // Annotation in front, real wiki link after — wiki link must still be picked up.
+        let links = cross_repo_links(
+            "`view.name` (GridView) and [[guide.md]]",
+            &["meow-tower"],
+        );
+        let targets: Vec<_> = links.iter().map(|l| l.target.clone()).collect();
+        assert_eq!(targets, vec!["guide.md"]);
+    }
+
+    // -- path-shape constraints (only enforced when name is a configured repo) --
+
+    #[test]
+    fn cross_repo_filtered_for_non_md_path() {
+        // .ts files in cross-repo refs are unverifiable without all-extension indexing — skip.
+        assert!(cross_repo_links("`tps-tag-applier.ts` (meow-toolbox)", &["meow-toolbox"]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_filtered_for_path_with_whitespace() {
+        // `foo bar.md` (meow-tower) — prose with a trailing extension; still not a path.
+        assert!(cross_repo_links("`foo bar.md` (meow-tower)", &["meow-tower"]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_filtered_for_placeholder_path() {
+        // Docs convention: `<name>`, `${name}`, `{name}` mark substitution points.
+        assert!(cross_repo_links("`services/<name>.md` (meow-game-server)", &["meow-game-server"]).is_empty());
+        assert!(cross_repo_links("`docs/${section}.md` (meow-tower)", &["meow-tower"]).is_empty());
+        assert!(cross_repo_links("`{anything}.md` (meow-tower)", &["meow-tower"]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_filtered_for_relative_path_prefix() {
+        assert!(cross_repo_links("`./foo.md` (meow-tower)", &["meow-tower"]).is_empty());
+        assert!(cross_repo_links("`../foo.md` (meow-tower)", &["meow-tower"]).is_empty());
+    }
+
+    #[test]
+    fn cross_repo_emitted_with_fragment_on_clean_path() {
+        let links = cross_repo_links("`docs/foo.md#sec` (meow-tower)", &["meow-tower"]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "docs/foo.md");
+        assert_eq!(links[0].fragment.as_deref(), Some("sec"));
     }
 
     // -- standard links --

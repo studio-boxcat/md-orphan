@@ -23,17 +23,18 @@ Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesom
 
 ```
 src/
-  path.rs       — path helpers + read_file + scanner-internal helpers (~150 LOC)
-  exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI (~250 LOC)
-  extract.rs    — Link type + byte-level link/heading/fence scanners (~480 LOC)
-  crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes (~660 LOC)
-  discovery.rs  — index_repo + RepoIndex (`ignore::WalkParallel`-based, parallel) (~190 LOC)
-  config.rs     — global JSON config + .md-orphan + expand_path (~250 LOC)
-  cache.rs      — ExtractionCache (mtime + size + content-hash keyed) (~310 LOC)
-  main.rs       — clap-derive command + output rendering + --fix wiring (~270 LOC)
+  path.rs       — path helpers + read_file + scanner-internal helpers (~165 LOC)
+  exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI (~280 LOC)
+  extract.rs    — Link type + byte-level link/heading/fence scanners (~640 LOC)
+  crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes (~870 LOC)
+  discovery.rs  — index_repo + RepoIndex (`ignore::WalkParallel`-based, parallel) (~290 LOC)
+  config.rs     — global JSON config + .md-orphan + expand_path (~285 LOC)
+  cache.rs      — ExtractionCache (mtime + size + content-hash keyed) (~395 LOC)
+  walk_cache.rs — WalkCache: persisted RepoIndex, per-dir-mtime validated (~235 LOC)
+  main.rs       — clap-derive command + output rendering + --fix wiring (~310 LOC)
 ```
 
-8 files, each focused. Total ~2.5k LOC; each file under 700. Library types and public-API surface fit on one screen.
+9 files, each focused. Total ~3.5k LOC; `crawl.rs` is the heaviest at ~870 LOC (BFS + resolver + style-fix rewriter + cross-repo crawl). Library types and public-API surface fit on one screen.
 
 Why not subdirectories: peer tools at our scale stay flat. Adding `src/extract/` for one file or `src/parsing/` for two has the cohesion penalty of misleading concern names.
 
@@ -95,8 +96,8 @@ pub fn bfs_crawl(
 `CrawlState` is a struct (with a `'c` lifetime borrowing `&mut ExtractionCache`) — single-threaded, single-owner, dropped at end of `bfs_crawl`. No statics, no shared instance.
 
 Two visited sets, both keyed by canonical absolute path:
-- `reachable: HashSet<String>` — entry-repo orphan tracking.
-- `cross_repo_visited: HashSet<String>` — cross-repo target trees. They get verified + style-checked but never enter `reachable` (orphan detection is scoped to the entry repo).
+- `reachable: HashSet<String>` — entry-repo orphan tracking. Files in this set get their outgoing links resolved + recursively followed.
+- `cross_repo_visited: HashSet<String>` — cross-repo target files the entry repo directly references. They're read so anchor checks against their headings work, but their outgoing links are NOT followed — `visit()` returns early after caching headings. Issues from cross-repo files would be downstream-repo concerns, not entry-repo concerns.
 
 Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canonicalize`, so path-based dedup handles them. Hardlinks (rare in doc trees) are processed twice.
 
@@ -107,26 +108,46 @@ Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canon
 | Global config | `$XDG_CONFIG_HOME/md-orphan/md-orphan.json` (fallback `~/.config/...`) | `{"repos": {name: path}}` or flat `{name: path}` — both accepted; `$VAR` / `~/` expansion |
 | Per-repo ignore | `<repo>/.md-orphan` | gitignore-style line patterns; `#` comments. Required at the entry repo root. |
 | Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
+| Per-repo walk-cache | `$XDG_CONFIG_HOME/md-orphan/walk-cache/<fnv1a64-of-canonical-root>.json` | persisted `RepoIndex` + per-dir mtime map |
 
-**Cache schema** (`schemaVersion: 3`):
+**Per-file cache schema** (`schema_version: 4`, defined at `cache.rs:21`):
 
 ```json
 {
-  "schemaVersion": 3,
-  "displayName": "md-orphan",
+  "schema_version": 4,
+  "display_name": "md-orphan",
+  "repo_set_hash": 12345678901234567890,
   "entries": {
     "README.md": {
-      "mtimeNs": 1...,
+      "mtime_ns": 1700000000000000000,
       "size": 1234,
-      "contentHash": 17...,
-      "links": [{"kind": {"Wiki": null}, "target": "TODO.md", "fragment": null, "pathStart": 1995, "pathEnd": 2002}],
+      "content_hash": 17000000000000000000,
+      "links": [{"kind": "Wiki", "target": "TODO.md", "fragment": null, "path_start": 1995, "path_end": 2002}],
       "headings": ["overview", "usage"]
     }
   }
 }
 ```
 
-Cache validation requires `(mtime_ns, size, content_hash)` to all match. Schema mismatch → silent invalidate (cache is regenerable). Schema bumped 2→3 during the Rust port because `serde` derives a different tagged-enum JSON shape than Swift `Codable` — old caches invalidate harmlessly on first run after the upgrade.
+Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache validation: `repo_set_hash` matches the active configured repo set (cross-repo refs are filtered against that set at extract time, so cached entries become unsafe when the set changes). Schema mismatch on either → silent invalidate. Bumps:
+- 2→3 during the Rust port (serde tagged-enum shape diverged from Swift Codable)
+- 3→4 added `repo_set_hash` to track repo-set changes
+
+**Walk-cache schema** (`WALK_CACHE_SCHEMA_VERSION: 1`, defined at `walk_cache.rs`):
+
+```json
+{
+  "schema_version": 1,
+  "canonical_root": "/Users/.../meow-tower",
+  "flags_key": 12345678901234567890,
+  "dir_mtimes": {"": 1700000000000000000, "docs": 1700000000000000001},
+  "md_files": ["README.md", "docs/architecture.md"],
+  "by_name": {"README.md": ["/abs/path/README.md"]},
+  "effective_exclude": ["Library/", "Pods/"]
+}
+```
+
+Validation: schema match + `flags_key` match + every `dir_mtimes` entry stats unchanged. Any miss → fall through to a fresh walk. `flags_key` is `fnv1a64(use_default_excludes | include_all_extensions | sorted-effective-excludes)`; bump triggers for the schema version live in the const's doc comment.
 
 ## Pitfalls — avoided in this design
 

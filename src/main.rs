@@ -101,7 +101,10 @@ fn run(cli: Cli) -> Result<bool> {
         .config
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
-    let global_config = load_global_config(&config_path).with_context(|| "loading global config")?;
+    let mut global_config = load_global_config(&config_path).with_context(|| "loading global config")?;
+    // Treat configured-but-not-cloned repos as if they weren't configured at all — refs to them
+    // become inline-code annotations rather than spurious broken-link errors.
+    global_config.retain_existing();
 
     let root = dir_name(&resolved_entries[0]).to_string();
     let root_path = std::path::Path::new(&root);
@@ -119,8 +122,12 @@ no extras."
         repos: global_config.repos,
         use_default_excludes: !cli.no_default_excludes,
         extra_excludes: exclude_patterns,
+        use_walk_cache: !cli.no_cache,
     };
-    let mut cache = ExtractionCache::new(!cli.no_cache);
+    let mut cache = ExtractionCache::new(
+        !cli.no_cache,
+        crawl_options.repos.keys().cloned().collect(),
+    );
     let (entry_index, reachable, issues) = bfs_crawl_at_root(
         &resolved_entries,
         &root,
@@ -166,7 +173,6 @@ no extras."
     let broken: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Broken)).collect();
     let ambiguous: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Ambiguous(_))).collect();
     let broken_anchors: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_))).collect();
-    let unknown_repos: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::UnknownRepo(_))).collect();
     let cross_repo_broken: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::CrossRepoBroken(_))).collect();
     let style_issues: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Style { .. })).collect();
 
@@ -191,15 +197,6 @@ no extras."
         for a in &broken_anchors {
             if let IssueKind::BrokenAnchor(frag) = &a.kind {
                 println!("  {}#{} in {}", a.link, frag, rel_source(a));
-            }
-        }
-        failed = true;
-    }
-    if !unknown_repos.is_empty() {
-        println!("\u{1F6AB} {} unknown cross-repo references:", unknown_repos.len());
-        for u in &unknown_repos {
-            if let IssueKind::UnknownRepo(r) = &u.kind {
-                println!("  `{}` ({r}) in {}", u.link, rel_source(u));
             }
         }
         failed = true;

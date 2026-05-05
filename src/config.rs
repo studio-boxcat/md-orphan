@@ -32,6 +32,15 @@ pub struct GlobalConfig {
     pub repos: HashMap<String, String>, // resolved (env-expanded) absolute paths
 }
 
+impl GlobalConfig {
+    /// Drop entries whose path isn't a directory on this machine. Cross-repo refs to a
+    /// configured-but-not-cloned repo would otherwise become spurious "broken" errors;
+    /// after retain, the parser drops them as inline-code annotations.
+    pub fn retain_existing(&mut self) {
+        self.repos.retain(|_, path| Path::new(path).is_dir());
+    }
+}
+
 /// Default global config path: `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`, fallback to
 /// `$HOME/.config/md-orphan/md-orphan.json`.
 pub fn default_config_path() -> PathBuf {
@@ -279,6 +288,36 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nope.json");
         let cfg = load_global_config(&path).unwrap();
+        assert!(cfg.repos.is_empty());
+    }
+
+    #[test]
+    fn retain_existing_drops_missing_paths() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let mut cfg = GlobalConfig {
+            repos: HashMap::from([
+                ("present".to_string(), real.to_string_lossy().to_string()),
+                ("absent".to_string(), "/tmp/__md_orphan_nope_no_such_dir__".to_string()),
+            ]),
+        };
+        cfg.retain_existing();
+        assert!(cfg.repos.contains_key("present"));
+        assert!(!cfg.repos.contains_key("absent"));
+    }
+
+    #[test]
+    fn retain_existing_drops_path_that_is_a_file_not_a_dir() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, "").unwrap();
+        let mut cfg = GlobalConfig {
+            repos: HashMap::from([
+                ("file-not-dir".to_string(), file.to_string_lossy().to_string()),
+            ]),
+        };
+        cfg.retain_existing();
         assert!(cfg.repos.is_empty());
     }
 }

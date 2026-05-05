@@ -38,7 +38,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 | `--fix` | Rewrite link style issues in place (atomic write) |
 | `--config <path>` | Override global config (default `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`) |
 | `--no-default-excludes` | Disable built-in defaults (`.git`, `node_modules`, `Library`, `.build`, ...) |
-| `--no-cache` | Disable the per-file extraction cache |
+| `--no-cache` | Disable both the walk-result cache and the per-file extraction cache |
 | `--claude` | Print full path + contents of nearest `CLAUDE.md` (walks up from cwd) |
 
 ## Link styles
@@ -53,6 +53,8 @@ The tool recognizes four link forms in markdown. Style violations are flagged wh
 | Inline code | `` `path.ext` `` (no repo suffix) | deferred — see [[TODO.md]] |
 
 Standard md links (`[text](path)`) get broken-link / ambiguity / anchor checks, but are **not** rewritten — most renderers (GitHub, etc.) interpret them as filesystem-relative, so basename-magic would silently break them.
+
+**Cross-repo annotation filter:** the `` `path.ext` (name) `` syntax is only treated as a cross-repo ref when `name` matches a configured repo. Patterns like `` `view.name` (GridView) ``, `` `Unity.Analytics` (Runtime) ``, `` `UISortingOrder.Activity` (10) `` are silently treated as inline-code annotations. Trade-off: typos to a known-repo name are caught at file-resolution (`CrossRepoBroken`); typos to a wrong-repo name are silent.
 
 Fenced code blocks (` ``` `) are skipped during scanning — content inside fences is never parsed as a link or cross-repo ref.
 
@@ -91,9 +93,9 @@ Cross-repo refs `` `path.ext` (repo-name) `` are resolved by looking up the repo
 
 `$VAR` / `${VAR}` and a leading `~/` are expanded against the environment. Default location: `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`, falling back to `~/.config/md-orphan/md-orphan.json`. Override with `--config <path>`.
 
-Failure modes (all exit 1): cross-repo ref to a repo not in config, file doesn't exist in target repo, style violation, broken anchor.
+Failure modes (all exit 1): file doesn't exist in target repo, style violation, broken anchor. A `` `…` (name) `` whose name isn't in the config is treated as an inline-code annotation, not a cross-repo ref — see the parser filter note in [Link styles](#link-styles).
 
-The crawl follows cross-repo `.md` targets recursively — links inside those files are checked too. **Orphan detection** is scoped to the entry repo only; cross-repo files are visited and verified but never participate in orphan reachability.
+The crawl visits each cross-repo target file the entry repo *directly* references — to verify the file exists and its anchors resolve — but **does not recurse** into the cross-repo file's own outgoing links. Cross-repo internal rot is the responsibility of that repo's own md-orphan run, not yours. Orphan detection is also scoped to the entry repo only.
 
 ## Per-repo ignore (`.md-orphan`)
 
@@ -120,17 +122,17 @@ Pattern syntax (gitignore-flavored):
 
 Built-in defaults (`.git`, `.svn`, `.hg`, `node_modules`, `.build`, `DerivedData`, `Library`, `Pods`, `target`, `vendor`, `.venv`, `__pycache__`) apply on top and use the same nested-matching semantics. Disable with `--no-default-excludes`.
 
-## Cache
+## Caches
 
-Per-file extraction (links + headings) is cached at `$XDG_CONFIG_HOME/md-orphan/cache/<hash>.json`, one file per indexed repo. Filename is `fnv1a64(canonical_root)` — two repos with the same basename in different parents don't collide.
+Two layers, both keyed by `fnv1a64(canonical_root)` — two repos with the same basename in different parents don't collide. Both use atomic writes (tempfile + rename), schema-versioned, last-writer-wins on concurrent invocations.
 
-**Validation**: `(mtime_ns, size, fnv1a64(content))` must all match the on-disk file before a cache entry is reused. Mismatch → re-extract + update.
+**Walk-result cache** at `$XDG_CONFIG_HOME/md-orphan/walk-cache/<hash>.json` — persists `RepoIndex` (md_files + by_name + effective excludes). Validation: per-dir mtime stat (APFS bumps dir mtime on entry add/remove/rename, not file content edits). Flags-keyed: changes to `--exclude`, `.md-orphan`, `--no-default-excludes` invalidate. On hit, skips the entire `index_repo` walk (~99 ms cold → ~40 ms warm on Unity-scale repos).
 
-**Robustness**: a single `cacheSchemaVersion` field invalidates cache on any format or parser change; atomic writes (tmp + rename via the `tempfile` crate); load errors silently fall through to fresh extraction; entries for files no longer in the repo are auto-pruned each run.
+**Per-file extraction cache** at `$XDG_CONFIG_HOME/md-orphan/cache/<hash>.json` — caches links + headings per `.md` file. Per-entry validation: `(mtime_ns, size, fnv1a64(content))` all match. Per-cache-file validation: `repo_set_hash` (fnv1a64 of sorted configured repo names) — invalidates the whole cache when the user's repo config changes, since cross-repo refs are filtered against that set at extract time. Catches the post-`--fix` byte-equal-output edge case via content hash. Entries for vanished files auto-pruned each run.
 
-**Concurrency**: last-writer-wins on concurrent invocations. Cache is regenerable, so corruption is non-fatal — a corrupted file is treated as a miss and overwritten on next run.
+Load errors silently fall through to fresh extraction; corrupted files are treated as misses and overwritten next run.
 
-Disable with `--no-cache`.
+Disable both with `--no-cache`.
 
 ## Structure
 
@@ -138,9 +140,10 @@ Disable with `--no-cache`.
 - `src/exclude.rs` — `ExcludeMatcher` with bare-basename hash-set fast path + `DEFAULT_EXCLUDES`
 - `src/extract.rs` — `Link` type + byte-level link/heading/fence scanners + grapheme-aware `anchor_id`
 - `src/crawl.rs` — `bfs_crawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolve_link`, `apply_style_fixes`
-- `src/discovery.rs` — `index_repo` + `RepoIndex` (walkdir-based)
+- `src/discovery.rs` — `index_repo` + `RepoIndex` (`ignore::WalkParallel`-based)
 - `src/config.rs` — global JSON config + per-repo `.md-orphan` parsing + `expand_path`
 - `src/cache.rs` — per-file extraction cache (mtime + size + fnv1a64 content-hash keyed)
+- `src/walk_cache.rs` — walk-result cache: persisted `RepoIndex`, per-dir-mtime validated
 - `src/main.rs` — clap-derive CLI entry + output rendering + `--fix` wiring
 - `tests/fixtures/` — anchor-id parity TSV captured during the Swift→Rust port
 - `dist/md-orphan` — pre-built release binary (committed to repo for fast `just install`)
@@ -149,11 +152,11 @@ Disable with `--no-cache`.
 ## Algorithm
 
 1. **Discover** — `ignore::WalkParallel` traversal under the entry root with per-thread visitor pruning excluded subtrees (work-stealing across `num_cpus` threads). `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is off by default — see [[TODO.md]].)
-2. **Crawl** — BFS from entry points. For each visited file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo and recursive crawl. Two visited sets, both keyed by canonical path.
+2. **Crawl** — BFS from entry points. For each visited entry-repo file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo. The target file is visited (heading extraction for anchor checks) but its outgoing links are NOT followed — cross-repo recursion stops at depth 1. Two visited sets, both keyed by canonical path.
 3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 
 Edge cases: missing entry point → exit 1; broken link → exit 1; circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union.
 
 ## Performance
 
-~7 ms self-check, ~500 ms on a Unity-scale 109k-file repo with defaults applied. Numbers, per-phase breakdown, and what the cache actually buys: [[performance.md]].
+~5 ms self-check; ~63 ms cold / ~29 ms warm on a Unity-scale 51k-file repo (post-prune). Numbers, per-phase breakdown, and what the walk-cache and per-file cache actually buy: [[performance.md]].

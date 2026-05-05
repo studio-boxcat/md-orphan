@@ -15,10 +15,9 @@ Wall-clock numbers, where time goes, and what the cache and `--no-default-exclud
 
 | Scenario | min – median – max | CPU | Notes |
 |---|---|---|---|
-| Self-check (6 `.md`) | **4 – 5 – 6 ms** | ~75% | startup + thread pool spinup dominates |
-| Unity-scale, no cache | **95 – 99 – 103 ms** | ~500% | every run does walk + read + extract |
-| Unity-scale, cold cache (cache wiped, first run) | **91 – 98 – 104 ms** | ~500% | cache write is cheap |
-| Unity-scale, warm cache | **96 – 99 – 106 ms** | ~500% | cache read essentially break-even with extract |
+| Self-check (6 `.md`), warm | **4 – 6 – 9 ms** | ~75% | startup + thread pool spinup dominates |
+| Unity-scale, `--no-cache` | **59 – 63 – 75 ms** | ~450-650% | walk + read + extract; no cross-repo recursion |
+| Unity-scale, **warm walk-cache + per-file** | **26 – 29 – 38 ms** | ~96% | no walk, no thread pool — single-threaded happy path |
 | Unity-scale, `--no-default-excludes` | ~700 ms | ~500% | walks Library/Pods/etc. — parallelism saves more on bigger trees |
 
 Progression on meow-tower:
@@ -28,41 +27,61 @@ Progression on meow-tower:
 | Swift baseline (pre-Rust) | ~225 ms | — |
 | Rust port (sequential `walkdir`) | ~165 ms | -27% |
 | + drop `sort_by_file_name` + precompute root prefix | ~165 ms (best 164 ms) | wash on wall clock; -30 ms user time |
-| + `ignore::WalkParallel` (5 worker threads) | **~99 ms (best 91 ms)** | **-40%** |
+| + `ignore::WalkParallel` (5 worker threads) | ~99 ms (best 91 ms) | -40% |
+| + walk-cache (warm) | ~40 ms (best 38 ms) | -60% |
+| + drop cross-repo recursion (warm) | **~29 ms (best 26 ms)** | **-28%** |
 
-**Total Swift→now: 225 ms → 99 ms (-56%).**
+**Total Swift→warm-today: 225 ms → 29 ms (-87%).**
 
 | Tool | meow-tower (51k pruned) |
 |---|---|
 | `fd ''` (parallel, walk only) | 33 – 35 ms |
 | `fd '' --threads 1` (walk only) | 180 – 210 ms |
-| md-orphan full pipeline | 95 – 99 ms |
+| md-orphan, cold (`--no-cache`) | 59 – 63 ms |
+| md-orphan, warm | **26 – 29 ms** |
 
-md-orphan's 99 ms includes: walk (~35 ms, matches `fd` parallel) + read 116 `.md` files + extract links/headings + BFS resolve + style-check + cross-repo crawl into 3 referenced repos + render output. fd just lists files.
+Warm md-orphan is in the same ballpark as `fd ''` parallel — but `fd` only lists files, while md-orphan also reads 116 `.md` files, extracts links/headings, BFS-resolves, style-checks, and crawls 3 cross-repo targets.
 
-## Where time goes (Unity-scale, ~99 ms total)
+## Where time goes (warm path, ~29 ms total)
+
+- Walk-cache load + `dir_mtimes` validation stats — ~3 ms. ~1k surviving dirs after prune; sequential `stat()` per dir but no `getdents` traversal.
+- Per-file cache validation on entry-repo `.md` files (read + hash) — ~5 ms across 116 files.
+- BFS resolve + style check + cross-repo direct-target reads (no recursion) — ~15-18 ms.
+- Output rendering + process exit — ~3-5 ms.
+
+The walk has been **eliminated from steady-state runs**. What remains is the post-walk pipeline: per-file cache validation reads, BFS resolution, and cross-repo crawl coordination.
+
+## Where time goes (cold path, ~63 ms `--no-cache`)
 
 - `index_repo` via `ignore::WalkParallel` — ~35 ms. Bound by kernel `getdents` traversal of ~51k entries, parallelized across 5 worker threads.
-- Read + extract 116 `.md` files — ~5 ms. Manual byte scanner; ~0.04 ms/file.
-- BFS resolve + style check + cross-repo crawl (3 repos) — ~50 ms. Path resolution, basename lookups, issue rendering, transitive cross-repo walks.
-- Output rendering + process exit — ~5-10 ms.
+- Read + extract 116 entry-repo `.md` files — ~5 ms. Manual byte scanner; ~0.04 ms/file.
+- BFS resolve + style check + cross-repo direct-target reads — ~15-20 ms. No recursion into cross-repo files.
+- Output rendering + process exit — ~3-5 ms.
 
-The walk no longer dominates after parallelism. The post-walk pipeline (~60 ms) is now the larger half — **reading and extracting markdown is essentially free**, but BFS + cross-repo crawl is the next thing to look at if we want to squeeze further.
+## Why the walk-cache earns its keep here
 
-## Why the cache is break-even here
+The walk-cache (`src/walk_cache.rs`) persists `RepoIndex` keyed by canonical root + flags hash, validated by per-dir mtime. APFS bumps a directory's mtime on entry add/remove/rename — not on file content edits — which is exactly the granularity we need for "did the basename map change?". File content edits are caught by the per-file cache layer below.
 
-The cache exists, is correct (mtime + size + fnv1a64 content hash, atomic writes via `tempfile`, schema-versioned), and shaves the ~5 ms extraction step on subsequent runs. But:
+- **Cold first run** pays ~36 ms over `--no-cache`: per-dir `stat()` calls during the walk + cache write. Acceptable one-time tax.
+- **Warm runs** drop ~60 ms: zero `getdents`, zero parallel walker spinup, just a stat-per-dir validation pass before the BFS pipeline runs.
+- Schema-versioned + `flags_key`-keyed: changes to `--exclude`, `.md-orphan`, or `--no-default-excludes` invalidate immediately.
+
+Disable with `--no-cache` (toggles both walk-cache and per-file extraction cache).
+
+## Why the per-file cache is break-even here
+
+The per-file extraction cache (`src/cache.rs`) exists, is correct (mtime + size + fnv1a64 content hash, atomic writes, schema-versioned), and shaves the ~5 ms extraction step on subsequent runs. But:
 
 - The validation path **always reads the file and hashes it** — that's the bulk of what a fresh extraction costs.
 - Hashing 600 KB of `.md` content is microseconds; extraction itself is also microseconds.
-- Net wall-clock difference between cold-no-cache and warm-with-cache is within run-to-run variance (~5 ms).
+- Net wall-clock difference between cold-no-cache and warm-with-per-file (without walk-cache) is within run-to-run variance (~5 ms).
 
-Where the cache earns its keep:
+Where it still earns its keep:
 
 - Larger doc trees (1000s of `.md` files) — extraction starts to add up.
 - Per-file content hashes catch the "post-`--fix` re-run with byte-equal output" scenario where `mtime + size` could be unchanged but cached byte offsets are stale.
 
-Disable with `--no-cache` to skip cache machinery entirely.
+The walk-cache is the larger lever here, since it eliminates the ~35 ms walk entirely rather than shaving ~5 ms off extraction.
 
 ## Parallel cross-repo discovery
 
@@ -108,5 +127,6 @@ cargo test --release            # release build
 See [[TODO.md]] for:
 
 - Extending parallel discovery to transitive cross-repos (level-synchronous BFS)
-- Walk-result cache (per-dir mtime validation; could land warm runs at <30 ms — the only step left to genuinely beat fd)
 - Non-`.md` style support cost analysis (~10× current `index_repo` time)
+- Trim post-walk pipeline (~30 ms BFS + cross-repo crawl) — the floor on warm runs now
+- Considered-and-rejected cache shapes (cacache, redb, rkyv, merkle-root-mtime, rayon-parallel-stat) — see TODO for the analysis
