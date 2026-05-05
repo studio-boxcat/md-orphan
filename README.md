@@ -25,7 +25,6 @@ md-orphan <entry-point...> [flags]
 ```
 md-orphan CLAUDE.md
 md-orphan CLAUDE.md README.md
-md-orphan --exclude Library,Packages AGENTS.md
 md-orphan --verbose CLAUDE.md
 md-orphan --fix CLAUDE.md
 ```

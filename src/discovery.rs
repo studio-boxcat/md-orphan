@@ -46,12 +46,16 @@ pub fn index_repo(
     let matcher = ExcludeMatcher::new(effective.clone());
     let bare_only = matcher.is_bare_only();
     let resolved_str = resolved.to_string_lossy().to_string();
+    // Precompute once — was being formatted per-entry inside the walker (fired ~50k times).
+    let root_prefix = format!("{}/", resolved_str);
 
     let mut md_files: HashSet<String> = HashSet::new();
     let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
 
+    // No `sort_by_file_name`: walkdir's sorter eagerly collects each directory into a Vec
+    // (walkdir/src/lib.rs:913-922), costing ~17% of walk time. Output ordering is handled
+    // by the BFS / sort-at-emit stage downstream, not by walk order.
     let walker = WalkDir::new(&resolved)
-        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| {
             // Always allow files through; pruning happens for directories only.
@@ -77,7 +81,7 @@ pub fn index_repo(
             }
             // Full rel_path needed for anchored/glob patterns.
             let abs = e.path().to_string_lossy();
-            if let Some(rel) = abs.strip_prefix(&format!("{}/", resolved_str)) {
+            if let Some(rel) = abs.strip_prefix(&root_prefix) {
                 if matcher.matches(rel, Some(name)) {
                     return false;
                 }
@@ -98,7 +102,7 @@ pub fn index_repo(
             continue;
         }
         let abs = entry.path().to_string_lossy().to_string();
-        let rel = match abs.strip_prefix(&format!("{}/", resolved_str)) {
+        let rel = match abs.strip_prefix(&root_prefix) {
             Some(r) => r.to_string(),
             None => abs.clone(),
         };

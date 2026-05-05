@@ -11,17 +11,26 @@ Wall-clock numbers, where time goes, and what the cache and `--no-default-exclud
 - **Self-check**: this repo, ~6 `.md` files, entry `AGENTS.md`
 - **Unity-scale**: meow-tower repo, ~51k files (Library/Pods/proj-*/Packages excluded by defaults + `.md-orphan`), 116 reachable `.md` files
 
-## Wall clock (Rust binary)
+## Wall clock (Rust binary, post-sort-removal)
 
 | Scenario | Time | Notes |
 |---|---|---|
-| Self-check (~6 `.md`) | **~3 ms** | startup + walk + 6 file reads |
-| Unity-scale, no cache | **~165 ms** | every run does walk + read + extract |
+| Self-check (~7 `.md`) | **~3-5 ms** | startup + walk + 7 file reads |
+| Unity-scale, no cache | **~165-200 ms** | best ~164 ms; sys-time variance from APFS FS cache state |
 | Unity-scale, cold cache (write) | **~225 ms** | +60 ms to write cache JSON |
 | Unity-scale, warm cache (read) | **~165 ms** | extraction skipped, cache validation costs ~hash time |
 | Unity-scale, `--no-default-excludes` | **~1.0 s** | walks `Library/`, `Pods/`, etc. — file count goes from 51k to ~190k |
 
-For comparison, the Swift baseline pre-port was ~225 ms cold / ~265 ms cached. The Rust port is about 30% faster end-to-end on meow-tower.
+Comparison points:
+
+| Tool | Time on meow-tower (51k pruned) |
+|---|---|
+| md-orphan (current Rust) | ~165 ms |
+| Swift baseline pre-port | ~225 ms |
+| `fd '' --threads 1` (single-threaded walk only) | ~180-210 ms |
+| `fd ''` (parallel default, walk only) | ~60-70 ms |
+
+md-orphan ≈ matches `fd --threads 1` on the walk; the gap to `fd` parallel is ~3× and would require parallelizing the walker (see [[TODO.md]]).
 
 ## Where time goes (Unity-scale)
 
