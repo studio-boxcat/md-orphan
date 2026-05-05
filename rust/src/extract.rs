@@ -1,0 +1,638 @@
+//! Byte-level link, fence, and heading extraction.
+//!
+//! Mirrors `Sources/Lib/Extract.swift`. Manual UTF-8 byte scan — Swift Regex was 28-33× slower
+//! per [Swift Forums](https://forums.swift.org/t/slow-regex-performance/75768); Rust's regex is
+//! fine but for our tight scanners byte slicing is simpler and faster.
+
+use crate::path::{decode_utf8, has_extension};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// One link extracted from markdown. Carries enough byte-offset info to feed the cache layer
+/// and `--fix` byte rewriter without separate "cached" or "detailed" variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    pub kind: LinkKind,
+    pub target: String,
+    pub fragment: Option<String>,
+    pub path_start: usize,
+    pub path_end: usize, // exclusive
+}
+
+/// Kind of link, matching the byte-syntax that produced it.
+///
+/// JSON shape: serde's default external tagging produces `{"wiki":null}`,
+/// `{"crossRepo":{"repo":"…"}}` — different from Swift Codable. Cache schema bumped 2→3
+/// to invalidate prior Swift-emitted caches (regenerable; one-time miss).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkKind {
+    Wiki,
+    Standard,
+    CrossRepo { repo: String },
+}
+
+// MARK: - Link extraction
+
+/// Scan raw UTF-8 bytes for markdown links.
+pub fn extract_links(buf: &[u8]) -> Vec<Link> {
+    if buf.len() <= 4 {
+        return Vec::new();
+    }
+    let mut links = Vec::new();
+    let mut i = 0;
+    let mut in_fence = false;
+    let count = buf.len();
+
+    while i < count {
+        // Code-fence detection at line start (\n or BOF, then ```). Flush-left only.
+        let at_line_start = i == 0 || buf[i - 1] == b'\n';
+        if at_line_start
+            && i + 2 < count
+            && buf[i] == b'`'
+            && buf[i + 1] == b'`'
+            && buf[i + 2] == b'`'
+        {
+            in_fence = !in_fence;
+            // Skip to end of line so the fence's own info-string isn't scanned.
+            while i < count && buf[i] != b'\n' {
+                i += 1;
+            }
+            if i < count {
+                i += 1;
+            }
+            continue;
+        }
+
+        if in_fence {
+            i += 1;
+            continue;
+        }
+
+        if i < count - 1 {
+            if buf[i] == b'[' && buf[i + 1] == b'[' {
+                i = scan_wiki_link(buf, count, i, &mut links);
+                continue;
+            }
+            if buf[i] == b']' && buf[i + 1] == b'(' {
+                i = scan_standard_link(buf, count, i, &mut links);
+                continue;
+            }
+        }
+        if buf[i] == b'`' {
+            i = scan_backtick_ref(buf, count, i, &mut links);
+            continue;
+        }
+        i += 1;
+    }
+
+    links
+}
+
+/// Convenience: extract links from a `&str`.
+pub fn extract_links_str(s: &str) -> Vec<Link> {
+    extract_links(s.as_bytes())
+}
+
+// MARK: - Per-syntax scanners
+
+/// Parse `[[page]]`, `[[page|alias]]`, `[[page#section]]` wiki links.
+fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
+    let start = i + 2;
+    let mut end = start;
+    while end < count - 1 {
+        let b = buf[end];
+        if b == b'\n' || b == b'\r' {
+            break;
+        }
+        if b == b']' && buf[end + 1] == b']' {
+            break;
+        }
+        end += 1;
+    }
+    if !(end < count - 1 && buf[end] == b']' && buf[end + 1] == b']' && end > start) {
+        return end + 1;
+    }
+
+    let mut name_end = end;
+    let mut hash_pos: Option<usize> = None;
+    for j in start..end {
+        if buf[j] == b'#' {
+            hash_pos = Some(j);
+            name_end = j;
+            break;
+        }
+        if buf[j] == b'|' {
+            name_end = j;
+            break;
+        }
+    }
+    let mut frag_end = end;
+    if let Some(h) = hash_pos {
+        for j in (h + 1)..end {
+            if buf[j] == b'|' {
+                frag_end = j;
+                break;
+            }
+        }
+    }
+    let name_len = name_end - start;
+    if name_len == 0 {
+        return end + 2;
+    }
+    if !has_extension(buf, start, name_len) {
+        return end + 2;
+    }
+    let fragment = hash_pos.and_then(|h| {
+        let frag_len = frag_end - h - 1;
+        if frag_len > 0 {
+            Some(decode_utf8(buf, h + 1, frag_len))
+        } else {
+            None
+        }
+    });
+    links.push(Link {
+        kind: LinkKind::Wiki,
+        target: decode_utf8(buf, start, name_len),
+        fragment,
+        path_start: start,
+        path_end: name_end,
+    });
+    end + 2
+}
+
+/// Parse `[text](path.md#fragment)` standard links.
+fn scan_standard_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
+    let start = i + 2;
+    let mut end = start;
+    let mut frag_pos: Option<usize> = None;
+    while end < count {
+        let b = buf[end];
+        if b == b')' || b == b'\n' || b == b'\r' {
+            break;
+        }
+        if b == b'#' && frag_pos.is_none() {
+            frag_pos = Some(end);
+        }
+        end += 1;
+    }
+    if !(end < count && buf[end] == b')') {
+        return end + 1;
+    }
+    let path_end_byte = frag_pos.unwrap_or(end);
+    let path_len = path_end_byte - start;
+
+    // Skip http(s) URLs
+    if path_len > 7
+        && start + 3 < count
+        && buf[start] == b'h'
+        && buf[start + 1] == b't'
+        && buf[start + 2] == b't'
+        && buf[start + 3] == b'p'
+    {
+        return end + 1;
+    }
+    if !has_extension(buf, start, path_len) {
+        return end + 1;
+    }
+
+    let fragment = frag_pos.and_then(|p| {
+        let frag_len = end - p - 1;
+        if frag_len > 0 {
+            Some(decode_utf8(buf, p + 1, frag_len))
+        } else {
+            None
+        }
+    });
+    links.push(Link {
+        kind: LinkKind::Standard,
+        target: decode_utf8(buf, start, path_len),
+        fragment,
+        path_start: start,
+        path_end: path_end_byte,
+    });
+    end + 1
+}
+
+/// Parse `` `path` (repo-name) `` cross-repo backtick refs.
+fn scan_backtick_ref(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
+    // Skip multi-backtick spans (``foo``, ```bar```).
+    if i + 1 < count && buf[i + 1] == b'`' {
+        return i + 1;
+    }
+    let path_start = i + 1;
+    let mut end = path_start;
+    while end < count {
+        let b = buf[end];
+        if b == b'`' {
+            break;
+        }
+        if b == b'\n' || b == b'\r' {
+            return i + 1;
+        }
+        end += 1;
+    }
+    if !(end < count && buf[end] == b'`' && end > path_start) {
+        return i + 1;
+    }
+    // After the closing backtick, look for " (repo-name)".
+    let after_close = end + 1;
+    if !(after_close + 2 < count && buf[after_close] == b' ' && buf[after_close + 1] == b'(') {
+        return after_close;
+    }
+    let repo_start = after_close + 2;
+    let mut repo_end = repo_start;
+    while repo_end < count {
+        let rb = buf[repo_end];
+        if rb == b')' {
+            break;
+        }
+        // Repo names: [A-Za-z0-9_-]
+        let is_alpha = (rb >= b'A' && rb <= b'Z') || (rb >= b'a' && rb <= b'z');
+        let is_digit = rb >= b'0' && rb <= b'9';
+        if !(is_alpha || is_digit || rb == b'_' || rb == b'-') {
+            return after_close;
+        }
+        repo_end += 1;
+    }
+    if !(repo_end < count && buf[repo_end] == b')' && repo_end > repo_start) {
+        return after_close;
+    }
+    // Path inside backticks: split on first '#' for fragment.
+    let mut hash_pos: Option<usize> = None;
+    for j in path_start..end {
+        if buf[j] == b'#' {
+            hash_pos = Some(j);
+            break;
+        }
+    }
+    let name_end = hash_pos.unwrap_or(end);
+    let name_len = name_end - path_start;
+    if name_len == 0 || !has_extension(buf, path_start, name_len) {
+        return repo_end + 1;
+    }
+    let fragment = hash_pos.and_then(|h| {
+        let frag_len = end - h - 1;
+        if frag_len > 0 {
+            Some(decode_utf8(buf, h + 1, frag_len))
+        } else {
+            None
+        }
+    });
+    let repo = decode_utf8(buf, repo_start, repo_end - repo_start);
+    links.push(Link {
+        kind: LinkKind::CrossRepo { repo },
+        target: decode_utf8(buf, path_start, name_len),
+        fragment,
+        path_start,
+        path_end: name_end,
+    });
+    repo_end + 1
+}
+
+// MARK: - Heading extraction
+
+/// Convert heading text to GitHub-style anchor ID.
+/// Lowercase, keep letters/numbers/hyphens/underscores, spaces→hyphens.
+///
+/// Iterates by **grapheme clusters** (not `char`s) to match Swift `Character`-level iteration.
+/// On a decomposed `é` (e + combining acute), Swift treats both as one Character; Rust's `chars()`
+/// would split them. `unicode-segmentation`'s `graphemes()` matches Swift's behavior.
+pub fn anchor_id(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let lower = text.to_lowercase();
+    for g in lower.graphemes(true) {
+        if g == " " {
+            result.push('-');
+            continue;
+        }
+        // Treat a grapheme as alphanumeric iff its first char is. Matches Swift `Character.isLetter`
+        // / `isNumber` (which return true for the cluster's base char's category).
+        let first = g.chars().next().unwrap_or('\0');
+        if first.is_alphabetic() || first.is_numeric() || first == '-' || first == '_' {
+            result.push_str(g);
+        }
+    }
+    result
+}
+
+/// Extract heading anchors from markdown content (GitHub-style slugs).
+pub fn extract_headings(buf: &[u8]) -> BTreeSet<String> {
+    let mut headings = BTreeSet::new();
+    let count = buf.len();
+    let mut i = 0;
+
+    while i < count {
+        if buf[i] == b'#' && (i == 0 || buf[i - 1] == b'\n' || buf[i - 1] == b'\r') {
+            let mut j = i;
+            while j < count && buf[j] == b'#' {
+                j += 1;
+            }
+            if j < count && buf[j] == b' ' {
+                j += 1;
+                let head_start = j;
+                while j < count && buf[j] != b'\n' && buf[j] != b'\r' {
+                    j += 1;
+                }
+                let mut head_end = j;
+                while head_end > head_start
+                    && (buf[head_end - 1] == b' ' || buf[head_end - 1] == b'\t')
+                {
+                    head_end -= 1;
+                }
+                if head_end > head_start {
+                    let text = decode_utf8(buf, head_start, head_end - head_start);
+                    headings.insert(anchor_id(&text));
+                }
+            }
+            i = j + 1;
+        } else {
+            while i < count && buf[i] != b'\n' {
+                i += 1;
+            }
+            i += 1;
+        }
+    }
+    headings
+}
+
+/// Convenience: extract headings from a `&str`.
+pub fn extract_headings_str(s: &str) -> BTreeSet<String> {
+    extract_headings(s.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(s: &str) -> Vec<String> {
+        extract_links_str(s).into_iter().map(|l| l.target).collect()
+    }
+
+    fn pairs(s: &str) -> Vec<(String, Option<String>)> {
+        extract_links_str(s)
+            .into_iter()
+            .map(|l| (l.target, l.fragment))
+            .collect()
+    }
+
+    // -- standard links --
+
+    #[test]
+    fn extracts_standard_link() {
+        assert_eq!(paths("See [guide](docs/guide.md) for details"), vec!["docs/guide.md"]);
+    }
+
+    #[test]
+    fn extracts_multiple_links() {
+        assert_eq!(paths("[a](one.md) text [b](two.md)"), vec!["one.md", "two.md"]);
+    }
+
+    #[test]
+    fn strips_fragment() {
+        assert_eq!(paths("[ref](page.md#section)"), vec!["page.md"]);
+    }
+
+    #[test]
+    fn handles_relative_dot() {
+        assert_eq!(paths("[x](./local.md)"), vec!["./local.md"]);
+    }
+
+    #[test]
+    fn handles_parent_traversal() {
+        assert_eq!(paths("[x](../other/file.md)"), vec!["../other/file.md"]);
+    }
+
+    #[test]
+    fn skips_http_urls() {
+        assert!(paths("[site](https://example.com/page.md)").is_empty());
+        assert!(paths("[site](http://example.com/page.md)").is_empty());
+    }
+
+    #[test]
+    fn extracts_non_markdown_links() {
+        assert_eq!(paths("[img](photo.png) [script](app.ts)"), vec!["photo.png", "app.ts"]);
+    }
+
+    #[test]
+    fn skips_html_tags() {
+        assert!(paths("<a href=\"page.md\">link</a>").is_empty());
+    }
+
+    #[test]
+    fn handles_empty_input() {
+        assert!(paths("").is_empty());
+    }
+
+    #[test]
+    fn handles_no_links() {
+        assert!(paths("Just some plain text without any links.").is_empty());
+    }
+
+    #[test]
+    fn handles_multiple_fragments() {
+        assert_eq!(paths("[x](page.md#one#two)"), vec!["page.md"]);
+    }
+
+    #[test]
+    fn skips_link_spanning_lines() {
+        assert!(paths("[text](broken\nlink.md)").is_empty());
+    }
+
+    #[test]
+    fn handles_adjacent_links() {
+        assert_eq!(paths("[a](a.md)[b](b.md)"), vec!["a.md", "b.md"]);
+    }
+
+    #[test]
+    fn skips_short_paths() {
+        assert!(paths("[x](.md)").is_empty());
+    }
+
+    // -- wiki links --
+
+    #[test]
+    fn extracts_wiki_link() {
+        assert_eq!(paths("See [[guide.md]] for details"), vec!["guide.md"]);
+    }
+
+    #[test]
+    fn extracts_wiki_link_with_alias() {
+        assert_eq!(paths("See [[guide.md|the guide]] for details"), vec!["guide.md"]);
+    }
+
+    #[test]
+    fn extracts_wiki_link_with_fragment() {
+        assert_eq!(paths("See [[guide.md#section]] here"), vec!["guide.md"]);
+    }
+
+    #[test]
+    fn extracts_wiki_link_with_fragment_and_alias() {
+        assert_eq!(paths("See [[guide.md#section|display]] here"), vec!["guide.md"]);
+    }
+
+    #[test]
+    fn extracts_wiki_link_with_path() {
+        assert_eq!(paths("See [[docs/guide.md]] for details"), vec!["docs/guide.md"]);
+    }
+
+    #[test]
+    fn skips_wiki_link_without_extension() {
+        assert!(paths("See [[guide]] here").is_empty());
+    }
+
+    #[test]
+    fn extracts_wiki_link_to_non_md() {
+        assert_eq!(paths("See [[image.png]] here"), vec!["image.png"]);
+    }
+
+    #[test]
+    fn extracts_mixed_links() {
+        assert_eq!(paths("[[wiki.md]] and [standard](standard.md)"), vec!["wiki.md", "standard.md"]);
+    }
+
+    #[test]
+    fn skips_empty_wiki_link() {
+        assert!(paths("See [[]] here").is_empty());
+    }
+
+    #[test]
+    fn skips_wiki_link_spanning_lines() {
+        assert!(paths("See [[broken\nlink]] here").is_empty());
+    }
+
+    #[test]
+    fn extracts_adjacent_wiki_links() {
+        assert_eq!(paths("[[one.md]][[two.md]]"), vec!["one.md", "two.md"]);
+    }
+
+    // -- fragments --
+
+    #[test]
+    fn fragment_from_standard_link() {
+        let p = pairs("[ref](page.md#section)");
+        assert_eq!(p, vec![("page.md".into(), Some("section".into()))]);
+    }
+
+    #[test]
+    fn fragment_from_wiki_link() {
+        let p = pairs("[[guide.md#core-classes]]");
+        assert_eq!(p, vec![("guide.md".into(), Some("core-classes".into()))]);
+    }
+
+    #[test]
+    fn wiki_link_fragment_with_alias() {
+        let p = pairs("[[guide.md#section|display]]");
+        assert_eq!(p, vec![("guide.md".into(), Some("section".into()))]);
+    }
+
+    #[test]
+    fn no_fragment_when_absent() {
+        let p = pairs("[ref](page.md)");
+        assert_eq!(p, vec![("page.md".into(), None)]);
+    }
+
+    #[test]
+    fn empty_fragment_treated_as_none() {
+        let p = pairs("[ref](page.md#)");
+        assert_eq!(p, vec![("page.md".into(), None)]);
+    }
+
+    // -- fences + backtick edge cases --
+
+    #[test]
+    fn fenced_code_block_skipped() {
+        let src = "See [[real.md]]\n\n```\nInside fence: [[fake.md]] and `path.md` (some-repo)\n```\n\nOutside again: [[other.md]]";
+        assert_eq!(paths(src), vec!["real.md", "other.md"]);
+    }
+
+    #[test]
+    fn wiki_link_after_double_backtick_inline_code() {
+        let src = "| Inline code | `` `path.ext` `` (no repo) | see [[TODO.md]] |";
+        assert_eq!(paths(src), vec!["TODO.md"]);
+    }
+
+    // -- headings --
+
+    #[test]
+    fn extracts_simple_heading() {
+        assert_eq!(extract_headings_str("# Hello World").iter().collect::<Vec<_>>(), vec!["hello-world"]);
+    }
+
+    #[test]
+    fn extracts_multiple_level_headings() {
+        let h = extract_headings_str("# First\n## Second\n### Third");
+        let v: Vec<_> = h.iter().cloned().collect();
+        // BTreeSet sorts; we just check membership.
+        assert!(v.contains(&"first".to_string()));
+        assert!(v.contains(&"second".to_string()));
+        assert!(v.contains(&"third".to_string()));
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn heading_with_special_chars() {
+        let h = extract_headings_str("## Core (Classes)");
+        assert!(h.contains("core-classes"));
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn heading_with_formatting() {
+        let h = extract_headings_str("## **Bold** heading");
+        assert!(h.contains("bold-heading"));
+    }
+
+    #[test]
+    fn heading_with_underscore() {
+        let h = extract_headings_str("## hello_world");
+        assert!(h.contains("hello_world"));
+    }
+
+    #[test]
+    fn heading_with_backticks() {
+        let h = extract_headings_str("## `code` stuff");
+        assert!(h.contains("code-stuff"));
+    }
+
+    #[test]
+    fn no_headings_in_plain_text() {
+        assert!(extract_headings_str("Just text\nMore text").is_empty());
+    }
+
+    #[test]
+    fn heading_must_have_space_after_hash() {
+        assert!(extract_headings_str("#NoSpace").is_empty());
+    }
+
+    #[test]
+    fn heading_not_mid_line() {
+        assert!(extract_headings_str("text ## not a heading").is_empty());
+    }
+
+    // -- anchor_id parity with Swift fixture --
+
+    #[test]
+    fn anchor_id_parity_with_swift() {
+        // Captured from Swift binary in tests/fixtures/anchor_id_parity.tsv. Verifies
+        // that grapheme-cluster iteration + Unicode category checks match Swift Character semantics.
+        let cases: &[(&str, &str)] = &[
+            ("Hello World", "hello-world"),
+            ("Core (Classes)", "core-classes"),
+            ("**Bold** heading", "bold-heading"),
+            ("hello_world", "hello_world"),
+            ("한글 제목", "한글-제목"),
+            ("café", "café"), // NFC
+            ("Section 1.0 release", "section-10-release"),
+            ("code-stuff", "code-stuff"),
+            ("Heading with  double  spaces", "heading-with--double--spaces"),
+            ("Heading—em dash", "headingem-dash"),
+            ("PR #123 fix", "pr-123-fix"),
+        ];
+        for (input, expected) in cases {
+            let got = anchor_id(input);
+            assert_eq!(&got, expected, "anchor_id({input:?}) mismatch");
+        }
+    }
+}
