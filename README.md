@@ -148,7 +148,7 @@ Disable with `--no-cache`.
 
 ## Algorithm
 
-1. **Discover** — `walkdir` traversal under the entry root with `filter_entry` pruning excluded subtrees. `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is off by default — see [[TODO.md]].)
+1. **Discover** — `ignore::WalkParallel` traversal under the entry root with per-thread visitor pruning excluded subtrees (work-stealing across `num_cpus` threads). `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is off by default — see [[TODO.md]].)
 2. **Crawl** — BFS from entry points. For each visited file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo and recursive crawl. Two visited sets, both keyed by canonical path.
 3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 

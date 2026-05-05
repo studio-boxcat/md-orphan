@@ -1,16 +1,18 @@
 //! Repo discovery: `index_repo` walks the tree and builds a `RepoIndex`.
 //!
-//! Mirrors `Sources/Lib/Discovery.swift`. Swift used `fts(3)` with `FTS_PHYSICAL | FTS_NOCHDIR
-//! | FTS_NOSTAT`. Rust uses `walkdir` — Round-1 research said walkdir is ~3× faster than fts
-//! single-threaded. `sort_by_file_name()` for deterministic order across machines (Round-2).
-//! `walkdir` always stats; the FTS_NOSTAT optimization is lost but acceptable since walk-cache
-//! amortizes cold-walk cost.
+//! Uses `ignore::WalkParallel` (the same walker behind `fd`/`ripgrep`). Work-stealing
+//! across N threads; we disable ignore's `.gitignore` parsing — we have our own
+//! `ExcludeMatcher` driven by built-in defaults + per-repo `.md-orphan`.
+//!
+//! `standard_filters(false)` and `hidden(false)` keep ignore from second-guessing our
+//! exclude semantics. Dot-dir skipping happens inside our visitor.
 
 use crate::exclude::{ExcludeMatcher, DEFAULT_EXCLUDES};
 use crate::path::real_path;
+use ignore::{WalkBuilder, WalkState};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use walkdir::WalkDir;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIndex {
@@ -24,12 +26,15 @@ pub struct RepoIndex {
     pub exclude: Vec<String>,
 }
 
-/// Walk a repo, applying exclude pruning at the `walkdir::filter_entry` stage so subtrees skip
-/// without iteration. Bare-basename excludes hit the `HashSet::contains` fast path on the dir's
-/// basename — no rel_path allocation. Anchored/glob patterns fall through to the slow path.
+/// Walk a repo, applying exclude pruning at the visitor stage so subtrees skip without iteration.
+/// Bare-basename excludes hit the `HashSet::contains` fast path on the dir's basename — no
+/// rel_path allocation. Anchored/glob patterns fall through to the slow path.
 ///
-/// `include_all_extensions=true` is for the (deferred) non-`.md` style support — populates
-/// `by_name` for every file, not just `.md`. ~30× the work on Unity-sized repos.
+/// Parallelism: `ignore` uses a work-stealing thread pool (default = num_cpus); each thread
+/// has its own `read_dir` loop. Per-thread accumulators merged into shared `Mutex` at end-of-fn.
+///
+/// `include_all_extensions=true` populates `by_name` for every file, not just `.md`. ~30× the
+/// work on Unity-sized repos — leave off unless non-`.md` style support actually fires.
 pub fn index_repo(
     root: &str,
     exclude: &[String],
@@ -46,83 +51,100 @@ pub fn index_repo(
     let matcher = ExcludeMatcher::new(effective.clone());
     let bare_only = matcher.is_bare_only();
     let resolved_str = resolved.to_string_lossy().to_string();
-    // Precompute once — was being formatted per-entry inside the walker (fired ~50k times).
     let root_prefix = format!("{}/", resolved_str);
 
-    let mut md_files: HashSet<String> = HashSet::new();
-    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+    // Shared accumulators. Lock contention is small at our entry counts (~15k post-prune)
+    // because each insert is microseconds and locked sections are tight.
+    let md_files: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    let by_name: Mutex<HashMap<String, Vec<String>>> = Mutex::new(HashMap::new());
 
-    // No `sort_by_file_name`: walkdir's sorter eagerly collects each directory into a Vec
-    // (walkdir/src/lib.rs:913-922), costing ~17% of walk time. Output ordering is handled
-    // by the BFS / sort-at-emit stage downstream, not by walk order.
-    let walker = WalkDir::new(&resolved)
-        .into_iter()
-        .filter_entry(|e| {
-            // Always allow files through; pruning happens for directories only.
-            if !e.file_type().is_dir() {
-                return true;
-            }
-            // The root itself is a dir but has no parent — keep it.
-            if e.depth() == 0 {
-                return true;
-            }
-            let name_cow = e.file_name().to_string_lossy();
-            let name: &str = &name_cow;
-            // Skip dot-dirs at any depth (.git, .build, .venv, .config, ...).
-            if name.starts_with('.') && name.len() > 1 {
-                return false;
-            }
-            // Bare-basename fast path — no rel_path alloc.
-            if matcher.matches_bare(name) {
-                return false;
-            }
-            if bare_only {
-                return true;
-            }
-            // Full rel_path needed for anchored/glob patterns.
-            let abs = e.path().to_string_lossy();
-            if let Some(rel) = abs.strip_prefix(&root_prefix) {
-                if matcher.matches(rel, Some(name)) {
-                    return false;
+    let walker = WalkBuilder::new(&resolved)
+        .standard_filters(false) // ← we have our own ExcludeMatcher; no .gitignore parsing
+        .hidden(false)
+        .follow_links(false) // match Swift-era FTS_PHYSICAL behavior
+        .build_parallel();
+
+    walker.run(|| {
+        // Per-thread closure: capture by reference where possible, clone strings as needed.
+        let matcher = &matcher;
+        let md_files = &md_files;
+        let by_name = &by_name;
+        let root_prefix = root_prefix.as_str();
+
+        Box::new(move |result| {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            let path = entry.path();
+            let depth = entry.depth();
+
+            // Determine type once. ignore::DirEntry::file_type() returns Option<FileType>;
+            // for `.` (root) it's Some(dir). filter_entry equivalent lives inline here.
+            let ft = match entry.file_type() {
+                Some(t) => t,
+                None => return WalkState::Continue,
+            };
+
+            // Directory pruning. Root passes through (depth 0).
+            if ft.is_dir() {
+                if depth == 0 {
+                    return WalkState::Continue;
                 }
+                let name_cow = entry.file_name().to_string_lossy();
+                let name: &str = &name_cow;
+                // Dot-dirs at any depth.
+                if name.starts_with('.') && name.len() > 1 {
+                    return WalkState::Skip;
+                }
+                if matcher.matches_bare(name) {
+                    return WalkState::Skip;
+                }
+                if bare_only {
+                    return WalkState::Continue;
+                }
+                let abs = path.to_string_lossy();
+                if let Some(rel) = abs.strip_prefix(root_prefix) {
+                    if matcher.matches(rel, Some(name)) {
+                        return WalkState::Skip;
+                    }
+                }
+                return WalkState::Continue;
             }
-            true
-        });
 
-    for entry in walker.flatten() {
-        let ft = entry.file_type();
-        if !(ft.is_file() || ft.is_symlink()) {
-            continue;
-        }
-        let name_cow = entry.file_name().to_string_lossy();
-        let name: &str = &name_cow;
-        let is_md = name.len() >= 3 && name.as_bytes().ends_with(b".md");
+            // File / symlink processing. ignore yields entries via DT_LNK/DT_REG (no extra stat).
+            if !(ft.is_file() || ft.is_symlink()) {
+                return WalkState::Continue;
+            }
+            let name_cow = entry.file_name().to_string_lossy();
+            let name: &str = &name_cow;
+            let is_md = name.len() >= 3 && name.as_bytes().ends_with(b".md");
 
-        if !is_md && !include_all_extensions {
-            continue;
-        }
-        let abs = entry.path().to_string_lossy().to_string();
-        let rel = match abs.strip_prefix(&root_prefix) {
-            Some(r) => r.to_string(),
-            None => abs.clone(),
-        };
-        // File-level exclude check (pattern targeting files via globs / plain prefixes).
-        if matcher.matches(&rel, Some(name)) {
-            continue;
-        }
-        by_name
-            .entry(name.to_string())
-            .or_insert_with(Vec::new)
-            .push(abs);
-        if is_md {
-            md_files.insert(rel);
-        }
-    }
+            if !is_md && !include_all_extensions {
+                return WalkState::Continue;
+            }
+            let abs = path.to_string_lossy().to_string();
+            let rel = match abs.strip_prefix(root_prefix) {
+                Some(r) => r.to_string(),
+                None => abs.clone(),
+            };
+            if matcher.matches(&rel, Some(name)) {
+                return WalkState::Continue;
+            }
+            // Mutex-locked inserts. Could go thread-local + merge for hotter workloads;
+            // at our scale (single-digit ms total locked) it's not the bottleneck.
+            by_name.lock().unwrap().entry(name.to_string()).or_default().push(abs);
+            if is_md {
+                md_files.lock().unwrap().insert(rel);
+            }
+            WalkState::Continue
+        })
+    });
 
     RepoIndex {
         root: resolved,
-        md_files,
-        by_name,
+        md_files: md_files.into_inner().unwrap(),
+        by_name: by_name.into_inner().unwrap(),
         exclude: effective,
     }
 }
@@ -156,7 +178,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(&dir.path().join("a.md"), "");
         write(&dir.path().join(".git/HEAD"), "");
-        write(&dir.path().join(".git/foo.md"), ""); // should be pruned
+        write(&dir.path().join(".git/foo.md"), "");
 
         let idx = index_repo(dir.path().to_str().unwrap(), &[], true, false);
         assert!(idx.md_files.contains("a.md"));
@@ -165,7 +187,6 @@ mod tests {
 
     #[test]
     fn applies_default_excludes_at_any_depth() {
-        // Pods/ default should match "proj-ios/Pods/" too (gitignore semantics).
         let dir = TempDir::new().unwrap();
         write(&dir.path().join("README.md"), "");
         write(&dir.path().join("proj-ios/Pods/Firebase/README.md"), "");

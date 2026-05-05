@@ -11,26 +11,32 @@ Wall-clock numbers, where time goes, and what the cache and `--no-default-exclud
 - **Self-check**: this repo, ~6 `.md` files, entry `AGENTS.md`
 - **Unity-scale**: meow-tower repo, ~51k files (Library/Pods/proj-*/Packages excluded by defaults + `.md-orphan`), 116 reachable `.md` files
 
-## Wall clock (Rust binary, post-sort-removal)
+## Wall clock (Rust binary, parallel walker via `ignore::WalkParallel`)
 
 | Scenario | Time | Notes |
 |---|---|---|
-| Self-check (~7 `.md`) | **~3-5 ms** | startup + walk + 7 file reads |
-| Unity-scale, no cache | **~165-200 ms** | best ~164 ms; sys-time variance from APFS FS cache state |
-| Unity-scale, cold cache (write) | **~225 ms** | +60 ms to write cache JSON |
-| Unity-scale, warm cache (read) | **~165 ms** | extraction skipped, cache validation costs ~hash time |
-| Unity-scale, `--no-default-excludes` | **~1.0 s** | walks `Library/`, `Pods/`, etc. — file count goes from 51k to ~190k |
+| Self-check (~7 `.md`) | **~7-8 ms** | startup + thread pool spinup + 7 file reads. Slight regression from ~3 ms (sequential) — acceptable trade for the meow-tower win below. |
+| Unity-scale, no cache | **~105-130 ms** | best ~103 ms; ~500% CPU (5-core parallelism) |
+| Unity-scale, cold cache (write) | **~165 ms** | +60 ms to write cache JSON |
+| Unity-scale, warm cache (read) | **~105-145 ms** | extraction skipped, cache validation costs ~hash time |
+| Unity-scale, `--no-default-excludes` | **~700 ms** | walks `Library/`, `Pods/`, etc. — parallelism saves more on bigger trees |
 
-Comparison points:
+Progression on meow-tower:
 
-| Tool | Time on meow-tower (51k pruned) |
+| Stage | Time | Δ |
+|---|---|---|
+| Swift baseline (pre-Rust) | ~225 ms | — |
+| Rust port (sequential `walkdir`) | ~165 ms | -27% |
+| + drop `sort_by_file_name` + precompute root prefix | ~165 ms (best 164 ms) | wash on wall clock; -30 ms user time |
+| + `ignore::WalkParallel` (5 worker threads) | **~105 ms (best 103 ms)** | -36% |
+
+| Tool | Walk-only time on meow-tower (51k pruned) |
 |---|---|
-| md-orphan (current Rust) | ~165 ms |
-| Swift baseline pre-port | ~225 ms |
-| `fd '' --threads 1` (single-threaded walk only) | ~180-210 ms |
-| `fd ''` (parallel default, walk only) | ~60-70 ms |
+| `fd ''` (parallel default) | ~37 ms |
+| md-orphan walker (~30-50 ms of the 105 ms total) | comparable to fd |
+| `fd '' --threads 1` | ~180-210 ms |
 
-md-orphan ≈ matches `fd --threads 1` on the walk; the gap to `fd` parallel is ~3× and would require parallelizing the walker (see [[TODO.md]]).
+md-orphan's full pipeline is ~105 ms, of which ~30-50 ms is walk and the rest is read + extract + BFS resolve + render. The walker itself now matches `fd` parallel.
 
 ## Where time goes (Unity-scale)
 
@@ -67,14 +73,16 @@ Tracked in [[TODO.md]]: extending to transitive cross-repos via level-synchronou
 
 ## What dominates
 
-1. **walkdir traversal cost** — kernel-side. Default excludes skip the big subtrees (`Library/`, `Pods/`, `node_modules/`, `.build/`, `DerivedData/`); per-repo `.md-orphan` adds project-specific prunes.
-2. **`ExcludeMatcher` bare-basename hash lookup** — O(1) per dir entry. Was the original 153 ms hot path in Swift before precompiled patterns; Rust port keeps the same precompile + `HashSet` pattern.
+1. **`ignore::WalkParallel` traversal** — kernel-side dirent reads parallelized across N worker threads via crossbeam-deque work stealing. Default excludes prune big subtrees (`Library/`, `Pods/`, etc.); per-repo `.md-orphan` adds project-specific prunes.
+2. **`ExcludeMatcher` bare-basename hash lookup** — O(1) per dir entry. `Mutex<HashMap>` insertions for `by_name` and `Mutex<HashSet>` for `md_files` add small contention; not yet measured as a bottleneck.
 
-## What doesn't help
+## What doesn't help further
 
-- **rayon / `tokio` async**: thread spawn overhead dominates for sub-ms per-file work. Reference tools at our scale (mlc, awesome_bot, markdown-link-check) all stay single-threaded.
+- **More threads beyond CPU count**: `ignore` defaults to `num_cpus`; pinning to higher values just thrashes context switches.
+- **Dropping `Mutex` for thread-local accumulators + merge**: the Mutex-locked sections are microseconds; not the bottleneck.
 - **`getattrlistbulk`** (macOS-specific batched stat): known kernel bugs ([Apple Forums](https://developer.apple.com/forums/thread/656787)).
 - **regex**: a manual byte scanner is faster than `regex` for our tight scanner pattern (single-char-class transitions).
+- **Sequential walk for tiny repos**: thread pool spin-up adds ~5 ms vs. sequential, regressing the 6-file self-check from 3 ms → 7 ms. Could add a sequential fast path under a file-count threshold; not worth it given the absolute cost.
 
 ## Reproducing
 
@@ -97,5 +105,5 @@ cargo test --release            # release build
 See [[TODO.md]] for:
 
 - Extending parallel discovery to transitive cross-repos (level-synchronous BFS)
-- Walk-result cache (per-dir mtime validation; could land warm runs at <30 ms)
+- Walk-result cache (per-dir mtime validation; could land warm runs at <30 ms — the only step left to genuinely beat fd)
 - Non-`.md` style support cost analysis (~10× current `index_repo` time)
