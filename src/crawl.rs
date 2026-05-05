@@ -132,7 +132,7 @@ pub fn bfs_crawl_at_root(
 
 struct CrawlState<'c> {
     entry_root: PathBuf,
-    entry_index: RepoIndex,
+    #[allow(dead_code)] entry_index: RepoIndex,
     resolved_repos: HashMap<String, PathBuf>,
     options: CrawlOptions,
     cache: &'c mut ExtractionCache,

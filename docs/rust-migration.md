@@ -1,4 +1,4 @@
-> **Related:** [[architecture.md]], [[performance.md]], [[../README.md]]
+> **Related:** [[architecture.md]], [[performance.md]], [[README.md]]
 
 # Rust migration plan (draft)
 

@@ -1,12 +1,12 @@
-> **Related:** [[README.md]], [[TODO.md]]
+> **Related:** [[README.md]], [[TODO.md]], [[rust-migration.md]]
 
 # md-orphan architecture
 
-How the codebase is organized after the cross-repo / cache / style-rule overhaul. Why each cut sits where it does.
+How the codebase is organized today (Rust, post Swift→Rust migration). Why each cut sits where it does.
 
 ## Background
 
-The tool started as a flat single-file Swift CLI: walk the tree, extract links, BFS, report orphans. Adding cross-repo references, link-style canonicalization, fenced-code skipping, and a per-file extraction cache grew `MdOrphan.swift` to ~600 LOC mixing four concerns. The Phase 1 audit surfaced the obvious smells: a 128-line `bfsCrawl` body, two helpers with 10 and 11 parameters and 5 and 4 inout slots respectively, three `MdLink`/`MdLinkDetail`/`CachedLink` structs that all describe the same thing at different lifecycle points.
+The tool started life as a single-file Swift CLI. It accumulated cross-repo references, link-style canonicalization, fenced-code skipping, a per-file extraction cache, and parallel cross-repo discovery before being ported to Rust for cross-platform reach + a tighter walker. The structural choices below predate the language port — see [[rust-migration.md]] for the migration record.
 
 ## Prior art
 
@@ -22,133 +22,137 @@ Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesom
 ## Module layout
 
 ```
-Sources/Lib/
-  Util.swift       — path helpers + readFile + readBuffer + scanner-internal helpers (~115 LOC)
-  Extract.swift    — Link type + byte-level link/heading/fence scanners            (~290 LOC)
-  Crawl.swift      — bfsCrawl + CrawlState + LinkIssue + CrawlOptions + resolveLink (~365 LOC)
-  Discovery.swift  — fts walk + RepoIndex + indexRepo                              (~110 LOC)
-  Config.swift     — global JSON config + .md-orphan + expandPath                  (~140 LOC)
-  Cache.swift      — ExtractionCache (mtime + size + content-hash keyed)           (~200 LOC)
-Sources/CLI/
-  main.swift       — ArgumentParser command, output rendering, --fix byte rewriter (~250 LOC)
+src/
+  path.rs       — path helpers + read_file + scanner-internal helpers (~150 LOC)
+  exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI (~250 LOC)
+  extract.rs    — Link type + byte-level link/heading/fence scanners (~480 LOC)
+  crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes (~660 LOC)
+  discovery.rs  — index_repo + RepoIndex (walkdir-based) (~150 LOC)
+  config.rs     — global JSON config + .md-orphan + expand_path (~250 LOC)
+  cache.rs      — ExtractionCache (mtime + size + content-hash keyed) (~310 LOC)
+  main.rs       — clap-derive command + output rendering + --fix wiring (~270 LOC)
 ```
 
-6 files, each focused. Total ~1.2k LOC; each file under 400. Library types and public-API surface fit on one screen.
+8 files, each focused. Total ~2.5k LOC; each file under 700. Library types and public-API surface fit on one screen.
 
-Why not subdirectories: peer tools at our scale stay flat. Adding `Lib/extract/` for one file or `Lib/parsing/` for two has the cohesion penalty of misleading concern names.
+Why not subdirectories: peer tools at our scale stay flat. Adding `src/extract/` for one file or `src/parsing/` for two has the cohesion penalty of misleading concern names.
 
-Why `Util.swift` (not `Discovery.swift`) for `realPath`/`dirName`/`baseName`/`isExcluded`: these are stdlib-shaped path utilities used everywhere. Putting them under "Discovery" misleads.
+Why `path.rs` (not `discovery.rs`) for `real_path` / `dir_name` / `base_name`: these are stdlib-shaped path utilities used everywhere. Putting them under "Discovery" misleads.
 
 ## Use cases
 
 Two real consumers, ranked by surface area needed:
 
-1. **CLI (`Sources/CLI/main.swift`)** — drives the whole pipeline. Calls `loadGlobalConfig`, `bfsCrawl(entryPoints:, root:)`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.pathStart..<Link.pathEnd`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
-2. **Tests (`Tests/MdOrphanTests.swift`, 98 tests)** — uses `@testable import` and asserts on the internal extractors (`extractLinks`, `extractHeadings`), the resolver (`resolveLink`), exclusion matching (`isExcluded`), the BFS results, the cache disk round-trip, and a few config helpers (`expandPath`, `loadProjectIgnore`).
+1. **CLI (`src/main.rs`)** — drives the whole pipeline. Calls `load_global_config`, `bfs_crawl_at_root`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.path_start..Link.path_end`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
+2. **Tests (per-module `#[cfg(test)]` blocks, 105 tests)** — assert on the byte scanners (`extract_links`, `extract_headings`), the resolver (`resolve_link`), the matcher (`ExcludeMatcher`), the BFS results, the cache disk round-trip, and config helpers (`expand_path`, `load_project_ignore`).
 
 No other consumers. No plugin story, no library users at the moment.
 
-Public API after demotion (18 symbols): `Link`, `LinkIssue`, `CrawlOptions`, `ExtractionCache`, `ExtractedFile`, `RepoIndex`, `GlobalConfig`, `ConfigError`, `bfsCrawl` (two overloads), `indexRepo`, `resolveLink`, `isExcluded`, `realPath`, `dirName`, `baseName`, `loadGlobalConfig`, `loadProjectIgnore`, `defaultConfigPath`, `defaultExcludes`, `expandPath`, `extractLinks` (two overloads), `extractHeadings` (two overloads), `anchorId`, `readFile`.
+Public API: `Link`, `LinkKind`, `LinkIssue`, `IssueKind`, `StyleScope`, `CrawlOptions`, `ExtractionCache`, `ExtractedFile`, `RepoIndex`, `GlobalConfig`, `ConfigError`, `bfs_crawl`, `bfs_crawl_at_root`, `index_repo`, `resolve_link`, `apply_style_fixes`, `ExcludeMatcher`, `DEFAULT_EXCLUDES`, `real_path`, `dir_name`, `base_name`, `rel_path`, `read_file`, `load_global_config`, `load_project_ignore`, `project_ignore_exists`, `default_config_path`, `expand_path`, `extract_links`, `extract_links_str`, `extract_headings`, `extract_headings_str`, `anchor_id`.
 
 ## Data flow
 
 ```
-                   CLI (main.swift)
+                   CLI (main.rs)
                          │
                          ▼
-              bfsCrawl(entryPaths, root, options, cache)
+              bfs_crawl_at_root(entry_paths, root, options, cache)
                          │
-                         ├─► indexRepo(root)  ──►  RepoIndex { mdFiles, byName }
+                         ├─► index_repo(root)  ──►  RepoIndex { md_files, by_name }
                          │
-                         └─► CrawlState (struct, mutating methods)
-                                ├─► seed(entryPaths)
+                         └─► CrawlState (struct, &mut self methods)
+                                ├─► seed(entry_paths)
+                                │     └─► prefetch_referenced_repos (std::thread::scope, parallel)
                                 ├─► loop: dequeue → cache.read(file) → resolve(link)
                                 │                         │
-                                │                         ├─► Extract.swift scanners
-                                │                         └─► extractLinks([Link]) + extractHeadings
+                                │                         ├─► extract.rs scanners
+                                │                         └─► extract_links([Link]) + extract_headings
                                 │
-                                └─► pruneCache()
+                                └─► prune_cache()
 ```
 
-`Link` flows extractor → cache → resolver → `--fix` byte rewriter as one struct. No conversion at boundaries. `Codable` derives the on-disk cache shape directly — no separate `CachedLink` mirror type.
+`Link` flows extractor → cache → resolver → `--fix` byte rewriter as one struct. No conversion at boundaries. `serde::Serialize`/`Deserialize` derive the on-disk cache shape directly — no separate `CachedLink` mirror type.
 
 ## Crawl state
 
-`bfsCrawl` is a 10-line driver over a `CrawlState` struct. Methods on the struct mutate through `mutating self` rather than passing 5 inout parameters between free functions:
+`bfs_crawl` is a 6-line driver over a `CrawlState` struct. Methods on the struct mutate through `&mut self` rather than passing parameters between free functions:
 
-```swift
-public func bfsCrawl(entryPaths: [String], index: RepoIndex,
-                     options: CrawlOptions, cache: ExtractionCache)
-    -> (reachable: Set<ino_t>, issues: [LinkIssue])
-{
-    var state = CrawlState(entryIndex: index, options: options, cache: cache)
-    state.seed(entryPaths)
-    while let item = state.dequeue() { state.visit(item) }
-    state.pruneCache()
-    return (state.reachable, state.issues)
+```rust
+pub fn bfs_crawl(
+    entry_paths: &[String],
+    index: RepoIndex,
+    options: &CrawlOptions,
+    cache: &mut ExtractionCache,
+) -> (HashSet<String>, Vec<LinkIssue>) {
+    let mut state = CrawlState::new(index, options.clone(), cache);
+    state.seed(entry_paths);
+    while let Some(item) = state.dequeue() { state.visit(&item); }
+    state.prune_cache();
+    (state.reachable, state.issues)
 }
 ```
 
-`CrawlState` is a `struct`, not a `class` — single-threaded, single-owner, no identity, dropped at end of `bfsCrawl`. The Phase 2 review pushed for struct over class to keep the "no shared instance, no statics" property explicit.
+`CrawlState` is a struct (with a `'c` lifetime borrowing `&mut ExtractionCache`) — single-threaded, single-owner, dropped at end of `bfs_crawl`. No statics, no shared instance.
 
-Two visited sets:
-- `reachable: Set<ino_t>` — entry-repo orphan tracking. Inode-keyed for symlink/hardlink dedup.
-- `crossRepoVisited: Set<String>` — canonical paths in cross-repo target trees. They get verified + style-checked but never enter `reachable` (orphan detection is scoped to the entry repo).
+Two visited sets, both keyed by canonical absolute path:
+- `reachable: HashSet<String>` — entry-repo orphan tracking.
+- `cross_repo_visited: HashSet<String>` — cross-repo target trees. They get verified + style-checked but never enter `reachable` (orphan detection is scoped to the entry repo).
+
+Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canonicalize`, so path-based dedup handles them. Hardlinks (rare in doc trees) are processed twice.
 
 ## Persisted state
 
 | File | Path | Shape |
 |---|---|---|
 | Global config | `$XDG_CONFIG_HOME/md-orphan/md-orphan.json` (fallback `~/.config/...`) | `{"repos": {name: path}}` or flat `{name: path}` — both accepted; `$VAR` / `~/` expansion |
-| Per-repo ignore | `<repo>/.md-orphan` | gitignore-style line patterns; `#` comments |
+| Per-repo ignore | `<repo>/.md-orphan` | gitignore-style line patterns; `#` comments. Required at the entry repo root. |
 | Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
 
-**Cache schema** (`schemaVersion: 2`):
+**Cache schema** (`schemaVersion: 3`):
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "displayName": "md-orphan",
   "entries": {
     "README.md": {
       "mtimeNs": 1...,
       "size": 1234,
       "contentHash": 17...,
-      "links": [{"kind": {"wiki": {}}, "target": "TODO.md", "fragment": null, "pathStart": 1995, "pathEnd": 2002}],
+      "links": [{"kind": {"Wiki": null}, "target": "TODO.md", "fragment": null, "pathStart": 1995, "pathEnd": 2002}],
       "headings": ["overview", "usage"]
     }
   }
 }
 ```
 
-Cache validation requires `(mtime_ns, size, content_hash)` to all match. Schema mismatch → silent invalidate (cache is regenerable).
+Cache validation requires `(mtime_ns, size, content_hash)` to all match. Schema mismatch → silent invalidate (cache is regenerable). Schema bumped 2→3 during the Rust port because `serde` derives a different tagged-enum JSON shape than Swift `Codable` — old caches invalidate harmlessly on first run after the upgrade.
 
 ## Pitfalls — avoided in this design
 
-These bugs were paid for during Phase 1; the structure must keep them out:
+These bugs were paid for during the Swift era; the structure must keep them out:
 
-1. **macOS `realpath` symlink mismatch** (`/var/folders` ↔ `/private/var/folders`). All paths handed to `CrawlState` are canonicalized once at `init` via `realPath`. Mixing canonical and raw paths breaks `hasPrefix` checks. Touched once during the cross-repo refactor; preserved by the new design.
-2. **`scanBacktickRef` runaway**. An unclosed `` ` `` followed by no newline before EOF used to advance to `count + 1`, eating the rest of the file (including any later `[[wiki]]` links on the same row). Fix: scanner returns `i + 1` (advance one byte, treat lone backtick as literal) on every no-close branch — never `end + 1`. See `Extract.swift:scanBacktickRef`.
-3. **Global `readBuffer` aliasing**. The buffer at `Util.swift:readBuffer` is process-wide and clobbered by every `readFile` call. Per-file extraction must complete before another `readFile` runs. `ExtractionCache.read` extracts links + headings synchronously inside one `readFile` window; preserve that pattern. Tests using `readFile` are `.serialized` for the same reason.
-4. **Cache content drift across parser changes**. Old cached byte offsets can be valid against an unchanged file but reflect the prior (buggy) parser. `cacheSchemaVersion` MUST bump on any scanner output change, not just on JSON-shape changes. The Phase 3 commit B bump (1 → 2) demonstrated this.
-5. **Cross-repo `..` escape**. A path like `../docs/foo.md` inside `` ` ` (some-repo) `` escapes the target repo root. Resolution falls back to basename lookup in the target repo's `byName`. The escape is reported as a style violation (canonical form = bare basename), not a hard error. See `Crawl.swift:resolveCrossRepo`.
+1. **macOS `canonicalize` symlink mismatch** (`/var/folders` ↔ `/private/var/folders`). All paths handed to `CrawlState` are canonicalized once at construction. Mixing canonical and raw paths breaks `starts_with` checks.
+2. **`scan_backtick_ref` runaway**. An unclosed `` ` `` with no newline before EOF used to advance past end-of-buffer, eating later `[[wiki]]` links on the same row. Fix: scanner returns `i + 1` (advance one byte, treat lone backtick as literal) on every no-close branch — never `end + 1`. See `extract.rs:scan_backtick_ref`.
+3. **Cache content drift across parser changes**. Old cached byte offsets can be valid against an unchanged file but reflect the prior (buggy) parser. `CACHE_SCHEMA_VERSION` MUST bump on any scanner output change, not just on JSON-shape changes.
+4. **Cross-repo `..` escape**. A path like `../docs/foo.md` inside `` ` ` (some-repo) `` escapes the target repo root. Resolution falls back to basename lookup in the target repo's `by_name`. The escape is reported as a style violation (canonical form = bare basename), not a hard error. See `crawl.rs:resolve_cross_repo`.
+5. **`anchor_id` Unicode parity**. Swift `Character.isLetter` iterates grapheme clusters; Rust `char` is a Unicode scalar. Rust port uses `unicode_segmentation::UnicodeSegmentation::graphemes(true)` to match Swift's behavior on decomposed `é`, Korean precomposed/decomposed jamo, ZWJ emoji clusters. Verified against `tests/fixtures/anchor_id_parity.tsv` captured from the Swift binary.
 
 ## Non-goals
 
-- **No `Pipeline` / `Stage` protocol.** We have one of each.
+- **No `Pipeline` / `Stage` trait.** We have one of each.
 - **No `Reporter` trait.** One binary, two output modes (text + `--fix`); no plugin story.
-- **No subdirectory carve-up of `Sources/Lib/`.** Flat at this scale.
-- **No async / parallel work.** Single-threaded fts + read is the right shape; reference tools at our scale also don't parallelize. Re-evaluate if profiling identifies a parallelizable hot path.
-- **No backwards-compat shims.** When `MdLink` / `MdLinkDetail` / `CachedLink` were collapsed into `Link`, the old types were deleted in the same commit; tests adapted atomically.
+- **No subdirectory carve-up of `src/`.** Flat at this scale.
+- **No async work.** Single-threaded walk + read is the right shape; cross-repo discovery uses `std::thread::scope` for the rare 3+-repo prefetch case. Reference tools at our scale also don't go async.
+- **No backwards-compat shims.** When the cache schema bumped 2→3 during the Rust port, old caches invalidated on first run; no Swift-format reader was kept around.
 - **No standard-link style rule.** `[text](path)` is renderer-relative — applying basename canonicalization would silently break GitHub rendering. Wiki and cross-repo backtick refs only.
 
 ## References
 
+- [Rust port migration record](rust-migration.md)
 - [mlc — closest-scale peer](https://github.com/becheran/mlc/tree/master/src)
 - [awesome_bot — flat lib/ at ~1.5k LOC](https://github.com/dkhamsing/awesome_bot/tree/master/lib/awesome_bot)
 - [markdown-link-check — coordination in <300 LOC](https://github.com/tcort/markdown-link-check/blob/master/index.js)
 - [lychee — what we don't need to be (15k LOC, async, multi-format)](https://github.com/lycheeverse/lychee/tree/master/lychee-lib/src)
-- [Swift Forums on TaskGroup overhead at small scales](https://forums.swift.org/t/taskgroup-and-parallelism/51039)
-- [APFS dirent traversal benchmarks (FTS_NOSTAT vs alternatives)](http://blog.tempel.org/2019/04/dir-read-performance.html)
-- [Why we don't use `getattrlistbulk` (Apple Forums)](https://developer.apple.com/forums/thread/656787)
-- [`Swift Regex 28-33× slower than manual scan`](https://forums.swift.org/t/slow-regex-performance/75768)
+- [walkdir — Rust directory walker](https://github.com/BurntSushi/walkdir)
+- [unicode-segmentation — grapheme cluster iteration](https://github.com/unicode-rs/unicode-segmentation)

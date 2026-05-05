@@ -127,7 +127,7 @@ Per-file extraction (links + headings) is cached at `$XDG_CONFIG_HOME/md-orphan/
 
 **Validation**: `(mtime_ns, size, fnv1a64(content))` must all match the on-disk file before a cache entry is reused. Mismatch → re-extract + update.
 
-**Robustness**: a single `cacheSchemaVersion` field invalidates cache on any format or parser change; atomic writes (tmp + rename via Foundation's `Data.write(.atomic)`); load errors silently fall through to fresh extraction; entries for files no longer in the repo are auto-pruned each run.
+**Robustness**: a single `cacheSchemaVersion` field invalidates cache on any format or parser change; atomic writes (tmp + rename via the `tempfile` crate); load errors silently fall through to fresh extraction; entries for files no longer in the repo are auto-pruned each run.
 
 **Concurrency**: last-writer-wins on concurrent invocations. Cache is regenerable, so corruption is non-fatal — a corrupted file is treated as a miss and overwritten on next run.
 
@@ -135,24 +135,25 @@ Disable with `--no-cache`.
 
 ## Structure
 
-- `Sources/Lib/Util.swift` — path helpers (`realPath`, `dirName`, `baseName`, `isExcluded`) + `readFile`
-- `Sources/Lib/Extract.swift` — `Link` type + byte-level link/heading/fence scanners
-- `Sources/Lib/Crawl.swift` — `bfsCrawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolveLink`
-- `Sources/Lib/Discovery.swift` — fts walks: `indexRepo` + `RepoIndex` + `discoverFiles`
-- `Sources/Lib/Config.swift` — global JSON config + per-repo `.md-orphan` parsing
-- `Sources/Lib/Cache.swift` — per-file extraction cache (mtime + size + content-hash keyed)
-- `Sources/CLI/main.swift` — ArgumentParser entry point + output rendering + `--fix`
-- `Tests/` — Swift Testing test suite
-- `dist/` — Pre-built release binary
-- See [[architecture.md]] for module layout + design rationale, and [[performance.md]] for benchmarks
+- `src/path.rs` — path helpers (`real_path`, `dir_name`, `base_name`, `rel_path`) + `read_file`
+- `src/exclude.rs` — `ExcludeMatcher` with bare-basename hash-set fast path + `DEFAULT_EXCLUDES`
+- `src/extract.rs` — `Link` type + byte-level link/heading/fence scanners + grapheme-aware `anchor_id`
+- `src/crawl.rs` — `bfs_crawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolve_link`, `apply_style_fixes`
+- `src/discovery.rs` — `index_repo` + `RepoIndex` (walkdir-based)
+- `src/config.rs` — global JSON config + per-repo `.md-orphan` parsing + `expand_path`
+- `src/cache.rs` — per-file extraction cache (mtime + size + fnv1a64 content-hash keyed)
+- `src/main.rs` — clap-derive CLI entry + output rendering + `--fix` wiring
+- `tests/fixtures/` — anchor-id parity TSV captured during the Swift→Rust port
+- `dist/md-orphan` — pre-built release binary (committed to repo for fast `just install`)
+- See [[architecture.md]] for module layout + design rationale, [[performance.md]] for benchmarks, and [[rust-migration.md]] for the historical Swift→Rust migration record
 
 ## Algorithm
 
-1. **Discover** — fts walk under the entry root. `.md` files keyed by inode for orphan reachability; `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is currently off by default — see [[TODO.md]].)
-2. **Crawl** — BFS from entry points. For each visited file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo and recursive crawl. Two visited sets: inodes (entry repo) and canonical paths (cross-repo).
-3. **Diff** — Files in the entry-repo `.md` set whose inodes are not in `reachable` are orphans.
+1. **Discover** — `walkdir` traversal under the entry root with `filter_entry` pruning excluded subtrees. `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is off by default — see [[TODO.md]].)
+2. **Crawl** — BFS from entry points. For each visited file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo and recursive crawl. Two visited sets, both keyed by canonical path.
+3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 
-Edge cases: missing entry point → exit 1; broken link → exit 1; circular links → visited set; symlinks → `realpath` canonicalization (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union.
+Edge cases: missing entry point → exit 1; broken link → exit 1; circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union.
 
 ## Performance
 

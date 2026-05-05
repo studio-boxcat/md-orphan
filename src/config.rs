@@ -4,7 +4,6 @@
 //! wrapped (`{"repos": {...}}`) and flat (`{name: path}`) JSON shapes for back-compat with
 //! Swift-era configs.
 
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fs;

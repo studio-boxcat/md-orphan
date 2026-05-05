@@ -1,19 +1,18 @@
 default: build
 
-# https://github.com/swiftlang/swift/blob/main/docs/OptimizationTips.rst
-# SwiftPM release already enables -O + WMO; -cross-module-optimization added in Package.swift
+# Cargo release profile: lto=thin + codegen-units=1 + strip (set in Cargo.toml).
 build:
-    swift build -c release
-    cp .build/release/md-orphan dist/md-orphan
+    cargo build --release
+    cp target/release/md-orphan dist/md-orphan
 
 install: build
     ln -sf {{justfile_directory()}}/dist/md-orphan ~/.local/bin/md-orphan
 
 test:
-    swift test
+    cargo test
 
 run *ARGS:
-    swift run -c release md-orphan {{ARGS}}
+    cargo run --release -- {{ARGS}}
 
 clean:
-    swift package clean
+    cargo clean
