@@ -1,4 +1,4 @@
-> **Related:** [[README.md]], [[architecture.md]]
+> **Related:** [[CLAUDE.md]], [[architecture.md]]
 
 # Performance
 
@@ -7,19 +7,19 @@ Wall-clock numbers, where time goes, and what the cache and `--no-default-exclud
 ## Test bench
 
 - macOS arm64 (M-series), APFS local volume, release build (`cargo build --release`)
-- Best-of-3 wall clock; first run of each scenario discarded (FS warmup ~1s extra)
-- **Self-check**: this repo, ~6 `.md` files, entry `AGENTS.md`
+- 5–7 runs each, post-warmup
+- **Self-check**: this repo, ~6 `.md` files, entry `CLAUDE.md`
 - **Unity-scale**: meow-tower repo, ~51k files (Library/Pods/proj-*/Packages excluded by defaults + `.md-orphan`), 116 reachable `.md` files
 
 ## Wall clock (Rust binary, parallel walker via `ignore::WalkParallel`)
 
-| Scenario | Time | Notes |
-|---|---|---|
-| Self-check (~7 `.md`) | **~7-8 ms** | startup + thread pool spinup + 7 file reads. Slight regression from ~3 ms (sequential) — acceptable trade for the meow-tower win below. |
-| Unity-scale, no cache | **~105-130 ms** | best ~103 ms; ~500% CPU (5-core parallelism) |
-| Unity-scale, cold cache (write) | **~165 ms** | +60 ms to write cache JSON |
-| Unity-scale, warm cache (read) | **~105-145 ms** | extraction skipped, cache validation costs ~hash time |
-| Unity-scale, `--no-default-excludes` | **~700 ms** | walks `Library/`, `Pods/`, etc. — parallelism saves more on bigger trees |
+| Scenario | min – median – max | CPU | Notes |
+|---|---|---|---|
+| Self-check (6 `.md`) | **4 – 5 – 6 ms** | ~75% | startup + thread pool spinup dominates |
+| Unity-scale, no cache | **95 – 99 – 103 ms** | ~500% | every run does walk + read + extract |
+| Unity-scale, cold cache (cache wiped, first run) | **91 – 98 – 104 ms** | ~500% | cache write is cheap |
+| Unity-scale, warm cache | **96 – 99 – 106 ms** | ~500% | cache read essentially break-even with extract |
+| Unity-scale, `--no-default-excludes` | ~700 ms | ~500% | walks Library/Pods/etc. — parallelism saves more on bigger trees |
 
 Progression on meow-tower:
 
@@ -28,23 +28,26 @@ Progression on meow-tower:
 | Swift baseline (pre-Rust) | ~225 ms | — |
 | Rust port (sequential `walkdir`) | ~165 ms | -27% |
 | + drop `sort_by_file_name` + precompute root prefix | ~165 ms (best 164 ms) | wash on wall clock; -30 ms user time |
-| + `ignore::WalkParallel` (5 worker threads) | **~105 ms (best 103 ms)** | -36% |
+| + `ignore::WalkParallel` (5 worker threads) | **~99 ms (best 91 ms)** | **-40%** |
 
-| Tool | Walk-only time on meow-tower (51k pruned) |
+**Total Swift→now: 225 ms → 99 ms (-56%).**
+
+| Tool | meow-tower (51k pruned) |
 |---|---|
-| `fd ''` (parallel default) | ~37 ms |
-| md-orphan walker (~30-50 ms of the 105 ms total) | comparable to fd |
-| `fd '' --threads 1` | ~180-210 ms |
+| `fd ''` (parallel, walk only) | 33 – 35 ms |
+| `fd '' --threads 1` (walk only) | 180 – 210 ms |
+| md-orphan full pipeline | 95 – 99 ms |
 
-md-orphan's full pipeline is ~105 ms, of which ~30-50 ms is walk and the rest is read + extract + BFS resolve + render. The walker itself now matches `fd` parallel.
+md-orphan's 99 ms includes: walk (~35 ms, matches `fd` parallel) + read 116 `.md` files + extract links/headings + BFS resolve + style-check + cross-repo crawl into 3 referenced repos + render output. fd just lists files.
 
-## Where time goes (Unity-scale)
+## Where time goes (Unity-scale, ~99 ms total)
 
-- `index_repo` (defaults on, walkdir + ExcludeMatcher fast path) — ~110-130 ms. Dominated by the kernel `getdents` traversal of ~51k entries; Rust's per-entry overhead (no `String(cString:)` allocation, no `String.contains` in the prune hot path) is much lighter than Swift fts was.
-- Read + extract 116 `.md` files — ~3-7 ms. Manual byte scanner; ~0.05 ms/file.
-- BFS resolve + style + output — ~30-50 ms. Path resolution, basename lookups, issue rendering.
+- `index_repo` via `ignore::WalkParallel` — ~35 ms. Bound by kernel `getdents` traversal of ~51k entries, parallelized across 5 worker threads.
+- Read + extract 116 `.md` files — ~5 ms. Manual byte scanner; ~0.04 ms/file.
+- BFS resolve + style check + cross-repo crawl (3 repos) — ~50 ms. Path resolution, basename lookups, issue rendering, transitive cross-repo walks.
+- Output rendering + process exit — ~5-10 ms.
 
-The walk dominates by ~10×. **Reading and extracting markdown is essentially free** at this scale.
+The walk no longer dominates after parallelism. The post-walk pipeline (~60 ms) is now the larger half — **reading and extracting markdown is essentially free**, but BFS + cross-repo crawl is the next thing to look at if we want to squeeze further.
 
 ## Why the cache is break-even here
 
