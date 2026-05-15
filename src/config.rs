@@ -190,6 +190,19 @@ pub fn project_ignore_exists(root: &Path) -> bool {
     root.join(".md-orphan").exists()
 }
 
+/// Walk up from `start`'s parent looking for the nearest ancestor containing `.md-orphan`.
+/// Returns `None` if none found before the filesystem root.
+pub fn find_project_ignore_ancestor(start: &Path) -> Option<PathBuf> {
+    let mut cur = start.parent();
+    while let Some(dir) = cur {
+        if dir.join(".md-orphan").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// Read `<root>/.md-orphan`, return one pattern per line. `#` line-comments + blanks ignored.
 pub fn load_project_ignore(root: &Path) -> std::io::Result<Vec<String>> {
     let path = root.join(".md-orphan");
@@ -262,6 +275,43 @@ mod tests {
         assert!(!project_ignore_exists(dir.path()));
         fs::write(dir.path().join(".md-orphan"), "").unwrap();
         assert!(project_ignore_exists(dir.path()));
+    }
+
+    #[test]
+    fn find_project_ignore_ancestor_walks_strictly_upward() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".md-orphan"), "").unwrap();
+        let nested = root.join("docs").join("specs");
+        fs::create_dir_all(&nested).unwrap();
+
+        // Strict ancestor: parent of `nested` has none, but its parent does.
+        let found = find_project_ignore_ancestor(&nested).unwrap();
+        assert_eq!(fs::canonicalize(&found).unwrap(), fs::canonicalize(root).unwrap());
+
+        // `start` itself is not checked — only ancestors above it.
+        assert!(find_project_ignore_ancestor(root).is_none());
+    }
+
+    #[test]
+    fn find_project_ignore_ancestor_none_when_no_match() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(find_project_ignore_ancestor(&nested).is_none());
+    }
+
+    #[test]
+    fn find_project_ignore_ancestor_returns_nearest() {
+        let dir = TempDir::new().unwrap();
+        let mid = dir.path().join("mid");
+        let leaf = mid.join("leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(dir.path().join(".md-orphan"), "").unwrap();
+        fs::write(mid.join(".md-orphan"), "").unwrap();
+
+        let found = find_project_ignore_ancestor(&leaf).unwrap();
+        assert_eq!(fs::canonicalize(&found).unwrap(), fs::canonicalize(&mid).unwrap());
     }
 
     #[test]

@@ -103,6 +103,8 @@ The crawl visits each cross-repo target file the entry repo *directly* reference
 
 Loaded automatically for the entry repo and every cross-repo target visited during recursion. Cross-repo targets without their own `.md-orphan` fall back to defaults only — no hard-fail on cross-repo absence.
 
+The "root" is the parent directory of the first entry point. When that parent has no `.md-orphan` but a strict ancestor does, the missing-file error reframes as "wrong-scoped entry point — pass an entry point inside `<ancestor>` instead" rather than suggesting you create a phantom mini-root at the subdirectory. Create `.md-orphan` at the subdirectory only when it's genuinely a separate repo with its own scope.
+
 ```
 # Comments and blank lines are ignored.
 Pods/                       # bare basename — matches at ANY depth (proj-ios/Pods/ etc.)

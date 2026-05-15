@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use md_orphan::cache::ExtractionCache;
 use md_orphan::config::{
-    default_config_path, load_global_config, project_ignore_exists,
+    default_config_path, find_project_ignore_ancestor, load_global_config, project_ignore_exists,
 };
 use md_orphan::crawl::{
     apply_style_fixes, bfs_crawl_at_root, CrawlOptions, IssueKind, LinkIssue, StyleScope,
@@ -108,6 +108,20 @@ fn run(cli: Cli) -> Result<bool> {
     let root = dir_name(&resolved_entries[0]).to_string();
     let root_path = std::path::Path::new(&root);
     if !project_ignore_exists(root_path) {
+        if let Some(ancestor) = find_project_ignore_ancestor(root_path) {
+            let ancestor_str = ancestor.to_string_lossy();
+            let example = ["CLAUDE.md", "README.md"]
+                .iter()
+                .find(|name| ancestor.join(name).exists())
+                .map(|name| format!(" (e.g. `md-orphan {ancestor_str}/{name}`)"))
+                .unwrap_or_default();
+            bail!(
+                "{root}/.md-orphan: missing, but an ancestor has one:\n  {ancestor_str}/.md-orphan\n\n\
+md-orphan treats the entry point's parent as the repo root. Your entry point is below the\n\
+configured root — pass an entry point inside `{ancestor_str}` instead{example}.\n\n\
+If `{root}` really is a separate repo with its own scope, create `{root}/.md-orphan` to declare it."
+            );
+        }
         bail!(
             "{root}/.md-orphan: missing\nEvery md-orphan-checked repo needs a `.md-orphan` file at its root listing project-specific\n\
 ignore patterns (gitignore-style line patterns). Built-in defaults handle .git, node_modules,\n\

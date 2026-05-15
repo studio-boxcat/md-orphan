@@ -45,11 +45,11 @@ Why `path.rs` (not `discovery.rs`) for `real_path` / `dir_name` / `base_name`: t
 Two real consumers, ranked by surface area needed:
 
 1. **CLI (`src/main.rs`)** — drives the whole pipeline. Calls `load_global_config`, `bfs_crawl_at_root`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.path_start..Link.path_end`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
-2. **Tests (per-module `#[cfg(test)]` blocks, 105 tests)** — assert on the byte scanners (`extract_links`, `extract_headings`), the resolver (`resolve_link`), the matcher (`ExcludeMatcher`), the BFS results, the cache disk round-trip, and config helpers (`expand_path`, `load_project_ignore`).
+2. **Tests (per-module `#[cfg(test)]` blocks)** — assert on the byte scanners (`extract_links`, `extract_headings`), the resolver (`resolve_link`), the matcher (`ExcludeMatcher`), the BFS results, the cache disk round-trip, and config helpers (`expand_path`, `load_project_ignore`).
 
 No other consumers. No plugin story, no library users at the moment.
 
-Public API: `Link`, `LinkKind`, `LinkIssue`, `IssueKind`, `StyleScope`, `CrawlOptions`, `ExtractionCache`, `ExtractedFile`, `RepoIndex`, `GlobalConfig`, `ConfigError`, `bfs_crawl`, `bfs_crawl_at_root`, `index_repo`, `resolve_link`, `apply_style_fixes`, `ExcludeMatcher`, `DEFAULT_EXCLUDES`, `real_path`, `dir_name`, `base_name`, `rel_path`, `read_file`, `load_global_config`, `load_project_ignore`, `project_ignore_exists`, `default_config_path`, `expand_path`, `extract_links`, `extract_links_str`, `extract_headings`, `extract_headings_str`, `anchor_id`.
+Public API surface is whatever each module exports with `pub` — grep `^pub ` to enumerate. Stable extension points are the types named in the data-flow diagram below; everything else is incidental.
 
 ## Data flow
 
