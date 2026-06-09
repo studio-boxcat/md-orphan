@@ -98,6 +98,8 @@ pub fn extract_links_str(s: &str) -> Vec<Link> {
 // MARK: - Per-syntax scanners
 
 /// Parse `[[page]]`, `[[page|alias]]`, `[[page#section]]` wiki links.
+// Index loops are deliberate: scanners track byte offsets (`path_start`/`path_end`) for `--fix`.
+#[allow(clippy::needless_range_loop)]
 fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
     let start = i + 2;
     let mut end = start;
@@ -138,12 +140,6 @@ fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> 
         }
     }
     let name_len = name_end - start;
-    if name_len == 0 {
-        return end + 2;
-    }
-    if !has_extension(buf, start, name_len) {
-        return end + 2;
-    }
     let fragment = hash_pos.and_then(|h| {
         let frag_len = frag_end - h - 1;
         if frag_len > 0 {
@@ -152,6 +148,23 @@ fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> 
             None
         }
     });
+    // Self-anchor link `[[#section]]` / `[[#section|alias]]`: empty path + fragment. Emitted with
+    // an empty target so the crawler validates the fragment against the *source* file's headings.
+    if name_len == 0 {
+        if let Some(fragment) = fragment {
+            links.push(Link {
+                kind: LinkKind::Wiki,
+                target: String::new(),
+                fragment: Some(fragment),
+                path_start: start,
+                path_end: start,
+            });
+        }
+        return end + 2;
+    }
+    if !has_extension(buf, start, name_len) {
+        return end + 2;
+    }
     links.push(Link {
         kind: LinkKind::Wiki,
         target: decode_utf8(buf, start, name_len),
@@ -216,6 +229,8 @@ fn scan_standard_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>)
 }
 
 /// Parse `` `path` (repo-name) `` cross-repo backtick refs.
+// Index loop is deliberate: tracks byte offsets for `--fix` (see scan_wiki_link).
+#[allow(clippy::needless_range_loop)]
 fn scan_backtick_ref(
     buf: &[u8],
     count: usize,
@@ -601,6 +616,25 @@ mod tests {
     #[test]
     fn skips_wiki_link_spanning_lines() {
         assert!(paths("See [[broken\nlink]] here").is_empty());
+    }
+
+    #[test]
+    fn extracts_self_anchor_wiki_link() {
+        // `[[#section]]` — empty path, fragment present: emitted with empty target.
+        let p = pairs("jump to [[#some-section]] above");
+        assert_eq!(p, vec![(String::new(), Some("some-section".into()))]);
+    }
+
+    #[test]
+    fn extracts_self_anchor_wiki_link_with_alias() {
+        let p = pairs("jump to [[#some-section|go up]] above");
+        assert_eq!(p, vec![(String::new(), Some("some-section".into()))]);
+    }
+
+    #[test]
+    fn skips_empty_self_anchor_wiki_link() {
+        // `[[#]]` — fragment is empty too; nothing to validate.
+        assert!(paths("See [[#]] here").is_empty());
     }
 
     #[test]

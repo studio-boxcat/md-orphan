@@ -65,6 +65,38 @@ impl CrawlOptions {
 
 // MARK: - Resolve helper
 
+/// Fold `.`/`..` segments of an absolute path into a normalized `/`-rooted string.
+///
+/// `strict_root` governs a `..` encountered with no segments left to pop (i.e. trying to climb
+/// above filesystem root):
+/// - `false` (same-repo): silent no-op. Containment is judged only by the caller's final prefix
+///   check, so a path that climbs out and re-enters (`/a/b/../../../a/b/c.md`) still resolves.
+/// - `true` (cross-repo): abort with `escaped = true`. Any path that transiently climbs above the
+///   configured repo root is rejected outright, even if it would re-enter.
+///
+/// Returns the normalized path and whether a strict escape was hit (always `false` when lenient).
+fn fold_segments(combined: &str, strict_root: bool) -> (String, bool) {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut escaped = false;
+    for seg in combined.split('/').filter(|s| !s.is_empty()) {
+        match seg {
+            "." => continue,
+            ".." => {
+                if segments.is_empty() {
+                    if strict_root {
+                        escaped = true;
+                        break;
+                    }
+                } else {
+                    segments.pop();
+                }
+            }
+            _ => segments.push(seg),
+        }
+    }
+    (format!("/{}", segments.join("/")), escaped)
+}
+
 /// Resolve a link relative to its source file. Returns absolute path or None if escapes root.
 pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String> {
     let source_dir = dir_name(source_file);
@@ -73,21 +105,28 @@ pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String>
     } else {
         format!("{}/{}", source_dir, link)
     };
-    let mut segments: Vec<&str> = Vec::new();
-    for seg in combined.split('/').filter(|s| !s.is_empty()) {
-        match seg {
-            "." => continue,
-            ".." => {
-                segments.pop();
-            }
-            _ => segments.push(seg),
-        }
-    }
-    let resolved = format!("/{}", segments.join("/"));
+    let (resolved, _) = fold_segments(&combined, false);
     if resolved == root || resolved.starts_with(&format!("{}/", root)) {
         Some(resolved)
     } else {
         None
+    }
+}
+
+/// `.md` basename fallback: when a path-resolve misses, look the link's basename up in the repo's
+/// name map. `Ok(Some)` = unique match resolved (or `None` if its realpath fails), `Ok(None)` = no
+/// such basename, `Err(n)` = n>1 candidates (ambiguous). Shared by same-repo and cross-repo resolve.
+fn basename_fallback(
+    target: &str,
+    by_name: &HashMap<String, Vec<String>>,
+) -> Result<Option<String>, usize> {
+    let Some(candidates) = by_name.get(base_name(target)) else {
+        return Ok(None);
+    };
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(real_path(&candidates[0]).map(|p| p.to_string_lossy().to_string())),
+        n => Err(n),
     }
 }
 
@@ -134,7 +173,6 @@ pub fn bfs_crawl_at_root(
 
 struct CrawlState<'c> {
     entry_root: PathBuf,
-    #[allow(dead_code)] entry_index: RepoIndex,
     resolved_repos: HashMap<String, PathBuf>,
     options: CrawlOptions,
     cache: &'c mut ExtractionCache,
@@ -158,10 +196,9 @@ impl<'c> CrawlState<'c> {
             resolved_repos.insert(name.clone(), resolved);
         }
         let mut indices = HashMap::new();
-        indices.insert(entry_root.clone(), entry_index.clone());
+        indices.insert(entry_root.clone(), entry_index);
         Self {
             entry_root,
-            entry_index,
             resolved_repos,
             options,
             cache,
@@ -203,11 +240,10 @@ impl<'c> CrawlState<'c> {
                 continue;
             };
             for link in &result.links {
-                if let LinkKind::CrossRepo { repo } = &link.kind {
-                    if let Some(root) = self.resolved_repos.get(repo) {
+                if let LinkKind::CrossRepo { repo } = &link.kind
+                    && let Some(root) = self.resolved_repos.get(repo) {
                         targets.insert(root.clone());
                     }
-                }
             }
         }
         let to_index: Vec<PathBuf> = targets
@@ -334,6 +370,14 @@ impl<'c> CrawlState<'c> {
     }
 
     fn resolve_same_repo(&mut self, link: &Link, source: &BfsQueueItem) {
+        // Self-anchor link `[[#section]]`: empty target means "this same file". Validate the
+        // fragment against the source's own headings; no path to resolve, style-check, or enqueue.
+        if link.target.is_empty() {
+            if let Some(fragment) = &link.fragment {
+                self.validate_fragment(link, &source.path, &source.path, fragment);
+            }
+            return;
+        }
         let current = self.index_for(&source.repo_root).clone();
         let current_root_str = current.root.to_string_lossy().to_string();
         let Some(resolved) = resolve_link(&link.target, &source.path, &current_root_str) else {
@@ -344,21 +388,15 @@ impl<'c> CrawlState<'c> {
 
         // Basename fallback for .md links.
         if canonical.is_none() && is_md {
-            let basename = base_name(&link.target);
-            if let Some(candidates) = current.by_name.get(basename) {
-                match candidates.len() {
-                    1 => {
-                        canonical = real_path(&candidates[0]).map(|p| p.to_string_lossy().to_string());
-                    }
-                    n if n > 1 => {
-                        self.issues.push(LinkIssue {
-                            link: link.target.clone(),
-                            source: source.path.clone(),
-                            kind: IssueKind::Ambiguous(n),
-                        });
-                        return;
-                    }
-                    _ => {}
+            match basename_fallback(&link.target, &current.by_name) {
+                Ok(resolved) => canonical = resolved,
+                Err(n) => {
+                    self.issues.push(LinkIssue {
+                        link: link.target.clone(),
+                        source: source.path.clone(),
+                        kind: IssueKind::Ambiguous(n),
+                    });
+                    return;
                 }
             }
         }
@@ -390,14 +428,7 @@ impl<'c> CrawlState<'c> {
         }
 
         if let Some(fragment) = &link.fragment {
-            let h = self.headings_for(&canonical);
-            if !h.contains(fragment) {
-                self.issues.push(LinkIssue {
-                    link: link.target.clone(),
-                    source: source.path.clone(),
-                    kind: IssueKind::BrokenAnchor(fragment.clone()),
-                });
-            }
+            self.validate_fragment(link, &source.path, &canonical, fragment);
         }
 
         // Enqueue.
@@ -418,22 +449,7 @@ impl<'c> CrawlState<'c> {
         } else {
             format!("{}/{}", repo_root_str, link.target)
         };
-        let mut segments: Vec<&str> = Vec::new();
-        let mut escaped = false;
-        for seg in raw_combined.split('/').filter(|s| !s.is_empty()) {
-            match seg {
-                "." => continue,
-                ".." => {
-                    if segments.is_empty() {
-                        escaped = true;
-                        break;
-                    }
-                    segments.pop();
-                }
-                _ => segments.push(seg),
-            }
-        }
-        let normalized = format!("/{}", segments.join("/"));
+        let (normalized, escaped) = fold_segments(&raw_combined, true);
         let within_root = !escaped
             && (normalized == repo_root_str
                 || normalized.starts_with(&format!("{}/", repo_root_str)));
@@ -447,21 +463,15 @@ impl<'c> CrawlState<'c> {
         let repo_index = self.index_for(&repo_root).clone();
 
         if canonical.is_none() && is_md {
-            let basename = base_name(&link.target);
-            if let Some(candidates) = repo_index.by_name.get(basename) {
-                match candidates.len() {
-                    1 => {
-                        canonical = real_path(&candidates[0]).map(|p| p.to_string_lossy().to_string());
-                    }
-                    n if n > 1 => {
-                        self.issues.push(LinkIssue {
-                            link: link.target.clone(),
-                            source: source.path.clone(),
-                            kind: IssueKind::Ambiguous(n),
-                        });
-                        return;
-                    }
-                    _ => {}
+            match basename_fallback(&link.target, &repo_index.by_name) {
+                Ok(resolved) => canonical = resolved,
+                Err(n) => {
+                    self.issues.push(LinkIssue {
+                        link: link.target.clone(),
+                        source: source.path.clone(),
+                        kind: IssueKind::Ambiguous(n),
+                    });
+                    return;
                 }
             }
         }
@@ -492,14 +502,7 @@ impl<'c> CrawlState<'c> {
         }
 
         if let Some(fragment) = &link.fragment {
-            let h = self.headings_for(&canonical);
-            if !h.contains(fragment) {
-                self.issues.push(LinkIssue {
-                    link: link.target.clone(),
-                    source: source.path.clone(),
-                    kind: IssueKind::BrokenAnchor(fragment.clone()),
-                });
-            }
+            self.validate_fragment(link, &source.path, &canonical, fragment);
         }
 
         let entry_str = self.entry_root.to_string_lossy().to_string();
@@ -511,6 +514,19 @@ impl<'c> CrawlState<'c> {
             repo_root
         };
         self.enqueue_resolved(canonical, owning_root);
+    }
+
+    /// Push a `BrokenAnchor` issue when `fragment` is absent from the target file's headings.
+    /// `canonical` is the file whose headings to check — the resolved target, or the source
+    /// itself for self-anchor links (`[[#section]]`).
+    fn validate_fragment(&mut self, link: &Link, source_path: &str, canonical: &str, fragment: &str) {
+        if !self.headings_for(canonical).contains(fragment) {
+            self.issues.push(LinkIssue {
+                link: link.target.clone(),
+                source: source_path.to_string(),
+                kind: IssueKind::BrokenAnchor(fragment.to_string()),
+            });
+        }
     }
 
     fn emit_style_if_needed(
@@ -616,11 +632,9 @@ pub fn apply_style_fixes(issues: &[LinkIssue]) {
                 path_end,
                 ..
             } = &issue.kind
-            {
-                if path_start <= path_end && *path_end <= bytes.len() {
+                && path_start <= path_end && *path_end <= bytes.len() {
                     bytes.splice(*path_start..*path_end, suggested.as_bytes().iter().copied());
                 }
-            }
         }
         // Atomic write via tempfile in the same dir.
         let path = Path::new(&source);
@@ -643,7 +657,6 @@ pub fn apply_style_fixes(issues: &[LinkIssue]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::LinkKind;
     use std::fs;
     use tempfile::TempDir;
 
@@ -674,6 +687,32 @@ mod tests {
     fn rejects_root_escape() {
         let r = resolve_link("../../../etc/passwd.md", "/repo/docs/index.md", "/repo");
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn fold_segments_lenient_collapses_dot_dot() {
+        assert_eq!(fold_segments("/a/b/../c", false), ("/a/c".into(), false));
+        assert_eq!(fold_segments("/a/./b", false), ("/a/b".into(), false));
+    }
+
+    #[test]
+    fn fold_segments_lenient_absorbs_dot_dot_past_root() {
+        // Climbing above root is a silent no-op; re-entry resolves. (Same-repo containment is
+        // enforced by resolve_link's final prefix check, not here.)
+        assert_eq!(fold_segments("/a/b/../../../a/b/c.md", false), ("/a/b/c.md".into(), false));
+    }
+
+    #[test]
+    fn fold_segments_strict_escapes_on_dot_dot_past_root() {
+        // Cross-repo mode: the same re-entering path is rejected outright as escaped.
+        let (_, escaped) = fold_segments("/a/b/../../../a/b/c.md", true);
+        assert!(escaped);
+    }
+
+    #[test]
+    fn fold_segments_strict_no_escape_within_root() {
+        // `..` that stays within the path never trips the strict escape.
+        assert_eq!(fold_segments("/a/b/c/../d", true), ("/a/b/d".into(), false));
     }
 
     #[test]
@@ -777,6 +816,51 @@ mod tests {
         assert_eq!(anchors.len(), 1);
         if let IssueKind::BrokenAnchor(frag) = &anchors[0].kind {
             assert_eq!(frag, "missing-section");
+        }
+    }
+
+    #[test]
+    fn self_anchor_valid() {
+        // `[[#section]]` pointing at a heading in the same file — no issue.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(
+            &canonical.join("index.md"),
+            "# Intro\n\njump to [[#details]]\n\n## Details\n",
+        );
+        let mut cache = ExtractionCache::for_tests(false);
+        let (_, _, issues) = bfs_crawl_at_root(
+            &[canonical.join("index.md").to_string_lossy().to_string()],
+            canonical.to_str().unwrap(),
+            &CrawlOptions::new(),
+            &mut cache,
+        );
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn self_anchor_broken() {
+        // `[[#nope]]` with no matching heading in the same file → BrokenAnchor.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(
+            &canonical.join("index.md"),
+            "# Intro\n\njump to [[#nope]]\n\n## Details\n",
+        );
+        let mut cache = ExtractionCache::for_tests(false);
+        let (_, _, issues) = bfs_crawl_at_root(
+            &[canonical.join("index.md").to_string_lossy().to_string()],
+            canonical.to_str().unwrap(),
+            &CrawlOptions::new(),
+            &mut cache,
+        );
+        let anchors: Vec<_> = issues
+            .iter()
+            .filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_)))
+            .collect();
+        assert_eq!(anchors.len(), 1, "expected 1 BrokenAnchor, got: {:?}", issues);
+        if let IssueKind::BrokenAnchor(frag) = &anchors[0].kind {
+            assert_eq!(frag, "nope");
         }
     }
 

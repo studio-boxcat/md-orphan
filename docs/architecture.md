@@ -23,18 +23,18 @@ Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesom
 
 ```
 src/
-  path.rs       — path helpers + read_file + scanner-internal helpers (~165 LOC)
-  exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI (~280 LOC)
-  extract.rs    — Link type + byte-level link/heading/fence scanners (~640 LOC)
-  crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes (~870 LOC)
-  discovery.rs  — index_repo + RepoIndex (`ignore::WalkParallel`-based, parallel) (~290 LOC)
-  config.rs     — global JSON config + .md-orphan + expand_path (~285 LOC)
-  cache.rs      — ExtractionCache (mtime + size + content-hash keyed) (~395 LOC)
-  walk_cache.rs — WalkCache: persisted RepoIndex, per-dir-mtime validated (~235 LOC)
-  main.rs       — clap-derive command + output rendering + --fix wiring (~310 LOC)
+  path.rs       — path helpers + read_file + scanner-internal helpers
+  exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI
+  extract.rs    — Link type + byte-level link/heading/fence scanners
+  crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes
+  discovery.rs  — index_repo + RepoIndex (`ignore::WalkParallel`-based, parallel)
+  config.rs     — global JSON config + .md-orphan + expand_path
+  cache.rs      — ExtractionCache (mtime + size + content-hash keyed)
+  walk_cache.rs — WalkCache: persisted RepoIndex, per-dir-mtime validated
+  main.rs       — clap-derive command + output rendering + --fix wiring
 ```
 
-9 files, each focused. Total ~3.5k LOC; `crawl.rs` is the heaviest at ~870 LOC (BFS + resolver + style-fix rewriter + cross-repo crawl). Library types and public-API surface fit on one screen.
+Each file stays focused on one concern; `crawl.rs` is the heaviest (BFS + resolver + style-fix rewriter + cross-repo crawl). Library types and public-API surface fit on one screen.
 
 Why not subdirectories: peer tools at our scale stay flat. Adding `src/extract/` for one file or `src/parsing/` for two has the cohesion penalty of misleading concern names.
 

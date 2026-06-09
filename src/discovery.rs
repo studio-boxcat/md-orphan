@@ -58,11 +58,10 @@ pub fn index_repo(
     } else {
         None
     };
-    if let Some(key) = flags_key {
-        if let Some(cached) = try_load_walk_cache(&resolved, key) {
+    if let Some(key) = flags_key
+        && let Some(cached) = try_load_walk_cache(&resolved, key) {
             return cached;
         }
-    }
 
     let matcher = ExcludeMatcher::new(effective.clone());
     let bare_only = matcher.is_bare_only();

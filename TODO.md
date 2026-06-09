@@ -2,9 +2,6 @@
 
 ## Deferred follow-ups
 
-### ~~Cross-repo parser: false-positive on inline-code annotations~~ — shipped
-`extract_links` now takes the configured repo set; `scan_backtick_ref` only emits `LinkKind::CrossRepo` when the `(name)` matches. Non-matching annotations (`(Runtime)`, `(10)`, `(PlayerPrefs-backed)`, …) are treated as inline code. Cache schema bumped 3→4 with a `repo_set_hash` field so cached links from a different repo config invalidate atomically. Verified: meow-tower run dropped 22 false positives → 0; 5 real broken cross-repo links remain (target files genuinely missing). Tradeoff accepted: typos to actually-configured repo names that no longer match anything become silent — but typos to *unknown* names always were silent under the old "unknown repo" output and the user surfaces real errors via target-file resolution.
-
 ### Inline-code style check
 Detect `` `path.ext` `` (no `(repo)` suffix) inline code spans and apply the same canonical-form rule as wiki links. **FP guards required**:
 - Skip if backtick span contains shell metachars (`*`, `?`, `$`, `|`, `<`, `>`)
@@ -12,30 +9,27 @@ Detect `` `path.ext` `` (no `(repo)` suffix) inline code spans and apply the sam
 - Skip if no extension AND no `/`
 - Resolve target via repo basename map; only flag when there's a real file match
 
-The fenced-code skipper is already in place, so this can be added to `scanBacktickRef` without parser-level changes.
+The fenced-code skipper is already in place, so this can be added to `scan_backtick_ref` without parser-level changes.
 
 ### Non-`.md` style support
-`indexRepo` only puts `.md` files into `byName` by default — populating it for all extensions in a Unity-sized repo (~100k files) costs ~800ms vs ~30ms. Wiki/cross-repo style for `.cs`, `.swift`, etc. currently goes unchecked.
+`index_repo` only puts `.md` files into `by_name` by default — populating it for all extensions in a Unity-sized repo (~100k files) costs ~800ms vs ~30ms. Wiki/cross-repo style for `.cs`, `.swift`, etc. currently goes unchecked.
 
-Hooks already in place: `indexRepo(includeAllExtensions: true)` produces a complete map. To wire up:
-1. Plumb a CrawlOptions flag through to `indexRepo` per repo
+Hooks already in place: the `include_all_extensions` param on `index_repo` (`discovery.rs`) produces a complete map when set `true` (currently always `false`). To wire up:
+1. Plumb a CrawlOptions flag through to `index_repo` per repo
 2. Decide on user-facing surface: a global `--all-extensions-style` flag, or auto-detect by file extension when a non-`.md` style violation might apply
 3. Document the perf trade-off
 
 ### Possible: extend parallel discovery to transitive cross-repos
 The current prefetch only catches first-level cross-repo refs in the seeded entry files. Cross-repo targets discovered deeper (e.g. meow-tower's `docs/specs/*` referencing `meow-game-server`) fall back to lazy serial walks. Could switch BFS to level-synchronous and parallel-batch all cross-repo refs at each level boundary. Win on meow-tower-like setups: ~100-200 ms (sum of ~3 transitive cross-repo walks → max). Trade-off: FIFO crawl order becomes level-order. Defer until profiling shows the lazy serial fallback dominating.
 
-### ~~Possible: directory-level mtime cache~~ — shipped
-Implemented as the walk-result cache in `src/walk_cache.rs`. Persists `RepoIndex` keyed by canonical root + flags hash, validated by per-dir mtime stat. APFS dir mtime bumps on entry add/remove/rename (not file content edits — those are handled by the per-file extraction cache). Warm runs on meow-tower drop from ~99 ms → ~40 ms. See [[performance.md]] for measurements.
-
 ### Concurrent invocation safety
 Cache writes are last-writer-wins. If users start running two `md-orphan` invocations against the same repo simultaneously (e.g. editor save hooks + lefthook), consider `flock(2)` on the cache file. So far accepted as last-writer-wins because cache is regenerable.
 
 ### XDG nit
-`expandPath` understands `$VAR` and leading `~/`. It does not currently expand `~user/` (other-user homes). Nobody asked, but worth mentioning.
+`expand_path` understands `$VAR` and leading `~/`. It does not currently expand `~user/` (other-user homes). Nobody asked, but worth mentioning.
 
 ### Multiple entry points spanning sibling dirs
-`main.swift:67` does `let root = dirName(resolvedEntries[0])` — if the user passes `a/index.md b/index.md` where `a/` and `b/` are siblings, the second entry is treated as living under `a/`'s root (broken-link-prone). Either (a) reject multi-entry across sibling dirs, or (b) compute a common ancestor. Pre-existing edge case; not a regression.
+`main.rs` does `let root = dir_name(&resolved_entries[0])` — if the user passes `a/index.md b/index.md` where `a/` and `b/` are siblings, the second entry is treated as living under `a/`'s root (broken-link-prone). Either (a) reject multi-entry across sibling dirs, or (b) compute a common ancestor. Pre-existing edge case; not a regression.
 
 ### Walk-cache: XDG inside indexed root
 If `XDG_CONFIG_HOME` resolves under the entry repo (unusual — e.g. running md-orphan over `$HOME` with default `~/.config`), saves bump dir mtimes that the walk recorded, causing guaranteed misses on the next run. The dot-dir prune handles `~/.config`, but a custom non-default XDG inside the tree would force cold-every-run. Either: refuse to persist when `walk_cache_directory()` is under `canonical_root`, or document the constraint. Low priority; affects only users with non-standard XDG layouts.

@@ -158,11 +158,10 @@ no extras."
                 if reachable.contains(&abs) {
                     return false;
                 }
-                if let Some(canonical) = real_path(&abs) {
-                    if reachable.contains(&canonical.to_string_lossy().to_string()) {
+                if let Some(canonical) = real_path(&abs)
+                    && reachable.contains(&canonical.to_string_lossy().to_string()) {
                         return false;
                     }
-                }
                 true
             })
             .cloned()

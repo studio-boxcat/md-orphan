@@ -135,13 +135,9 @@ mod tests {
     }
 
     #[test]
-    fn has_extension_dot_in_dir() {
-        // ".md" alone has dot at start but len=3, no chars after dot before /
-        // Actually our check finds dot at i=0 with chars before it... let's test the real
-        // semantic: "x/.md" has dot inside — should NOT match because the . is preceded by /.
-        let s = b"x/.md";
-        // Scanning from end: 'd', 'm', '.'. At '.' i==2, base[2-1]='/' wait... let's just
-        // test whatever Swift did. Swift returned false for ".md" in tests.
+    fn has_extension_leading_dot_not_an_extension() {
+        // A dot at the very start of the segment (`.md`) isn't an extension — there's no
+        // basename char before it. The scan stops at `from` without inspecting position 0.
         assert!(!has_extension(b".md", 0, 3));
     }
 

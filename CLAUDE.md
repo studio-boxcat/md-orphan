@@ -47,7 +47,7 @@ The tool recognizes four link forms in markdown. Style violations are flagged wh
 
 | Form | Example | Style-checked? |
 |---|---|---|
-| Wiki | `[[guide.md]]`, `[[guide.md#sec\|alias]]` | yes (any extension) |
+| Wiki | `[[guide.md]]`, `[[guide.md#sec\|alias]]`, `[[#section]]` | yes (any extension) |
 | Standard md link | `[text](path.md)` | broken/ambiguous/anchor only — no style rewrite |
 | Cross-repo backtick | `` `bar.md` (meow-toolbox) ``, `` `bar.md#sec` (repo) `` | yes |
 | Inline code | `` `path.ext` `` (no repo suffix) | deferred — see [[TODO.md]] |
@@ -55,6 +55,8 @@ The tool recognizes four link forms in markdown. Style violations are flagged wh
 Standard md links (`[text](path)`) get broken-link / ambiguity / anchor checks, but are **not** rewritten — most renderers (GitHub, etc.) interpret them as filesystem-relative, so basename-magic would silently break them.
 
 **Cross-repo annotation filter:** the `` `path.ext` (name) `` syntax is only treated as a cross-repo ref when `name` matches a configured repo. Patterns like `` `view.name` (GridView) ``, `` `Unity.Analytics` (Runtime) ``, `` `UISortingOrder.Activity` (10) `` are silently treated as inline-code annotations. Trade-off: typos to a known-repo name are caught at file-resolution (`CrossRepoBroken`); typos to a wrong-repo name are silent.
+
+**Self-anchor links:** a wiki link with an empty path and a fragment (`[[#section]]`, `[[#section|alias]]`) targets the *current* file. The fragment is validated against the source file's own headings (broken → `BrokenAnchor`); there's no path to resolve, style-check, or rewrite. The standard-link equivalent `[text](#section)` is **not** checked — it has no extension, so it's dropped at the parser like any other extensionless link.
 
 Fenced code blocks (` ``` `) are skipped during scanning — content inside fences is never parsed as a link or cross-repo ref.
 

@@ -117,11 +117,10 @@ impl ExcludeMatcher {
     /// Full rel_path check — used after `matches_bare` returns false, or when the caller already
     /// has rel_path in hand (file-level checks).
     pub fn matches(&self, rel_path: &str, basename: Option<&str>) -> bool {
-        if let Some(b) = basename {
-            if self.bare_basenames.contains(b) {
+        if let Some(b) = basename
+            && self.bare_basenames.contains(b) {
                 return true;
             }
-        }
         if !self.bare_basenames.is_empty() {
             // Fall back to scanning segments — needed when caller can't isolate basename.
             for seg in rel_path.split('/').filter(|s| !s.is_empty()) {

@@ -216,7 +216,7 @@ impl ExtractionCache {
         };
         let mtime_ns = match meta.modified().and_then(|t| {
             t.duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
         }) {
             Ok(d) => d.as_nanos() as i64,
             Err(_) => 0,
@@ -225,8 +225,8 @@ impl ExtractionCache {
         let hash = fnv1a64(&buf);
 
         let cache = self.ensure_loaded(repo_root);
-        if let Some(entry) = cache.entries.get(&rel_key) {
-            if entry.mtime_ns == mtime_ns
+        if let Some(entry) = cache.entries.get(&rel_key)
+            && entry.mtime_ns == mtime_ns
                 && entry.size == size
                 && entry.content_hash == hash
             {
@@ -236,7 +236,6 @@ impl ExtractionCache {
                     headings,
                 });
             }
-        }
 
         let result = extract_fresh(&buf, &self.repos);
         let mut headings_vec: Vec<String> = result.headings.iter().cloned().collect();
