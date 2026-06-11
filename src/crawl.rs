@@ -995,6 +995,26 @@ mod tests {
     }
 
     #[test]
+    fn inline_raw_text_anchor_accepted_and_broken_detected() {
+        // Raw heading text in an inline fragment gets the same leniency as wiki links;
+        // a non-matching one is a BrokenAnchor.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(
+            &canonical.join("index.md"),
+            "ok `other.md#Existing Section` bad `other.md#No Such Heading`",
+        );
+        write(&canonical.join("other.md"), "# Existing Section");
+        let (_, issues) = crawl(&canonical, "index.md");
+        assert_eq!(issues.len(), 1, "expected 1 BrokenAnchor, got: {:?}", issues);
+        if let IssueKind::BrokenAnchor(frag) = &issues[0].kind {
+            assert_eq!(frag, "No Such Heading");
+        } else {
+            panic!("expected BrokenAnchor, got: {:?}", issues[0]);
+        }
+    }
+
+    #[test]
     fn inline_noncanonical_path_flagged_and_fixed() {
         // `docs/guide.md` with a unique basename → canonical form is `guide.md`.
         let dir = TempDir::new().unwrap();

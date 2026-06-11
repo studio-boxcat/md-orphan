@@ -59,7 +59,7 @@ Standard md links (`[text](path)`) get broken-link / ambiguity / anchor checks, 
 
 **Inline code spans:** a plain `` `path.ext` `` span is treated as a same-repo reference *only when it resolves to a real file* — no match (or an ambiguous basename) means it's prose, never an error. Parser-level guards drop commands (`git status`), globs (`*.md`), placeholders (`services/<name>.md`), env refs, and extension-less names before resolution. A real match gets the style check (canonical = bare basename / root-relative, same as wiki), anchor validation on `#fragments`, and counts toward reachability.
 
-**Anchor fragments:** wiki and cross-repo fragments accept either the kebab-case slug (`#content-type`) or the raw heading text (`#Content Type` — Obsidian convention); raw text is slugified before lookup. Standard md link fragments must be the exact slug — renderers resolve them as real URL fragments, where raw text 404s.
+**Anchor fragments:** wiki, cross-repo, and inline-code fragments accept either the kebab-case slug (`#content-type`) or the raw heading text (`#Content Type` — Obsidian convention); raw text is slugified before lookup. Standard md link fragments must be the exact slug — renderers resolve them as real URL fragments, where raw text 404s.
 
 **Self-anchor links:** a wiki link with an empty path and a fragment (`[[#section]]`, `[[#section|alias]]`) targets the *current* file. The fragment is validated against the source file's own headings (broken → `BrokenAnchor`); there's no path to resolve, style-check, or rewrite. The standard-link equivalent `[text](#section)` is **not** checked — it has no extension, so it's dropped at the parser like any other extensionless link.
 

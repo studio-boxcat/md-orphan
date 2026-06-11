@@ -320,7 +320,12 @@ fn emit_inline_if_pathlike(buf: &[u8], path_start: usize, end: usize, links: &mu
     let mut hash_pos: Option<usize> = None;
     for j in path_start..end {
         match buf[j] {
-            b'#' if hash_pos.is_none() => hash_pos = Some(j),
+            // Guards apply to the path part only — fragment bytes are heading text
+            // (raw form may contain spaces), validated later at the anchor check.
+            b'#' => {
+                hash_pos = Some(j);
+                break;
+            }
             b' ' | b'\t' | b'*' | b'?' | b'$' | b'|' | b'<' | b'>' | b'{' | b'}' | b'"'
             | b'\'' | b'\\' | b'=' => return,
             _ => {}
@@ -518,6 +523,23 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target, "docs/foo.md");
         assert_eq!(links[0].fragment.as_deref(), Some("sec"));
+    }
+
+    #[test]
+    fn inline_raw_text_fragment_with_spaces() {
+        // Guards stop at `#` — raw heading text in the fragment is legal.
+        let links = cross_repo_links("see `guide.md#Some Section`", &[]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].kind, LinkKind::Inline);
+        assert_eq!(links[0].target, "guide.md");
+        assert_eq!(links[0].fragment.as_deref(), Some("Some Section"));
+    }
+
+    #[test]
+    fn inline_path_part_guards_still_apply_before_fragment() {
+        // Metachars/whitespace in the PATH part still reject the span.
+        assert!(cross_repo_links("`gui de.md#x`", &[]).is_empty());
+        assert!(cross_repo_links("`*.md#x`", &[]).is_empty());
     }
 
     #[test]

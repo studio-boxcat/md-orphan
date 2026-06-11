@@ -133,6 +133,7 @@ Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache vali
 - 2→3 during the Rust port (serde tagged-enum shape diverged from Swift Codable)
 - 3→4 added `repo_set_hash` to track repo-set changes
 - 4→5 scanner emits `LinkKind::Inline` for plain backtick spans (v4 entries lack them)
+- 5→6 inline-span guards stop at `#` — raw-text fragments with spaces now emitted
 
 **Walk-cache schema** (`WALK_CACHE_SCHEMA_VERSION: 1`, defined at `walk_cache.rs`):
 

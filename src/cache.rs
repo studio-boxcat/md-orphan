@@ -18,7 +18,8 @@ use std::time::SystemTime;
 /// 4: added `repo_set_hash` so cross-repo backtick refs are filtered against the active
 ///    repo set; cached `LinkKind::CrossRepo` entries from v3 may have ghost repos.
 /// 5: scanner emits `LinkKind::Inline` for plain backtick spans; v4 entries lack them.
-pub const CACHE_SCHEMA_VERSION: u32 = 5;
+/// 6: inline-span guards stop at `#` — raw-text fragments with spaces now emitted.
+pub const CACHE_SCHEMA_VERSION: u32 = 6;
 
 /// One cache file per repo at `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json`.
 #[derive(Debug, Serialize, Deserialize)]
