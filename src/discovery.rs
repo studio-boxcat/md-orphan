@@ -36,7 +36,7 @@ pub struct RepoIndex {
 /// has its own `read_dir` loop. Per-thread accumulators merged into shared `Mutex` at end-of-fn.
 ///
 /// `include_all_extensions=true` populates `by_name` for every file, not just `.md`. ~30× the
-/// work on Unity-sized repos — leave off unless non-`.md` style support actually fires.
+/// work on Unity-sized repos — off by default; CLI `--all-extensions` turns it on.
 pub fn index_repo(
     root: &str,
     exclude: &[String],

@@ -47,6 +47,11 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
+    /// Index every file extension so non-.md refs ([[foo.cs]], `src/foo.cs`) get style and
+    /// basename resolution (~30x walk cost on large repos)
+    #[arg(long)]
+    all_extensions: bool,
+
     /// Print md-orphan's own CLAUDE.md (usage guide for this tool)
     #[arg(long)]
     orient: bool,
@@ -136,6 +141,7 @@ no extras."
         use_default_excludes: !cli.no_default_excludes,
         extra_excludes: exclude_patterns,
         use_walk_cache: !cli.no_cache,
+        include_all_extensions: cli.all_extensions,
     };
     let mut cache = ExtractionCache::new(
         !cli.no_cache,

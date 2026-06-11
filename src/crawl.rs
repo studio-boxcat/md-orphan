@@ -58,6 +58,9 @@ pub struct CrawlOptions {
     pub extra_excludes: Vec<String>,
     /// See [[walk_cache.rs]]. Toggled with the per-file cache by `--no-cache`.
     pub use_walk_cache: bool,
+    /// Index every extension into `by_name` so non-`.md` wiki/inline refs get style and
+    /// basename resolution. ~30× walk cost on Unity-scale repos — CLI `--all-extensions`.
+    pub include_all_extensions: bool,
 }
 
 impl CrawlOptions {
@@ -69,6 +72,7 @@ impl CrawlOptions {
             use_default_excludes: true,
             extra_excludes: Vec::new(),
             use_walk_cache: true,
+            include_all_extensions: false,
         }
     }
 }
@@ -176,7 +180,13 @@ pub fn bfs_crawl_at_root(
     let project_ignore = load_project_ignore(Path::new(root)).unwrap_or_default();
     let mut exclude = options.extra_excludes.clone();
     exclude.extend(project_ignore);
-    let idx = index_repo(root, &exclude, options.use_default_excludes, false, options.use_walk_cache);
+    let idx = index_repo(
+        root,
+        &exclude,
+        options.use_default_excludes,
+        options.include_all_extensions,
+        options.use_walk_cache,
+    );
     let (reachable, issues) = bfs_crawl(entry_paths, idx.clone(), options, cache);
     (idx, reachable, issues)
 }
@@ -273,6 +283,7 @@ impl<'c> CrawlState<'c> {
         let extra_excludes = self.options.extra_excludes.clone();
         let use_defaults = self.options.use_default_excludes;
         let use_walk_cache = self.options.use_walk_cache;
+        let all_ext = self.options.include_all_extensions;
         std::thread::scope(|s| {
             for root in &to_index {
                 let prefetched = &prefetched;
@@ -281,7 +292,7 @@ impl<'c> CrawlState<'c> {
                     let project_ignore = load_project_ignore(root.as_ref()).unwrap_or_default();
                     let mut excl = extra_excludes;
                     excl.extend(project_ignore);
-                    let idx = index_repo(root.as_str(), &excl, use_defaults, false, use_walk_cache);
+                    let idx = index_repo(root.as_str(), &excl, use_defaults, all_ext, use_walk_cache);
                     prefetched.lock().unwrap().insert(root.clone(), idx);
                 });
             }
@@ -342,7 +353,7 @@ impl<'c> CrawlState<'c> {
                 canonical_root.as_str(),
                 &excl,
                 self.options.use_default_excludes,
-                false,
+                self.options.include_all_extensions,
                 self.options.use_walk_cache,
             );
             self.indices.insert(canonical_root.clone(), idx);
@@ -449,8 +460,8 @@ impl<'c> CrawlState<'c> {
         let is_md = link.target.ends_with(".md");
         let mut canonical = canonicalize_str(&resolved);
 
-        // Basename fallback for .md links.
-        if canonical.is_none() && is_md {
+        // Basename fallback for .md links — and for any extension when by_name indexes all.
+        if canonical.is_none() && (is_md || self.options.include_all_extensions) {
             match basename_fallback(&link.target, &current.by_name) {
                 Ok(resolved) => canonical = resolved,
                 Err(n) => {
@@ -1006,6 +1017,63 @@ mod tests {
         assert_eq!(rewritten, "see `guide.md` here");
     }
 
+    /// Crawl with `include_all_extensions` on (and the extraction cache off).
+    fn crawl_all_ext(root: &Path, entry: &str) -> (HashSet<CanonicalPath>, Vec<LinkIssue>) {
+        let opts = CrawlOptions {
+            use_walk_cache: false,
+            include_all_extensions: true,
+            ..CrawlOptions::new()
+        };
+        let mut cache = ExtractionCache::for_tests(false);
+        let (_, reachable, issues) = bfs_crawl_at_root(
+            &[root.join(entry).to_string_lossy().to_string()],
+            root.to_str().unwrap(),
+            &opts,
+            &mut cache,
+        );
+        (reachable, issues)
+    }
+
+    #[test]
+    fn non_md_wiki_link_broken_without_all_extensions() {
+        // by_name is .md-only by default, so [[foo.cs]] from another dir can't resolve.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("docs/index.md"), "see [[foo.cs]]");
+        write(&canonical.join("src/foo.cs"), "");
+        let (_, issues) = crawl(&canonical, "docs/index.md");
+        assert_eq!(issues.len(), 1, "expected Broken, got: {:?}", issues);
+        assert!(matches!(issues[0].kind, IssueKind::Broken));
+    }
+
+    #[test]
+    fn non_md_wiki_link_resolves_with_all_extensions() {
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("docs/index.md"), "see [[foo.cs]]");
+        write(&canonical.join("src/foo.cs"), "");
+        let (_, issues) = crawl_all_ext(&canonical, "docs/index.md");
+        assert!(issues.is_empty(), "expected clean resolve, got: {:?}", issues);
+    }
+
+    #[test]
+    fn non_md_inline_style_flagged_with_all_extensions() {
+        // `src/foo.cs` inline with a unique basename → canonical form is `foo.cs`.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "see `src/foo.cs`");
+        write(&canonical.join("src/foo.cs"), "");
+        let (_, issues) = crawl_all_ext(&canonical, "index.md");
+        let style: Vec<&LinkIssue> = issues
+            .iter()
+            .filter(|i| matches!(i.kind, IssueKind::Style { .. }))
+            .collect();
+        assert_eq!(style.len(), 1, "expected 1 Style, got: {:?}", issues);
+        if let IssueKind::Style { suggested, .. } = &style[0].kind {
+            assert_eq!(suggested, "foo.cs");
+        }
+    }
+
     #[test]
     fn wiki_style_relative_path_flagged() {
         let dir = TempDir::new().unwrap();
@@ -1051,9 +1119,8 @@ mod tests {
         repos.insert("known-repo".to_string(), target.to_string_lossy().to_string());
         let opts = CrawlOptions {
             repos,
-            use_default_excludes: true,
-            extra_excludes: Vec::new(),
             use_walk_cache: false,
+            ..CrawlOptions::new()
         };
         let mut cache =
             ExtractionCache::new(false, opts.repos.keys().cloned().collect());
@@ -1087,9 +1154,8 @@ mod tests {
                 "target-repo".to_string(),
                 target.to_string_lossy().to_string(),
             )]),
-            use_default_excludes: true,
-            extra_excludes: Vec::new(),
             use_walk_cache: false,
+            ..CrawlOptions::new()
         };
         let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
         let (_, _, issues) = bfs_crawl_at_root(
@@ -1120,9 +1186,8 @@ mod tests {
                 "target-repo".to_string(),
                 target.to_string_lossy().to_string(),
             )]),
-            use_default_excludes: true,
-            extra_excludes: Vec::new(),
             use_walk_cache: false,
+            ..CrawlOptions::new()
         };
         let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
         let (_, _, issues) = bfs_crawl_at_root(
@@ -1158,9 +1223,8 @@ mod tests {
 
         let opts = CrawlOptions {
             repos: cfg.repos,
-            use_default_excludes: true,
-            extra_excludes: Vec::new(),
             use_walk_cache: false,
+            ..CrawlOptions::new()
         };
         let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
         let (_, _, issues) = bfs_crawl_at_root(

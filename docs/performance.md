@@ -60,7 +60,7 @@ The walk has been **eliminated from steady-state runs**. What remains is the pos
 
 ## Why the walk-cache earns its keep here
 
-The walk-cache (`src/walk_cache.rs`) persists `RepoIndex` keyed by canonical root + flags hash, validated by per-dir mtime. APFS bumps a directory's mtime on entry add/remove/rename — not on file content edits — which is exactly the granularity we need for "did the basename map change?". File content edits are caught by the per-file cache layer below.
+The walk-cache (`walk_cache.rs`) persists `RepoIndex` keyed by canonical root + flags hash, validated by per-dir mtime. APFS bumps a directory's mtime on entry add/remove/rename — not on file content edits — which is exactly the granularity we need for "did the basename map change?". File content edits are caught by the per-file cache layer below.
 
 - **Cold first run** pays ~36 ms over `--no-cache`: per-dir `stat()` calls during the walk + cache write. Acceptable one-time tax.
 - **Warm runs** drop ~60 ms: zero `getdents`, zero parallel walker spinup, just a stat-per-dir validation pass before the BFS pipeline runs.
@@ -70,7 +70,7 @@ Disable with `--no-cache` (toggles both walk-cache and per-file extraction cache
 
 ## Why the per-file cache is break-even here
 
-The per-file extraction cache (`src/cache.rs`) exists, is correct (mtime + size + fnv1a64 content hash, atomic writes, schema-versioned), and shaves the ~5 ms extraction step on subsequent runs. But:
+The per-file extraction cache (`cache.rs`) exists, is correct (mtime + size + fnv1a64 content hash, atomic writes, schema-versioned), and shaves the ~5 ms extraction step on subsequent runs. But:
 
 - The validation path **always reads the file and hashes it** — that's the bulk of what a fresh extraction costs.
 - Hashing 600 KB of `.md` content is microseconds; extraction itself is also microseconds.

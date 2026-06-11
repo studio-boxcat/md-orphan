@@ -2,14 +2,6 @@
 
 ## Deferred follow-ups
 
-### Non-`.md` style support
-`index_repo` only puts `.md` files into `by_name` by default — populating it for all extensions in a Unity-sized repo (~100k files) costs ~800ms vs ~30ms. Wiki/cross-repo style for `.cs`, `.swift`, etc. currently goes unchecked.
-
-Hooks already in place: the `include_all_extensions` param on `index_repo` (`discovery.rs`) produces a complete map when set `true` (currently always `false`). To wire up:
-1. Plumb a CrawlOptions flag through to `index_repo` per repo
-2. Decide on user-facing surface: a global `--all-extensions-style` flag, or auto-detect by file extension when a non-`.md` style violation might apply
-3. Document the perf trade-off
-
 ### Possible: extend parallel discovery to transitive cross-repos
 The current prefetch only catches first-level cross-repo refs in the seeded entry files. Cross-repo targets discovered deeper (e.g. meow-tower's `docs/specs/*` referencing `meow-game-server`) fall back to lazy serial walks. Could switch BFS to level-synchronous and parallel-batch all cross-repo refs at each level boundary. Win on meow-tower-like setups: ~100-200 ms (sum of ~3 transitive cross-repo walks → max). Trade-off: FIFO crawl order becomes level-order. Defer until profiling shows the lazy serial fallback dominating.
 

@@ -44,7 +44,7 @@ Why `path.rs` (not `discovery.rs`) for `real_path` / `dir_name` / `base_name`: t
 
 Two real consumers, ranked by surface area needed:
 
-1. **CLI (`src/main.rs`)** — drives the whole pipeline. Calls `load_global_config`, `bfs_crawl_at_root`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.path_start..Link.path_end`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
+1. **CLI (`main.rs`)** — drives the whole pipeline. Calls `load_global_config`, `bfs_crawl_at_root`, formats `[LinkIssue]`, applies `--fix` by rewriting bytes at `Link.path_start..Link.path_end`. Re-implements style rendering (`[[…]]` vs `` `…` (repo)``) because the wrapping syntax is a CLI display concern, not a library concern.
 2. **Tests (per-module `#[cfg(test)]` blocks)** — assert on the byte scanners (`extract_links`, `extract_headings`), the resolver (`resolve_link`), the matcher (`ExcludeMatcher`), the BFS results, the cache disk round-trip, and config helpers (`expand_path`, `load_project_ignore`).
 
 No other consumers. No plugin story, no library users at the moment.
@@ -158,7 +158,7 @@ These bugs were paid for during the Swift era; the structure must keep them out:
 2. **`scan_backtick_ref` runaway**. An unclosed `` ` `` with no newline before EOF used to advance past end-of-buffer, eating later `[[wiki]]` links on the same row. Fix: scanner returns `i + 1` (advance one byte, treat lone backtick as literal) on every no-close branch — never `end + 1`. See `extract.rs:scan_backtick_ref`.
 3. **Cache content drift across parser changes**. Old cached byte offsets can be valid against an unchanged file but reflect the prior (buggy) parser. `CACHE_SCHEMA_VERSION` MUST bump on any scanner output change, not just on JSON-shape changes.
 4. **Cross-repo `..` escape**. A path like `../docs/foo.md` inside `` ` ` (some-repo) `` escapes the target repo root. Resolution falls back to basename lookup in the target repo's `by_name`. The escape is reported as a style violation (canonical form = bare basename), not a hard error. See `crawl.rs:resolve_cross_repo`.
-5. **`anchor_id` Unicode parity**. Swift `Character.isLetter` iterates grapheme clusters; Rust `char` is a Unicode scalar. Rust port uses `unicode_segmentation::UnicodeSegmentation::graphemes(true)` to match Swift's behavior on decomposed `é`, Korean precomposed/decomposed jamo, ZWJ emoji clusters. Verified against `tests/fixtures/anchor_id_parity.tsv` captured from the Swift binary.
+5. **`anchor_id` Unicode parity**. Swift `Character.isLetter` iterates grapheme clusters; Rust `char` is a Unicode scalar. Rust port uses `unicode_segmentation::UnicodeSegmentation::graphemes(true)` to match Swift's behavior on decomposed `é`, Korean precomposed/decomposed jamo, ZWJ emoji clusters. Verified against `anchor_id_parity.tsv` captured from the Swift binary.
 
 ## Non-goals
 

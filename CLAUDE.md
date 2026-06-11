@@ -39,6 +39,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 | `--config <path>` | Override global config (default `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`) |
 | `--no-default-excludes` | Disable built-in defaults (`.git`, `node_modules`, `Library`, `.build`, ...) |
 | `--no-cache` | Disable both the walk-result cache and the per-file extraction cache |
+| `--all-extensions` | Index every extension so non-`.md` refs (`[[foo.cs]]`, `` `src/foo.cs` ``) get style + basename resolution (~30× walk cost on Unity-scale repos) |
 | `--orient` | Print md-orphan's own `CLAUDE.md` (usage guide for this tool) |
 
 ## Link styles
@@ -144,22 +145,22 @@ Disable both with `--no-cache`.
 
 ## Structure
 
-- `src/path.rs` — path helpers (`real_path`, `dir_name`, `base_name`, `rel_path`) + `CanonicalPath` + `read_file`/`atomic_write_bytes`
-- `src/exclude.rs` — `ExcludeMatcher` with bare-basename hash-set fast path + `DEFAULT_EXCLUDES`
-- `src/extract.rs` — `Link` type + byte-level link/heading/fence scanners + grapheme-aware `anchor_id`
-- `src/crawl.rs` — `bfs_crawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolve_link`, `apply_style_fixes`
-- `src/discovery.rs` — `index_repo` + `RepoIndex` (`ignore::WalkParallel`-based)
-- `src/config.rs` — global JSON config + per-repo `.md-orphan` parsing + `expand_path`
-- `src/cache.rs` — per-file extraction cache (mtime + size + fnv1a64 content-hash keyed)
-- `src/walk_cache.rs` — walk-result cache: persisted `RepoIndex`, per-dir-mtime validated
-- `src/main.rs` — clap-derive CLI entry + output rendering + `--fix` wiring
+- `path.rs` — path helpers (`real_path`, `dir_name`, `base_name`, `rel_path`) + `CanonicalPath` + `read_file`/`atomic_write_bytes`
+- `exclude.rs` — `ExcludeMatcher` with bare-basename hash-set fast path + `DEFAULT_EXCLUDES`
+- `extract.rs` — `Link` type + byte-level link/heading/fence scanners + grapheme-aware `anchor_id`
+- `crawl.rs` — `bfs_crawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolve_link`, `apply_style_fixes`
+- `discovery.rs` — `index_repo` + `RepoIndex` (`ignore::WalkParallel`-based)
+- `config.rs` — global JSON config + per-repo `.md-orphan` parsing + `expand_path`
+- `cache.rs` — per-file extraction cache (mtime + size + fnv1a64 content-hash keyed)
+- `walk_cache.rs` — walk-result cache: persisted `RepoIndex`, per-dir-mtime validated
+- `main.rs` — clap-derive CLI entry + output rendering + `--fix` wiring
 - `tests/fixtures/` — anchor-id parity TSV captured during the Swift→Rust port
 - `dist/md-orphan` — pre-built release binary (committed to repo for fast `just install`)
 - See [[architecture.md]] for module layout + design rationale, [[performance.md]] for benchmarks, and [[rust-migration.md]] for the historical Swift→Rust migration record
 
 ## Algorithm
 
-1. **Discover** — `ignore::WalkParallel` traversal under the entry root with per-thread visitor pruning excluded subtrees (work-stealing across `num_cpus` threads). `.md` filenames enter the basename map for style/ambiguity checks. (Non-`.md` extensions in the basename map costs ~30× more on Unity-sized repos and is off by default — see [[TODO.md]].)
+1. **Discover** — `ignore::WalkParallel` traversal under the entry root with per-thread visitor pruning excluded subtrees (work-stealing across `num_cpus` threads). `.md` filenames enter the basename map for style/ambiguity checks; `--all-extensions` widens the map to every file (~30× walk cost on Unity-sized repos, off by default).
 2. **Crawl** — BFS from entry points. For each visited entry-repo file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo. The target file is visited (heading extraction for anchor checks) but its outgoing links are NOT followed — cross-repo recursion stops at depth 1. Two visited sets, both keyed by canonical path.
 3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 
