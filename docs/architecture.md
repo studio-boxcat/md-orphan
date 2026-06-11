@@ -1,4 +1,4 @@
-> **Related:** [[CLAUDE.md]], [[TODO.md]], [[rust-migration.md]]
+> **Related:** [[CLAUDE.md]], [[rust-migration.md]]
 
 # md-orphan architecture
 
