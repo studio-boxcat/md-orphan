@@ -5,6 +5,9 @@
 ### Possible: extend parallel discovery to transitive cross-repos
 The current prefetch only catches first-level cross-repo refs in the seeded entry files. Cross-repo targets discovered deeper (e.g. meow-tower's `docs/specs/*` referencing `meow-game-server`) fall back to lazy serial walks. Could switch BFS to level-synchronous and parallel-batch all cross-repo refs at each level boundary. Win on meow-tower-like setups: ~100-200 ms (sum of ~3 transitive cross-repo walks → max). Trade-off: FIFO crawl order becomes level-order. Defer until profiling shows the lazy serial fallback dominating.
 
+### Inline spans: raw-text fragments with spaces skipped
+`` `guide.md#Some Section` `` is dropped at the parser — the inline-span whitespace guard scans fragment bytes too, so raw-heading-text fragments (accepted in wiki/cross-repo links) never get anchor-checked in inline spans. Fail-silent, never a false positive. Fix: stop the metachar scan at the `#`.
+
 ### Concurrent invocation safety
 Cache writes are last-writer-wins. If users start running two `md-orphan` invocations against the same repo simultaneously (e.g. editor save hooks + lefthook), consider `flock(2)` on the cache file. So far accepted as last-writer-wins because cache is regenerable.
 
