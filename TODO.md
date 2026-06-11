@@ -11,9 +11,6 @@ Cache writes are last-writer-wins. If users start running two `md-orphan` invoca
 ### XDG nit
 `expand_path` understands `$VAR` and leading `~/`. It does not currently expand `~user/` (other-user homes). Nobody asked, but worth mentioning.
 
-### Multiple entry points spanning sibling dirs
-`main.rs` does `let root = dir_name(&resolved_entries[0])` — if the user passes `a/index.md b/index.md` where `a/` and `b/` are siblings, the second entry is treated as living under `a/`'s root (broken-link-prone). Either (a) reject multi-entry across sibling dirs, or (b) compute a common ancestor. Pre-existing edge case; not a regression.
-
 ### Walk-cache: XDG inside indexed root
 If `XDG_CONFIG_HOME` resolves under the entry repo (unusual — e.g. running md-orphan over `$HOME` with default `~/.config`), saves bump dir mtimes that the walk recorded, causing guaranteed misses on the next run. The dot-dir prune handles `~/.config`, but a custom non-default XDG inside the tree would force cold-every-run. Either: refuse to persist when `walk_cache_directory()` is under `canonical_root`, or document the constraint. Low priority; affects only users with non-standard XDG layouts.
 

@@ -10,7 +10,7 @@ use md_orphan::config::{
 use md_orphan::crawl::{
     apply_style_fixes, bfs_crawl_at_root, CrawlOptions, IssueKind, LinkIssue, StyleScope,
 };
-use md_orphan::path::{base_name, dir_name, real_path, rel_path};
+use md_orphan::path::{base_name, dir_name, is_under, real_path, rel_path};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -111,6 +111,16 @@ fn run(cli: Cli) -> Result<bool> {
     global_config.retain_existing();
 
     let root = dir_name(&resolved_entries[0]).to_string();
+    // The first entry's parent defines the repo root. An entry outside it (sibling dir)
+    // would be crawled against the wrong root — broken-link-prone — so reject up front.
+    for ep in &resolved_entries[1..] {
+        if !is_under(ep, &root) {
+            bail!(
+                "{ep}: outside repo root `{root}` (derived from the first entry point)\n\
+                 All entry points must live under one repo root; run md-orphan once per repo."
+            );
+        }
+    }
     let root_path = std::path::Path::new(&root);
     if !project_ignore_exists(root_path) {
         if let Some(ancestor) = find_project_ignore_ancestor(root_path) {

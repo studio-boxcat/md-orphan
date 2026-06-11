@@ -164,7 +164,7 @@ Disable both with `--no-cache`.
 2. **Crawl** — BFS from entry points. For each visited entry-repo file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo. The target file is visited (heading extraction for anchor checks) but its outgoing links are NOT followed — cross-repo recursion stops at depth 1. Two visited sets, both keyed by canonical path.
 3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 
-Edge cases: missing entry point → error (exit 2); broken link → exit 1; unreadable file → `Unreadable` issue (exit 1; still counted reachable, never doubles as an orphan); circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union.
+Edge cases: missing entry point → error (exit 2); broken link → exit 1; unreadable file → `Unreadable` issue (exit 1; still counted reachable, never doubles as an orphan); circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union (all must live under the first entry's root — siblings are rejected with exit 2).
 
 ## Performance
 
