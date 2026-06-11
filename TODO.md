@@ -8,11 +8,14 @@ The current prefetch only catches first-level cross-repo refs in the seeded entr
 ### Concurrent invocation safety
 Cache writes are last-writer-wins. If users start running two `md-orphan` invocations against the same repo simultaneously (e.g. editor save hooks + lefthook), consider `flock(2)` on the cache file. So far accepted as last-writer-wins because cache is regenerable.
 
-### Walk-cache: non-UTF-8 path lossy comparison
-`walk_cache.rs` compares `cache.canonical_root` against `canonical_root.to_string_lossy()` (`try_load_walk_cache`) and hashes via the lossy form for the cache filename. Two distinct paths with non-UTF-8 bytes could lossy-collide, returning a wrong-repo cache. Not a hazard for current users (macOS APFS is UTF-8; Linux dev paths typically are too). Fix would be to hash raw `OsStr` bytes via `as_encoded_bytes()` and reject non-UTF-8 paths from the equality check, or store both. Defer.
+### Non-UTF-8 path lossy collisions
+All canonical paths now flow through `CanonicalPath(String)` via `to_string_lossy` (`canonicalize_str` in `path.rs`) — two distinct non-UTF-8 paths could lossy-collide in visited sets, cache keys, and walk-cache filenames alike. Not a hazard for current users (macOS APFS is UTF-8; Linux dev paths typically are too). A real fix means an `OsString`-backed brand, which ripples everywhere String comparisons happen. Defer.
 
 ### Walk-cache: NFS / coarse-mtime filesystems
 Validation assumes dir mtime is bumped reliably on entry add/remove/rename. APFS, ext4, btrfs, NTFS: yes. NFS and some FUSE/CIFS mounts: server-side mtime can lag or have second-granularity. A rapid add+walk+save cycle on NFS could record a stale mtime that survives validation. No clean fix without entry-content-hashing per dir (expensive). Document the hazard if anyone reports it.
+
+### Per-link RepoIndex clone under --all-extensions
+`resolve_same_repo` / `resolve_inline` clone the full `RepoIndex` per link to appease the borrow checker. Cheap with an `.md`-only `by_name`; with `--all-extensions` on a 51k-file repo the map is ~30× larger per clone. Restructure to borrow (split `index_for` lookup from the `&mut self` issue-push) if `--all-extensions` ever feels slow.
 
 ### Trim post-walk pipeline (~30 ms BFS + cross-repo crawl)
 After walk-cache, the warm-path floor is the BFS-resolve + style-check + cross-repo coordination block in `crawl.rs`. Burns ~25-30 ms on meow-tower. No quick win identified; would require profiling to see whether path resolution, basename lookups, or cross-repo dispatch dominates. The walk has been eliminated from steady-state; this is now the largest remaining lever for warm-path speedup.
