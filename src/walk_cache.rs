@@ -38,6 +38,7 @@ pub(crate) struct WalkCache {
 }
 
 fn walk_cache_directory() -> PathBuf {
+    // `cache_directory()` always ends in "/md-orphan/cache", so a parent always exists.
     cache_directory().parent().unwrap().join("walk-cache")
 }
 

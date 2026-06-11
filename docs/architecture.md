@@ -110,11 +110,11 @@ Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canon
 | Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
 | Per-repo walk-cache | `$XDG_CONFIG_HOME/md-orphan/walk-cache/<fnv1a64-of-canonical-root>.json` | persisted `RepoIndex` + per-dir mtime map |
 
-**Per-file cache schema** (`schema_version: 5`, defined in `cache.rs`):
+**Per-file cache schema** (`schema_version: 6`, defined in `cache.rs`):
 
 ```json
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "display_name": "md-orphan",
   "repo_set_hash": 12345678901234567890,
   "entries": {

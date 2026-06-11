@@ -195,8 +195,28 @@ no extras."
         .map(|p| base_name(p).to_string())
         .collect::<Vec<_>>()
         .join(", ");
+
+    let failed = render_issues(&issues, &orphans, &root, &names, cli.fix);
+    if !failed && cli.verbose {
+        println!(
+            "\u{2705} All {} markdown files are reachable from {names}",
+            entry_index.md_files.len()
+        );
+    }
+    Ok(!failed)
+}
+
+/// Print every issue group + orphans (stdout), apply `--fix` when asked, and return whether
+/// the run failed. Output format byte-matches the Swift-era binary for existing kinds.
+fn render_issues(
+    issues: &[LinkIssue],
+    orphans: &[String],
+    root: &str,
+    names: &str,
+    fix: bool,
+) -> bool {
     let rel_source = |issue: &LinkIssue| {
-        rel_path(&issue.source, &root).map(|s| s.to_string()).unwrap_or_else(|| issue.source.clone())
+        rel_path(&issue.source, root).map(|s| s.to_string()).unwrap_or_else(|| issue.source.clone())
     };
 
     let mut failed = false;
@@ -251,7 +271,7 @@ no extras."
         failed = true;
     }
     if !style_issues.is_empty() {
-        let header = if cli.fix { "fixed" } else { "issues" };
+        let header = if fix { "fixed" } else { "issues" };
         println!("\u{1F4DD} {} link style {header}:", style_issues.len());
         let mut sorted: Vec<&LinkIssue> = style_issues.clone();
         sorted.sort_by(|a, b| {
@@ -276,7 +296,7 @@ no extras."
                 println!("  {}: {lhs} -> {rhs}", rel_source(issue));
             }
         }
-        if cli.fix {
+        if fix {
             let owned: Vec<LinkIssue> = style_issues.iter().map(|i| (*i).clone()).collect();
             if apply_style_fixes(&owned) > 0 {
                 failed = true; // some reported fixes did not land; stderr has the details
@@ -292,19 +312,13 @@ no extras."
             "\u{274C} {} orphan markdown files (not reachable from {names}):",
             orphans.len()
         );
-        for path in &orphans {
+        for path in orphans {
             println!("  {path}");
         }
         failed = true;
     }
 
-    if !failed && cli.verbose {
-        println!(
-            "\u{2705} All {} markdown files are reachable from {names}",
-            entry_index.md_files.len()
-        );
-    }
-    Ok(!failed)
+    failed
 }
 
 fn render_style(link: &str, suggested: &str, scope: &StyleScope) -> (String, String) {

@@ -4,7 +4,7 @@ Detect markdown files not reachable from a given entry point by crawling links r
 
 ## Install
 
-Pre-built macOS binary in `dist/`. Build and symlink to `~/.local/bin`:
+Build into `dist/` and symlink to `~/.local/bin`:
 
 ```
 just install
@@ -155,7 +155,7 @@ Disable both with `--no-cache`.
 - `walk_cache.rs` — walk-result cache: persisted `RepoIndex`, per-dir-mtime validated
 - `main.rs` — clap-derive CLI entry + output rendering + `--fix` wiring
 - `tests/fixtures/` — anchor-id parity TSV captured during the Swift→Rust port
-- `dist/md-orphan` — pre-built release binary (committed to repo for fast `just install`)
+- `dist/md-orphan` — locally built release binary (gitignored; `just build` refreshes it, `~/.local/bin/md-orphan` symlinks to it)
 - See [[architecture.md]] for module layout + design rationale, [[performance.md]] for benchmarks, and [[rust-migration.md]] for the historical Swift→Rust migration record
 
 ## Algorithm

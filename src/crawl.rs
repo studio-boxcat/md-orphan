@@ -128,6 +128,22 @@ pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String>
     }
 }
 
+/// Root-relative strict resolve shared by cross-repo and inline refs: join under `root`,
+/// fold with the strict escape rule, require containment, then realpath. `None` = no such
+/// file, or the path escaped the root.
+fn resolve_under_root(target: &str, root: &str) -> Option<CanonicalPath> {
+    let raw_combined = if target.starts_with('/') {
+        format!("{}{}", root, target)
+    } else {
+        format!("{}/{}", root, target)
+    };
+    let (normalized, escaped) = fold_segments(&raw_combined, true);
+    if escaped || !is_under(&normalized, root) {
+        return None;
+    }
+    canonicalize_str(&normalized)
+}
+
 /// `.md` basename fallback: when a path-resolve misses, look the link's basename up in the repo's
 /// name map. `Ok(Some)` = unique match resolved (or `None` if its realpath fails), `Ok(None)` = no
 /// such basename, `Err(n)` = n>1 candidates (ambiguous). Shared by same-repo and cross-repo resolve.
@@ -410,13 +426,7 @@ impl<'c> CrawlState<'c> {
     fn resolve_inline(&mut self, link: &Link, source: &BfsQueueItem) {
         let current = self.index_for(&source.repo_root);
         let root = current.root.as_str();
-        let raw_combined = format!("{}/{}", root, link.target);
-        let (normalized, escaped) = fold_segments(&raw_combined, true);
-        let mut canonical = if !escaped && is_under(&normalized, root) {
-            canonicalize_str(&normalized)
-        } else {
-            None
-        };
+        let mut canonical = resolve_under_root(&link.target, root);
         if canonical.is_none()
             && let Ok(resolved) = basename_fallback(&link.target, &current.by_name)
         {
@@ -519,20 +529,8 @@ impl<'c> CrawlState<'c> {
         let Some(repo_root) = self.resolved_repos.get(repo_name).cloned() else {
             return;
         };
-        let raw_combined = if link.target.starts_with('/') {
-            format!("{}{}", repo_root.as_str(), link.target)
-        } else {
-            format!("{}/{}", repo_root.as_str(), link.target)
-        };
-        let (normalized, escaped) = fold_segments(&raw_combined, true);
-        let within_root = !escaped && is_under(&normalized, repo_root.as_str());
-
         let is_md = link.target.ends_with(".md");
-        let mut canonical = if within_root {
-            canonicalize_str(&normalized)
-        } else {
-            None
-        };
+        let mut canonical = resolve_under_root(&link.target, repo_root.as_str());
         let repo_index = self.index_for(&repo_root);
 
         if canonical.is_none() && is_md {
@@ -1128,32 +1126,43 @@ mod tests {
         assert!(issues.is_empty());
     }
 
-    #[test]
-    fn cross_repo_ref_to_known_repo_with_missing_target_flagged() {
-        // `(known-repo)` IS configured but the target file doesn't exist → CrossRepoBroken.
-        // Confirms the parser-side filter doesn't mask real cross-repo errors.
+    /// Cross-repo crawl harness: entry repo with `index.md` = `entry_content`, plus a
+    /// configured `repo_name` pointing at a second tempdir populated with `target_files`.
+    fn cross_repo_crawl(
+        entry_content: &str,
+        repo_name: &str,
+        target_files: &[(&str, &str)],
+    ) -> Vec<LinkIssue> {
         let entry_dir = TempDir::new().unwrap();
         let target_dir = TempDir::new().unwrap();
         let entry = fs::canonicalize(entry_dir.path()).unwrap();
         let target = fs::canonicalize(target_dir.path()).unwrap();
         write(&entry.join(".md-orphan"), "");
-        write(&entry.join("index.md"), "see `missing.md` (known-repo)");
+        write(&entry.join("index.md"), entry_content);
         write(&target.join(".md-orphan"), "");
-        let mut repos = HashMap::new();
-        repos.insert("known-repo".to_string(), target.to_string_lossy().to_string());
+        for (rel, content) in target_files {
+            write(&target.join(rel), content);
+        }
         let opts = CrawlOptions {
-            repos,
+            repos: HashMap::from([(repo_name.to_string(), target.to_string_lossy().to_string())]),
             use_walk_cache: false,
             ..CrawlOptions::new()
         };
-        let mut cache =
-            ExtractionCache::new(false, opts.repos.keys().cloned().collect());
+        let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
         let (_, _, issues) = bfs_crawl_at_root(
             &[entry.join("index.md").to_string_lossy().to_string()],
             entry.to_str().unwrap(),
             &opts,
             &mut cache,
         );
+        issues
+    }
+
+    #[test]
+    fn cross_repo_ref_to_known_repo_with_missing_target_flagged() {
+        // `(known-repo)` IS configured but the target file doesn't exist → CrossRepoBroken.
+        // Confirms the parser-side filter doesn't mask real cross-repo errors.
+        let issues = cross_repo_crawl("see `missing.md` (known-repo)", "known-repo", &[]);
         let broken: Vec<_> = issues
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::CrossRepoBroken(_)))
@@ -1165,31 +1174,11 @@ mod tests {
     fn cross_repo_files_internal_broken_links_not_reported() {
         // Entry repo references a file in target repo; that file has its own broken link.
         // The internal broken link is NOT meow-tower's responsibility — should be silent.
-        let entry_dir = TempDir::new().unwrap();
-        let target_dir = TempDir::new().unwrap();
-        let entry = fs::canonicalize(entry_dir.path()).unwrap();
-        let target = fs::canonicalize(target_dir.path()).unwrap();
-        write(&entry.join(".md-orphan"), "");
-        write(&entry.join("index.md"), "see `outgoing.md` (target-repo)");
-        write(&target.join(".md-orphan"), "");
-        write(&target.join("outgoing.md"), "[bad](nonexistent.md) intra-target broken link");
-        let opts = CrawlOptions {
-            repos: HashMap::from([(
-                "target-repo".to_string(),
-                target.to_string_lossy().to_string(),
-            )]),
-            use_walk_cache: false,
-            ..CrawlOptions::new()
-        };
-        let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[entry.join("index.md").to_string_lossy().to_string()],
-            entry.to_str().unwrap(),
-            &opts,
-            &mut cache,
+        let issues = cross_repo_crawl(
+            "see `outgoing.md` (target-repo)",
+            "target-repo",
+            &[("outgoing.md", "[bad](nonexistent.md) intra-target broken link")],
         );
-        // No broken-link or any other issue: outgoing.md exists in target-repo, and we
-        // don't recurse into target-repo files to find their own broken links.
         assert!(issues.is_empty(), "expected silent, got: {:?}", issues);
     }
 
@@ -1197,28 +1186,10 @@ mod tests {
     fn entry_repo_anchor_check_on_cross_repo_target_still_works() {
         // Anchor verification on entry-repo's outgoing refs must still read the target file's
         // headings. Skipping recursion ≠ skipping anchor verification on direct refs.
-        let entry_dir = TempDir::new().unwrap();
-        let target_dir = TempDir::new().unwrap();
-        let entry = fs::canonicalize(entry_dir.path()).unwrap();
-        let target = fs::canonicalize(target_dir.path()).unwrap();
-        write(&entry.join(".md-orphan"), "");
-        write(&entry.join("index.md"), "see `outgoing.md#nope` (target-repo)");
-        write(&target.join(".md-orphan"), "");
-        write(&target.join("outgoing.md"), "# Real Section\n");
-        let opts = CrawlOptions {
-            repos: HashMap::from([(
-                "target-repo".to_string(),
-                target.to_string_lossy().to_string(),
-            )]),
-            use_walk_cache: false,
-            ..CrawlOptions::new()
-        };
-        let mut cache = ExtractionCache::new(false, opts.repos.keys().cloned().collect());
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[entry.join("index.md").to_string_lossy().to_string()],
-            entry.to_str().unwrap(),
-            &opts,
-            &mut cache,
+        let issues = cross_repo_crawl(
+            "see `outgoing.md#nope` (target-repo)",
+            "target-repo",
+            &[("outgoing.md", "# Real Section\n")],
         );
         let anchors: Vec<_> = issues
             .iter()
