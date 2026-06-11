@@ -1,4 +1,4 @@
-//! Path helpers: real_path, dir_name, base_name, rel_path, read_file.
+//! Path helpers: real_path, dir_name, base_name, rel_path, read_file, atomic_write_bytes.
 //!
 //! Mirrors `Sources/Lib/Util.swift`. Swift had a global reusable read buffer; Rust uses per-call
 //! `Vec<u8>` (allocator is fast enough at our file sizes — sub-ms for ~10KB files).
@@ -11,6 +11,52 @@ use std::path::{Path, PathBuf};
 /// Equivalent to `realpath(3)`. Empty/garbage paths return `None` (Swift's behavior).
 pub fn real_path<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
     fs::canonicalize(path).ok()
+}
+
+/// Symlink-resolved absolute path — `realpath(3)` output. The crawl's identity key: visited
+/// sets, the heading cache, and reachability are all keyed by this. The brand exists because
+/// mixing raw and canonical paths breaks `starts_with` containment checks and visited-set
+/// dedup (macOS `/var/folders` ↔ `/private/var/folders` — architecture.md, Pitfalls).
+///
+/// Construct via [`canonicalize_str`]; `assume_canonical` is the documented escape hatch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalPath(String);
+
+impl CanonicalPath {
+    /// Brand a path that can't go through `realpath(3)` — e.g. a seeded entry file that
+    /// doesn't exist (surfaces as `Unreadable` at visit). Callers own the canonicality claim.
+    pub(crate) fn assume_canonical(path: String) -> Self {
+        Self(path)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<Path> for CanonicalPath {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+/// Lets `HashSet<CanonicalPath>`/`HashMap<CanonicalPath, _>` look up by `&str` without
+/// re-branding the probe (derived `Hash` delegates to the inner `String` = `str` hashing).
+impl std::borrow::Borrow<str> for CanonicalPath {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// [`real_path`] + lossy decode into the crawl's `String`-keyed canonical form.
+pub fn canonicalize_str<P: AsRef<Path>>(path: P) -> Option<CanonicalPath> {
+    real_path(path).map(|p| CanonicalPath(p.to_string_lossy().into_owned()))
 }
 
 /// Parent directory portion of `path`. Returns `"."` when there's no `/`.
@@ -37,18 +83,39 @@ pub fn rel_path<'a>(path: &'a str, under_root: &str) -> Option<&'a str> {
     if path == under_root {
         return Some("");
     }
-    let prefix = format!("{}/", under_root);
-    if let Some(rest) = path.strip_prefix(&prefix) {
-        Some(rest)
-    } else {
-        None
-    }
+    let rest = path.strip_prefix(under_root)?;
+    rest.strip_prefix('/')
+}
+
+/// Containment check: `path == root` or `path` lives under `root/`. Allocation-free —
+/// replaces the `x == root || x.starts_with(&format!("{root}/"))` idiom.
+pub fn is_under(path: &str, root: &str) -> bool {
+    rel_path(path, root).is_some()
 }
 
 /// Read file contents as raw bytes. Per-call `Vec<u8>` allocation; no shared global buffer.
 /// Tests can run in parallel because of this (vs. Swift's `@Suite(.serialized)` constraint).
 pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     fs::read(path)
+}
+
+/// Tempfile + rename atomic write (tempfile in the target's own dir so rename stays on-device).
+/// Callers decide failure policy: caches warn and continue (regenerable), `--fix` fails the run.
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
+/// Test helper: write `content` to `path`, creating parent dirs. Shared by crawl/discovery tests.
+#[cfg(test)]
+pub(crate) fn write(path: &Path, content: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
 }
 
 // MARK: - Byte-scanner helpers (internal, shared with extract.rs)

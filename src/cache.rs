@@ -3,13 +3,12 @@
 //! See [[architecture.md#persisted-state]] for schema. Atomic writes via [`atomic_write_json`],
 //! shared with the walk-cache in [[walk_cache.rs]].
 
-use crate::config::home_dir;
+use crate::config::xdg_config_home;
 use crate::extract::{extract_headings, extract_links, Link};
-use crate::path::{read_file, rel_path};
+use crate::path::{atomic_write_bytes, read_file, rel_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -77,11 +76,7 @@ pub struct ExtractedFile {
 // MARK: - Cache directory + filename
 
 pub(crate) fn cache_directory() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{}/.config", home_dir()));
-    PathBuf::from(format!("{}/md-orphan/cache", base))
+    PathBuf::from(format!("{}/md-orphan/cache", xdg_config_home()))
 }
 
 pub(crate) fn cache_file_path(canonical_root: &Path) -> PathBuf {
@@ -129,39 +124,17 @@ pub(crate) fn load_link_cache(
 }
 
 pub(crate) fn save_link_cache(cache: &LinkCache, canonical_root: &Path) {
-    atomic_write_json(&cache_directory(), &cache_file_path(canonical_root), cache, "cache");
+    atomic_write_json(&cache_file_path(canonical_root), cache, "cache");
 }
 
-/// Tempfile + rename atomic JSON write. Failures log to stderr but don't abort —
+/// Atomic JSON write via [`atomic_write_bytes`]. Failures log to stderr but don't abort —
 /// caches are regenerable, so a write error means a cache miss next run.
-pub(crate) fn atomic_write_json<T: serde::Serialize>(
-    dir: &Path,
-    path: &Path,
-    value: &T,
-    label: &str,
-) {
-    if let Err(e) = fs::create_dir_all(dir) {
-        eprintln!("md-orphan: warning: cannot create {label} dir {}: {e}", dir.display());
-        return;
-    }
-    let json = match serde_json::to_vec(value) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("md-orphan: warning: cannot encode {label}: {e}");
-            return;
-        }
-    };
-    match tempfile::NamedTempFile::new_in(dir) {
-        Ok(mut tmp) => {
-            if let Err(e) = tmp.write_all(&json) {
-                eprintln!("md-orphan: warning: cannot write {label}: {e}");
-                return;
-            }
-            if let Err(e) = tmp.persist(path) {
-                eprintln!("md-orphan: warning: cannot persist {label} {}: {}", path.display(), e);
-            }
-        }
-        Err(e) => eprintln!("md-orphan: warning: cannot create tmp for {label}: {e}"),
+pub(crate) fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T, label: &str) {
+    let result = serde_json::to_vec(value)
+        .map_err(std::io::Error::other)
+        .and_then(|json| atomic_write_bytes(path, &json));
+    if let Err(e) = result {
+        eprintln!("md-orphan: warning: cannot write {label} {}: {e}", path.display());
     }
 }
 
@@ -314,6 +287,22 @@ pub(crate) fn xdg_test_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Isolated XDG dir + sibling repo dir under one tempdir, so cache writes don't bump the
+/// indexed repo's mtimes. Returns `(tempdir guard, xdg dir, canonicalized repo dir)`.
+/// Shared by `discovery`/`walk_cache` tests; caller must hold [`xdg_test_lock`].
+#[cfg(test)]
+pub(crate) fn xdg_test_env() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let xdg = tmp.path().join("xdg");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&xdg).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    // SAFETY: caller holds `xdg_test_lock()`; env is process-global but serialized.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+    let canon = fs::canonicalize(&repo).unwrap();
+    (tmp, xdg, canon)
 }
 
 #[cfg(test)]

@@ -91,8 +91,18 @@ pub fn extract_links(buf: &[u8], repos: &HashSet<String>) -> Vec<Link> {
     links
 }
 
-pub fn extract_links_str(s: &str) -> Vec<Link> {
-    extract_links(s.as_bytes(), &HashSet::new())
+/// Decode the fragment after a `#` at `hash_pos`, ending (exclusive) at `end`.
+/// `None` when there's no `#` or the fragment is empty (`[[a.md#]]`).
+#[inline]
+fn parse_fragment(buf: &[u8], hash_pos: Option<usize>, end: usize) -> Option<String> {
+    hash_pos.and_then(|h| {
+        let frag_len = end - h - 1;
+        if frag_len > 0 {
+            Some(decode_utf8(buf, h + 1, frag_len))
+        } else {
+            None
+        }
+    })
 }
 
 // MARK: - Per-syntax scanners
@@ -140,14 +150,7 @@ fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> 
         }
     }
     let name_len = name_end - start;
-    let fragment = hash_pos.and_then(|h| {
-        let frag_len = frag_end - h - 1;
-        if frag_len > 0 {
-            Some(decode_utf8(buf, h + 1, frag_len))
-        } else {
-            None
-        }
-    });
+    let fragment = parse_fragment(buf, hash_pos, frag_end);
     // Self-anchor link `[[#section]]` / `[[#section|alias]]`: empty path + fragment. Emitted with
     // an empty target so the crawler validates the fragment against the *source* file's headings.
     if name_len == 0 {
@@ -210,14 +213,7 @@ fn scan_standard_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>)
         return end + 1;
     }
 
-    let fragment = frag_pos.and_then(|p| {
-        let frag_len = end - p - 1;
-        if frag_len > 0 {
-            Some(decode_utf8(buf, p + 1, frag_len))
-        } else {
-            None
-        }
-    });
+    let fragment = parse_fragment(buf, frag_pos, end);
     links.push(Link {
         kind: LinkKind::Standard,
         target: decode_utf8(buf, start, path_len),
@@ -293,14 +289,7 @@ fn scan_backtick_ref(
     if !is_valid_cross_repo_path(&buf[path_start..name_end]) {
         return repo_end + 1;
     }
-    let fragment = hash_pos.and_then(|h| {
-        let frag_len = end - h - 1;
-        if frag_len > 0 {
-            Some(decode_utf8(buf, h + 1, frag_len))
-        } else {
-            None
-        }
-    });
+    let fragment = parse_fragment(buf, hash_pos, end);
     links.push(Link {
         kind: LinkKind::CrossRepo { repo: repo_str.to_string() },
         target: decode_utf8(buf, path_start, name_end - path_start),
@@ -395,14 +384,17 @@ pub fn extract_headings(buf: &[u8]) -> BTreeSet<String> {
     headings
 }
 
-/// Convenience: extract headings from a `&str`.
-pub fn extract_headings_str(s: &str) -> BTreeSet<String> {
-    extract_headings(s.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extract_links_str(s: &str) -> Vec<Link> {
+        extract_links(s.as_bytes(), &HashSet::new())
+    }
+
+    fn extract_headings_str(s: &str) -> BTreeSet<String> {
+        extract_headings(s.as_bytes())
+    }
 
     fn paths(s: &str) -> Vec<String> {
         extract_links_str(s).into_iter().map(|l| l.target).collect()
@@ -750,24 +742,14 @@ mod tests {
 
     #[test]
     fn anchor_id_parity_with_swift() {
-        // Captured from Swift binary in tests/fixtures/anchor_id_parity.tsv. Verifies
-        // that grapheme-cluster iteration + Unicode category checks match Swift Character semantics.
-        let cases: &[(&str, &str)] = &[
-            ("Hello World", "hello-world"),
-            ("Core (Classes)", "core-classes"),
-            ("**Bold** heading", "bold-heading"),
-            ("hello_world", "hello_world"),
-            ("한글 제목", "한글-제목"),
-            ("café", "café"), // NFC
-            ("Section 1.0 release", "section-10-release"),
-            ("code-stuff", "code-stuff"),
-            ("Heading with  double  spaces", "heading-with--double--spaces"),
-            ("Heading—em dash", "headingem-dash"),
-            ("PR #123 fix", "pr-123-fix"),
-        ];
-        for (input, expected) in cases {
+        // Cases captured from the Swift binary; the TSV is the single source (embedded at
+        // compile time, so NFC vs NFD café survive byte-exactly). Verifies grapheme-cluster
+        // iteration + Unicode category checks match Swift Character semantics.
+        let tsv = include_str!("../tests/fixtures/anchor_id_parity.tsv");
+        for (n, line) in tsv.lines().enumerate() {
+            let (input, expected) = line.split_once('\t').expect("two tab-separated columns");
             let got = anchor_id(input);
-            assert_eq!(&got, expected, "anchor_id({input:?}) mismatch");
+            assert_eq!(got, expected, "anchor_id({input:?}) mismatch (tsv line {})", n + 1);
         }
     }
 }

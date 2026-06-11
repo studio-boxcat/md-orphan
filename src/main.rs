@@ -147,19 +147,22 @@ no extras."
         &crawl_options,
         &mut cache,
     );
+    // Persist the per-file extraction cache (the walk-cache saves itself inside index_repo).
+    // Files rewritten by --fix below self-invalidate next run via (mtime, size, content-hash).
+    cache.save();
 
-    let entry_root_str = entry_index.root.to_string_lossy().to_string();
+    let entry_root_str = entry_index.root.as_str();
     let orphans: Vec<String> = {
         let mut v: Vec<String> = entry_index
             .md_files
             .iter()
             .filter(|rel| {
                 let abs = format!("{}/{}", entry_root_str, rel);
-                if reachable.contains(&abs) {
+                if reachable.contains(abs.as_str()) {
                     return false;
                 }
                 if let Some(canonical) = real_path(&abs)
-                    && reachable.contains(&canonical.to_string_lossy().to_string()) {
+                    && reachable.contains(canonical.to_string_lossy().as_ref()) {
                         return false;
                     }
                 true
@@ -187,6 +190,15 @@ no extras."
     let broken_anchors: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_))).collect();
     let cross_repo_broken: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::CrossRepoBroken(_))).collect();
     let style_issues: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Style { .. })).collect();
+    let unreadable: Vec<&LinkIssue> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Unreadable)).collect();
+
+    if !unreadable.is_empty() {
+        println!("\u{26D4} {} unreadable files:", unreadable.len());
+        for u in &unreadable {
+            println!("  {}", rel_source(u));
+        }
+        failed = true;
+    }
 
     if !broken.is_empty() {
         println!("\u{1F517} {} broken links:", broken.len());
@@ -250,7 +262,9 @@ no extras."
         }
         if cli.fix {
             let owned: Vec<LinkIssue> = style_issues.iter().map(|i| (*i).clone()).collect();
-            apply_style_fixes(&owned);
+            if apply_style_fixes(&owned) > 0 {
+                failed = true; // some reported fixes did not land; stderr has the details
+            }
         } else {
             println!("  (run with --fix to apply)");
             failed = true;

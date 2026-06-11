@@ -6,12 +6,14 @@
 use crate::cache::ExtractionCache;
 use crate::config::load_project_ignore;
 use crate::discovery::{index_repo, RepoIndex};
-use crate::extract::{Link, LinkKind};
-use crate::path::{base_name, dir_name, real_path, rel_path};
+use crate::extract::{anchor_id, Link, LinkKind};
+use crate::path::{
+    atomic_write_bytes, base_name, canonicalize_str, dir_name, is_under, rel_path,
+    CanonicalPath,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +34,9 @@ pub enum IssueKind {
         path_end: usize,
     },
     CrossRepoBroken(String),
+    /// A reachable file that couldn't be read (vanished mid-run, permissions). The crawl can't
+    /// verify its links/headings, so the run must not exit clean. `link` == `source` == the file.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +46,9 @@ pub struct LinkIssue {
     pub kind: IssueKind,
 }
 
-#[derive(Debug, Clone, Default)]
+// No `Default` derive: it would yield `use_default_excludes: false, use_walk_cache: false`,
+// silently contradicting `new()`'s documented defaults. All construction goes through `new()`.
+#[derive(Debug, Clone)]
 pub struct CrawlOptions {
     /// repo-name → absolute root (env-expanded; will be realpath'd internally).
     pub repos: HashMap<String, String>,
@@ -53,6 +60,8 @@ pub struct CrawlOptions {
 }
 
 impl CrawlOptions {
+    // See the struct comment — a Default impl is exactly the footgun being avoided.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             repos: HashMap::new(),
@@ -106,7 +115,7 @@ pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String>
         format!("{}/{}", source_dir, link)
     };
     let (resolved, _) = fold_segments(&combined, false);
-    if resolved == root || resolved.starts_with(&format!("{}/", root)) {
+    if is_under(&resolved, root) {
         Some(resolved)
     } else {
         None
@@ -116,16 +125,18 @@ pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String>
 /// `.md` basename fallback: when a path-resolve misses, look the link's basename up in the repo's
 /// name map. `Ok(Some)` = unique match resolved (or `None` if its realpath fails), `Ok(None)` = no
 /// such basename, `Err(n)` = n>1 candidates (ambiguous). Shared by same-repo and cross-repo resolve.
+/// `by_name` values may end in a symlinked *file* (the walk doesn't resolve those), hence the
+/// re-canonicalize here — this is where the `CanonicalPath` brand gets applied.
 fn basename_fallback(
     target: &str,
     by_name: &HashMap<String, Vec<String>>,
-) -> Result<Option<String>, usize> {
+) -> Result<Option<CanonicalPath>, usize> {
     let Some(candidates) = by_name.get(base_name(target)) else {
         return Ok(None);
     };
     match candidates.len() {
         0 => Ok(None),
-        1 => Ok(real_path(&candidates[0]).map(|p| p.to_string_lossy().to_string())),
+        1 => Ok(canonicalize_str(&candidates[0])),
         n => Err(n),
     }
 }
@@ -134,8 +145,8 @@ fn basename_fallback(
 
 #[derive(Debug, Clone)]
 struct BfsQueueItem {
-    path: String,
-    repo_root: PathBuf,
+    path: CanonicalPath,
+    repo_root: CanonicalPath,
     is_entry_repo: bool,
 }
 
@@ -144,7 +155,7 @@ pub fn bfs_crawl(
     index: RepoIndex,
     options: &CrawlOptions,
     cache: &mut ExtractionCache,
-) -> (HashSet<String>, Vec<LinkIssue>) {
+) -> (HashSet<CanonicalPath>, Vec<LinkIssue>) {
     let mut state = CrawlState::new(index, options.clone(), cache);
     state.seed(entry_paths);
     while let Some(item) = state.dequeue() {
@@ -160,7 +171,7 @@ pub fn bfs_crawl_at_root(
     root: &str,
     options: &CrawlOptions,
     cache: &mut ExtractionCache,
-) -> (RepoIndex, HashSet<String>, Vec<LinkIssue>) {
+) -> (RepoIndex, HashSet<CanonicalPath>, Vec<LinkIssue>) {
     let project_ignore = load_project_ignore(Path::new(root)).unwrap_or_default();
     let mut exclude = options.extra_excludes.clone();
     exclude.extend(project_ignore);
@@ -172,19 +183,19 @@ pub fn bfs_crawl_at_root(
 // MARK: - CrawlState
 
 struct CrawlState<'c> {
-    entry_root: PathBuf,
-    resolved_repos: HashMap<String, PathBuf>,
+    entry_root: CanonicalPath,
+    resolved_repos: HashMap<String, CanonicalPath>,
     options: CrawlOptions,
     cache: &'c mut ExtractionCache,
 
-    indices: HashMap<PathBuf, RepoIndex>,
+    indices: HashMap<CanonicalPath, RepoIndex>,
     queue: Vec<BfsQueueItem>,
     cursor: usize,
-    queued_entry_paths: HashSet<String>,
-    cross_repo_visited: HashSet<String>,
-    reachable: HashSet<String>,
+    queued_entry_paths: HashSet<CanonicalPath>,
+    cross_repo_visited: HashSet<CanonicalPath>,
+    reachable: HashSet<CanonicalPath>,
     issues: Vec<LinkIssue>,
-    heading_cache: HashMap<String, BTreeSet<String>>,
+    heading_cache: HashMap<CanonicalPath, BTreeSet<String>>,
 }
 
 impl<'c> CrawlState<'c> {
@@ -192,7 +203,9 @@ impl<'c> CrawlState<'c> {
         let entry_root = entry_index.root.clone();
         let mut resolved_repos = HashMap::new();
         for (name, raw) in &options.repos {
-            let resolved = real_path(raw).unwrap_or_else(|| PathBuf::from(raw));
+            // retain_existing() already dropped non-dirs, so realpath only fails on races.
+            let resolved = canonicalize_str(raw)
+                .unwrap_or_else(|| CanonicalPath::assume_canonical(raw.clone()));
             resolved_repos.insert(name.clone(), resolved);
         }
         let mut indices = HashMap::new();
@@ -215,9 +228,9 @@ impl<'c> CrawlState<'c> {
 
     fn seed(&mut self, entry_paths: &[String]) {
         for ep in entry_paths {
-            let canonical = real_path(ep)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| ep.clone());
+            // Missing entry has no realpath; brand as-is so visit() reports it Unreadable.
+            let canonical = canonicalize_str(ep)
+                .unwrap_or_else(|| CanonicalPath::assume_canonical(ep.clone()));
             self.queued_entry_paths.insert(canonical.clone());
             self.queue.push(BfsQueueItem {
                 path: canonical,
@@ -231,12 +244,14 @@ impl<'c> CrawlState<'c> {
     /// Walk seeded entry files once to find first-level cross-repo target names, then
     /// parallel-index those repos via `std::thread::scope`.
     fn prefetch_referenced_repos(&mut self) {
-        let mut targets: HashSet<PathBuf> = HashSet::new();
-        for item in self.queue.clone() {
+        let mut targets: HashSet<CanonicalPath> = HashSet::new();
+        // Field-level split borrows: &self.queue (read) + &mut self.cache (read-through) are
+        // disjoint, so no queue clone is needed.
+        for item in &self.queue {
             if !item.is_entry_repo {
                 continue;
             }
-            let Some(result) = self.cache.read(Path::new(&item.path), &item.repo_root) else {
+            let Some(result) = self.cache.read(item.path.as_ref(), item.repo_root.as_ref()) else {
                 continue;
             };
             for link in &result.links {
@@ -246,14 +261,14 @@ impl<'c> CrawlState<'c> {
                     }
             }
         }
-        let to_index: Vec<PathBuf> = targets
+        let to_index: Vec<CanonicalPath> = targets
             .into_iter()
             .filter(|r| r != &self.entry_root)
             .collect();
         if to_index.is_empty() {
             return;
         }
-        let prefetched = Mutex::new(HashMap::<PathBuf, RepoIndex>::new());
+        let prefetched = Mutex::new(HashMap::<CanonicalPath, RepoIndex>::new());
         let extra_excludes = self.options.extra_excludes.clone();
         let use_defaults = self.options.use_default_excludes;
         let use_walk_cache = self.options.use_walk_cache;
@@ -262,11 +277,10 @@ impl<'c> CrawlState<'c> {
                 let prefetched = &prefetched;
                 let extra_excludes = extra_excludes.clone();
                 s.spawn(move || {
-                    let project_ignore = load_project_ignore(root).unwrap_or_default();
+                    let project_ignore = load_project_ignore(root.as_ref()).unwrap_or_default();
                     let mut excl = extra_excludes;
                     excl.extend(project_ignore);
-                    let root_str = root.to_string_lossy();
-                    let idx = index_repo(&root_str, &excl, use_defaults, false, use_walk_cache);
+                    let idx = index_repo(root.as_str(), &excl, use_defaults, false, use_walk_cache);
                     prefetched.lock().unwrap().insert(root.clone(), idx);
                 });
             }
@@ -287,10 +301,9 @@ impl<'c> CrawlState<'c> {
     }
 
     fn visit(&mut self, item: &BfsQueueItem) {
-        let Some(result) = self.cache.read(Path::new(&item.path), &item.repo_root) else {
-            eprintln!("md-orphan: warning: cannot read {}", item.path);
-            return;
-        };
+        // Mark visited before reading: an unreadable file is still *reachable* (a link led
+        // here), so it must not double-report as an orphan — and re-reading a failing path
+        // on every re-encounter is useless.
         if item.is_entry_repo {
             if !self.reachable.insert(item.path.clone()) {
                 return;
@@ -298,6 +311,14 @@ impl<'c> CrawlState<'c> {
         } else if !self.cross_repo_visited.insert(item.path.clone()) {
             return;
         }
+        let Some(result) = self.cache.read(item.path.as_ref(), item.repo_root.as_ref()) else {
+            self.issues.push(LinkIssue {
+                link: item.path.to_string(),
+                source: item.path.to_string(),
+                kind: IssueKind::Unreadable,
+            });
+            return;
+        };
         self.heading_cache.insert(item.path.clone(), result.headings.clone());
         // Scope: don't follow links inside cross-repo files. Those repos run their own
         // md-orphan; their broken-link rot isn't this entry repo's responsibility. Headings
@@ -311,48 +332,45 @@ impl<'c> CrawlState<'c> {
         }
     }
 
-    fn index_for(&mut self, canonical_root: &Path) -> &RepoIndex {
+    fn index_for(&mut self, canonical_root: &CanonicalPath) -> &RepoIndex {
         if !self.indices.contains_key(canonical_root) {
-            let project_ignore = load_project_ignore(canonical_root).unwrap_or_default();
+            let project_ignore = load_project_ignore(canonical_root.as_ref()).unwrap_or_default();
             let mut excl = self.options.extra_excludes.clone();
             excl.extend(project_ignore);
-            let root_str = canonical_root.to_string_lossy();
             let idx = index_repo(
-                &root_str,
+                canonical_root.as_str(),
                 &excl,
                 self.options.use_default_excludes,
                 false,
                 self.options.use_walk_cache,
             );
-            self.indices.insert(canonical_root.to_path_buf(), idx);
+            self.indices.insert(canonical_root.clone(), idx);
         }
         self.indices.get(canonical_root).unwrap()
     }
 
-    fn headings_for(&mut self, canonical: &str) -> BTreeSet<String> {
+    fn headings_for(&mut self, canonical: &CanonicalPath) -> BTreeSet<String> {
         if let Some(cached) = self.heading_cache.get(canonical) {
             return cached.clone();
         }
         let owning_root = self
-            .repo_root_containing(canonical)
+            .repo_root_containing(canonical.as_str())
             .unwrap_or_else(|| self.entry_root.clone());
         let h = self
             .cache
-            .read(Path::new(canonical), &owning_root)
+            .read(canonical.as_ref(), owning_root.as_ref())
             .map(|r| r.headings)
             .unwrap_or_default();
-        self.heading_cache.insert(canonical.to_string(), h.clone());
+        self.heading_cache.insert(canonical.clone(), h.clone());
         h
     }
 
-    fn repo_root_containing(&self, path: &str) -> Option<PathBuf> {
-        let entry_str = self.entry_root.to_string_lossy();
-        if path == entry_str.as_ref() || path.starts_with(&format!("{}/", entry_str)) {
+    fn repo_root_containing(&self, path: &str) -> Option<CanonicalPath> {
+        if is_under(path, self.entry_root.as_str()) {
             return Some(self.entry_root.clone());
         }
         for root in self.resolved_repos.values() {
-            let s = root.to_string_lossy();
-            if path == s.as_ref() || path.starts_with(&format!("{}/", s)) {
+            if is_under(path, root.as_str()) {
                 return Some(root.clone());
             }
         }
@@ -379,12 +397,12 @@ impl<'c> CrawlState<'c> {
             return;
         }
         let current = self.index_for(&source.repo_root).clone();
-        let current_root_str = current.root.to_string_lossy().to_string();
-        let Some(resolved) = resolve_link(&link.target, &source.path, &current_root_str) else {
+        let Some(resolved) = resolve_link(&link.target, source.path.as_str(), current.root.as_str())
+        else {
             return;
         };
         let is_md = link.target.ends_with(".md");
-        let mut canonical = real_path(&resolved).map(|p| p.to_string_lossy().to_string());
+        let mut canonical = canonicalize_str(&resolved);
 
         // Basename fallback for .md links.
         if canonical.is_none() && is_md {
@@ -393,7 +411,7 @@ impl<'c> CrawlState<'c> {
                 Err(n) => {
                     self.issues.push(LinkIssue {
                         link: link.target.clone(),
-                        source: source.path.clone(),
+                        source: source.path.to_string(),
                         kind: IssueKind::Ambiguous(n),
                     });
                     return;
@@ -403,16 +421,14 @@ impl<'c> CrawlState<'c> {
         let Some(canonical) = canonical else {
             self.issues.push(LinkIssue {
                 link: link.target.clone(),
-                source: source.path.clone(),
+                source: source.path.to_string(),
                 kind: IssueKind::Broken,
             });
             return;
         };
 
         // Style check: wiki links only, target must live in same repo.
-        if matches!(link.kind, LinkKind::Wiki)
-            && canonical.starts_with(&format!("{}/", current_root_str))
-        {
+        if matches!(link.kind, LinkKind::Wiki) && is_under(canonical.as_str(), current.root.as_str()) {
             self.emit_style_if_needed(
                 link,
                 &source.path,
@@ -433,7 +449,7 @@ impl<'c> CrawlState<'c> {
 
         // Enqueue.
         let owning_root = self
-            .repo_root_containing(&canonical)
+            .repo_root_containing(canonical.as_str())
             .unwrap_or_else(|| current.root.clone());
         self.enqueue_resolved(canonical, owning_root);
     }
@@ -443,20 +459,17 @@ impl<'c> CrawlState<'c> {
         let Some(repo_root) = self.resolved_repos.get(repo_name).cloned() else {
             return;
         };
-        let repo_root_str = repo_root.to_string_lossy().to_string();
         let raw_combined = if link.target.starts_with('/') {
-            format!("{}{}", repo_root_str, link.target)
+            format!("{}{}", repo_root.as_str(), link.target)
         } else {
-            format!("{}/{}", repo_root_str, link.target)
+            format!("{}/{}", repo_root.as_str(), link.target)
         };
         let (normalized, escaped) = fold_segments(&raw_combined, true);
-        let within_root = !escaped
-            && (normalized == repo_root_str
-                || normalized.starts_with(&format!("{}/", repo_root_str)));
+        let within_root = !escaped && is_under(&normalized, repo_root.as_str());
 
         let is_md = link.target.ends_with(".md");
         let mut canonical = if within_root {
-            real_path(&normalized).map(|p| p.to_string_lossy().to_string())
+            canonicalize_str(&normalized)
         } else {
             None
         };
@@ -468,7 +481,7 @@ impl<'c> CrawlState<'c> {
                 Err(n) => {
                     self.issues.push(LinkIssue {
                         link: link.target.clone(),
-                        source: source.path.clone(),
+                        source: source.path.to_string(),
                         kind: IssueKind::Ambiguous(n),
                     });
                     return;
@@ -478,13 +491,13 @@ impl<'c> CrawlState<'c> {
         let Some(canonical) = canonical else {
             self.issues.push(LinkIssue {
                 link: link.target.clone(),
-                source: source.path.clone(),
+                source: source.path.to_string(),
                 kind: IssueKind::CrossRepoBroken(repo_name.to_string()),
             });
             return;
         };
 
-        if canonical.starts_with(&format!("{}/", repo_root_str)) {
+        if is_under(canonical.as_str(), repo_root.as_str()) {
             self.emit_style_if_needed(
                 link,
                 &source.path,
@@ -505,10 +518,7 @@ impl<'c> CrawlState<'c> {
             self.validate_fragment(link, &source.path, &canonical, fragment);
         }
 
-        let entry_str = self.entry_root.to_string_lossy().to_string();
-        let owning_root = if canonical == entry_str
-            || canonical.starts_with(&format!("{}/", entry_str))
-        {
+        let owning_root = if is_under(canonical.as_str(), self.entry_root.as_str()) {
             self.entry_root.clone()
         } else {
             repo_root
@@ -519,8 +529,20 @@ impl<'c> CrawlState<'c> {
     /// Push a `BrokenAnchor` issue when `fragment` is absent from the target file's headings.
     /// `canonical` is the file whose headings to check — the resolved target, or the source
     /// itself for self-anchor links (`[[#section]]`).
-    fn validate_fragment(&mut self, link: &Link, source_path: &str, canonical: &str, fragment: &str) {
-        if !self.headings_for(canonical).contains(fragment) {
+    fn validate_fragment(
+        &mut self,
+        link: &Link,
+        source_path: &CanonicalPath,
+        canonical: &CanonicalPath,
+        fragment: &str,
+    ) {
+        let headings = self.headings_for(canonical);
+        // Wiki/cross-repo fragments also accept raw heading text (Obsidian convention) —
+        // slugify before lookup. Standard links stay slug-exact: renderers resolve them as
+        // real URL fragments, where raw text genuinely 404s.
+        let ok = headings.contains(fragment)
+            || (!matches!(link.kind, LinkKind::Standard) && headings.contains(&anchor_id(fragment)));
+        if !ok {
             self.issues.push(LinkIssue {
                 link: link.target.clone(),
                 source: source_path.to_string(),
@@ -532,14 +554,15 @@ impl<'c> CrawlState<'c> {
     fn emit_style_if_needed(
         &mut self,
         link: &Link,
-        source: &str,
-        canonical: &str,
-        repo_root: &Path,
+        source: &CanonicalPath,
+        canonical: &CanonicalPath,
+        repo_root: &CanonicalPath,
         by_name: &HashMap<String, Vec<String>>,
         scope: StyleScope,
     ) {
-        let root_str = repo_root.to_string_lossy().to_string();
-        let Some(rel_target) = rel_path(canonical, &root_str).map(|s| s.to_string()) else {
+        let Some(rel_target) =
+            rel_path(canonical.as_str(), repo_root.as_str()).map(|s| s.to_string())
+        else {
             return;
         };
         let basename = base_name(&rel_target);
@@ -567,7 +590,7 @@ impl<'c> CrawlState<'c> {
         });
     }
 
-    fn enqueue_resolved(&mut self, canonical: String, owning_root: PathBuf) {
+    fn enqueue_resolved(&mut self, canonical: CanonicalPath, owning_root: CanonicalPath) {
         if owning_root == self.entry_root {
             if self.queued_entry_paths.insert(canonical.clone()) {
                 self.queue.push(BfsQueueItem {
@@ -586,13 +609,13 @@ impl<'c> CrawlState<'c> {
     }
 
     fn prune_cache(&mut self) {
-        let snapshot: Vec<(PathBuf, HashSet<String>)> = self
+        let snapshot: Vec<(CanonicalPath, HashSet<String>)> = self
             .indices
             .iter()
             .map(|(r, i)| (r.clone(), i.md_files.clone()))
             .collect();
         for (root, keep) in snapshot {
-            self.cache.prune(&root, &keep);
+            self.cache.prune(root.as_ref(), &keep);
         }
     }
 }
@@ -602,15 +625,23 @@ impl<'c> CrawlState<'c> {
 /// Rewrite the path bytes inside `[[...]]` or `` `...` `` for every `.style` issue.
 /// Replacements per source file are applied in descending byte-offset order so earlier
 /// offsets stay valid. Atomic write via `tempfile`.
-pub fn apply_style_fixes(issues: &[LinkIssue]) {
+///
+/// Returns the number of source files that could not be read or rewritten — non-zero means
+/// some reported fixes did NOT land, and the caller must fail the run.
+pub fn apply_style_fixes(issues: &[LinkIssue]) -> usize {
+    let mut failures = 0;
     let mut by_source: HashMap<String, Vec<&LinkIssue>> = HashMap::new();
     for i in issues {
         by_source.entry(i.source.clone()).or_default().push(i);
     }
     for (source, mut source_issues) in by_source {
-        let Ok(data) = fs::read(&source) else {
-            eprintln!("md-orphan: warning: cannot read {source} for --fix");
-            continue;
+        let data = match fs::read(&source) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("md-orphan: error: cannot read {source} for --fix: {e}");
+                failures += 1;
+                continue;
+            }
         };
         // Sort by path_start descending so earlier offsets stay valid.
         source_issues.sort_by(|a, b| {
@@ -636,33 +667,31 @@ pub fn apply_style_fixes(issues: &[LinkIssue]) {
                     bytes.splice(*path_start..*path_end, suggested.as_bytes().iter().copied());
                 }
         }
-        // Atomic write via tempfile in the same dir.
-        let path = Path::new(&source);
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        match tempfile::NamedTempFile::new_in(parent) {
-            Ok(mut tmp) => {
-                if let Err(e) = tmp.write_all(&bytes) {
-                    eprintln!("md-orphan: warning: cannot write {source}: {e}");
-                    continue;
-                }
-                if let Err(e) = tmp.persist(path) {
-                    eprintln!("md-orphan: warning: cannot persist {source}: {e}");
-                }
-            }
-            Err(e) => eprintln!("md-orphan: warning: cannot create tmp for {source}: {e}"),
+        if let Err(e) = atomic_write_bytes(Path::new(&source), &bytes) {
+            eprintln!("md-orphan: error: cannot apply --fix to {source}: {e}");
+            failures += 1;
         }
     }
+    failures
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path::write;
     use std::fs;
     use tempfile::TempDir;
 
-    fn write(path: &Path, content: &str) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
+    /// Default-options crawl of `entry` (relative to `root`), extraction cache off.
+    fn crawl(root: &Path, entry: &str) -> (HashSet<CanonicalPath>, Vec<LinkIssue>) {
+        let mut cache = ExtractionCache::for_tests(false);
+        let (_, reachable, issues) = bfs_crawl_at_root(
+            &[root.join(entry).to_string_lossy().to_string()],
+            root.to_str().unwrap(),
+            &CrawlOptions::new(),
+            &mut cache,
+        );
+        (reachable, issues)
     }
 
     #[test]
@@ -726,13 +755,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[a](missing.md)");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "index.md");
         let broken: Vec<_> = issues.iter().filter(|i| matches!(i.kind, IssueKind::Broken)).collect();
         assert_eq!(broken.len(), 1);
         assert_eq!(broken[0].link, "missing.md");
@@ -744,13 +767,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[a](other.md)");
         write(&canonical.join("other.md"), "hello");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, reachable, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (reachable, issues) = crawl(&canonical, "index.md");
         assert!(issues.is_empty());
         assert_eq!(reachable.len(), 2);
     }
@@ -761,13 +778,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[a](guide.md)");
         write(&canonical.join("docs/guide.md"), "hello");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, reachable, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (reachable, issues) = crawl(&canonical, "index.md");
         assert!(issues.is_empty());
         assert_eq!(reachable.len(), 2);
     }
@@ -779,13 +790,7 @@ mod tests {
         write(&canonical.join("index.md"), "[a](guide.md)");
         write(&canonical.join("a/guide.md"), "");
         write(&canonical.join("b/guide.md"), "");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "index.md");
         let ambig: Vec<_> = issues
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::Ambiguous(_)))
@@ -802,13 +807,7 @@ mod tests {
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "[ref](other.md#missing-section)");
         write(&canonical.join("other.md"), "# Existing Section\n\nSome content");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "index.md");
         let anchors: Vec<_> = issues
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_)))
@@ -828,13 +827,7 @@ mod tests {
             &canonical.join("index.md"),
             "# Intro\n\njump to [[#details]]\n\n## Details\n",
         );
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "index.md");
         assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
     }
 
@@ -847,13 +840,7 @@ mod tests {
             &canonical.join("index.md"),
             "# Intro\n\njump to [[#nope]]\n\n## Details\n",
         );
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "index.md");
         let anchors: Vec<_> = issues
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_)))
@@ -865,18 +852,55 @@ mod tests {
     }
 
     #[test]
+    fn raw_text_anchor_in_wiki_link() {
+        // `[[other.md#Existing Section]]` — raw heading text, not the slug. Accepted for
+        // wiki links (Obsidian convention): slugified before lookup.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "[[other.md#Existing Section]]");
+        write(&canonical.join("other.md"), "# Existing Section\n\nSome content");
+        let (_, issues) = crawl(&canonical, "index.md");
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn raw_text_self_anchor() {
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(
+            &canonical.join("index.md"),
+            "# Intro\n\njump to [[#Details Section]]\n\n## Details Section\n",
+        );
+        let (_, issues) = crawl(&canonical, "index.md");
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn raw_text_anchor_in_standard_link_still_broken() {
+        // Standard links resolve as real URL fragments on GitHub — raw heading text 404s
+        // there, so leniency does NOT apply. Slug-exact match required.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "[ref](other.md#Existing Section)");
+        write(&canonical.join("other.md"), "# Existing Section\n\nSome content");
+        let (_, issues) = crawl(&canonical, "index.md");
+        let anchors: Vec<_> = issues
+            .iter()
+            .filter(|i| matches!(i.kind, IssueKind::BrokenAnchor(_)))
+            .collect();
+        assert_eq!(anchors.len(), 1, "expected 1 BrokenAnchor, got: {:?}", issues);
+        if let IssueKind::BrokenAnchor(frag) = &anchors[0].kind {
+            assert_eq!(frag, "Existing Section");
+        }
+    }
+
+    #[test]
     fn wiki_style_relative_path_flagged() {
         let dir = TempDir::new().unwrap();
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("docs/dev/index.md"), "see [[../system/foo.md]]");
         write(&canonical.join("docs/system/foo.md"), "");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("docs/dev/index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "docs/dev/index.md");
         let style: Vec<_> = issues
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::Style { .. }))
@@ -894,13 +918,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let canonical = fs::canonicalize(dir.path()).unwrap();
         write(&canonical.join("index.md"), "see `foo.md` (no-such-repo)");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[canonical.join("index.md").to_string_lossy().to_string()],
-            canonical.to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical, "index.md");
         // No issues at all — annotation is silent (parser pre-filter), and the file has
         // no other links to resolve.
         assert!(issues.is_empty());
@@ -1049,13 +1067,7 @@ mod tests {
         let entry = canonical.join("a/index.md");
         write(&entry, "x [[docs/guide.md]] y");
         write(&canonical.join("a/docs/guide.md"), "");
-        let mut cache = ExtractionCache::for_tests(false);
-        let (_, _, issues) = bfs_crawl_at_root(
-            &[entry.to_string_lossy().to_string()],
-            canonical.join("a").to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache,
-        );
+        let (_, issues) = crawl(&canonical.join("a"), "index.md");
         let style: Vec<&LinkIssue> = issues
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::Style { .. }))
@@ -1064,23 +1076,47 @@ mod tests {
 
         // Apply fix.
         let style_owned: Vec<LinkIssue> = style.into_iter().cloned().collect();
-        apply_style_fixes(&style_owned);
+        assert_eq!(apply_style_fixes(&style_owned), 0);
 
         let rewritten = fs::read_to_string(&entry).unwrap();
         assert_eq!(rewritten, "x [[guide.md]] y");
 
         // Idempotency: re-run yields no style issues.
-        let mut cache2 = ExtractionCache::for_tests(false);
-        let (_, _, issues2) = bfs_crawl_at_root(
-            &[entry.to_string_lossy().to_string()],
-            canonical.join("a").to_str().unwrap(),
-            &CrawlOptions::new(),
-            &mut cache2,
-        );
+        let (_, issues2) = crawl(&canonical.join("a"), "index.md");
         let style2: Vec<_> = issues2
             .iter()
             .filter(|i| matches!(i.kind, IssueKind::Style { .. }))
             .collect();
         assert!(style2.is_empty());
+    }
+
+    #[test]
+    fn unreadable_entry_reports_issue_not_orphan() {
+        // A seeded entry that can't be read → Unreadable issue; it still lands in the
+        // reachable set (marked before the read) so it can't double-report as an orphan.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        let missing = canonical.join("gone.md");
+        let (reachable, issues) = crawl(&canonical, "gone.md");
+        assert_eq!(issues.len(), 1, "expected 1 Unreadable, got: {:?}", issues);
+        assert!(matches!(issues[0].kind, IssueKind::Unreadable));
+        assert_eq!(issues[0].source, missing.to_string_lossy());
+        assert!(reachable.contains(missing.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn fix_counts_unreadable_source_as_failure() {
+        // A Style issue whose source file vanished before --fix → read fails → counted.
+        let issue = LinkIssue {
+            link: "docs/guide.md".into(),
+            source: "/nonexistent/__md_orphan_test__/index.md".into(),
+            kind: IssueKind::Style {
+                scope: StyleScope::Wiki,
+                suggested: "guide.md".into(),
+                path_start: 2,
+                path_end: 15,
+            },
+        };
+        assert_eq!(apply_style_fixes(&[issue]), 1);
     }
 }

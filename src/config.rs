@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 pub enum ConfigError {
     #[error("{path}: malformed JSON: {message}")]
     MalformedJson { path: String, message: String },
-    #[error("{path}: missing 'repos' object")]
-    MissingReposKey { path: String },
     #[error("repo '{name}' path '{raw}': undefined env var ${missing_var}")]
     RepoPathExpansion {
         name: String,
@@ -44,11 +42,16 @@ impl GlobalConfig {
 /// Default global config path: `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`, fallback to
 /// `$HOME/.config/md-orphan/md-orphan.json`.
 pub fn default_config_path() -> PathBuf {
-    let base = env::var("XDG_CONFIG_HOME")
+    PathBuf::from(format!("{}/md-orphan/md-orphan.json", xdg_config_home()))
+}
+
+/// `$XDG_CONFIG_HOME`, falling back to `$HOME/.config`. Shared base for the global config
+/// (here) and both cache layers (`cache.rs`).
+pub(crate) fn xdg_config_home() -> String {
+    env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{}/.config", home_dir()));
-    PathBuf::from(format!("{}/md-orphan/md-orphan.json", base))
+        .unwrap_or_else(|| format!("{}/.config", home_dir()))
 }
 
 /// User home directory. `$HOME` first, fall back to `dirs::home_dir`-equivalent via passwd.

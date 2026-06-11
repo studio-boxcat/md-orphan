@@ -35,7 +35,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 |------|-------------|
 | `--exclude <pattern>` | Exclude paths by prefix or glob (comma-separated, repeatable) |
 | `--verbose`, `-v` | Show success message when all files are reachable |
-| `--fix` | Rewrite link style issues in place (atomic write) |
+| `--fix` | Rewrite link style issues in place (atomic write); a fix that can't be written exits 1 |
 | `--config <path>` | Override global config (default `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`) |
 | `--no-default-excludes` | Disable built-in defaults (`.git`, `node_modules`, `Library`, `.build`, ...) |
 | `--no-cache` | Disable both the walk-result cache and the per-file extraction cache |
@@ -55,6 +55,8 @@ The tool recognizes four link forms in markdown. Style violations are flagged wh
 Standard md links (`[text](path)`) get broken-link / ambiguity / anchor checks, but are **not** rewritten — most renderers (GitHub, etc.) interpret them as filesystem-relative, so basename-magic would silently break them.
 
 **Cross-repo annotation filter:** the `` `path.ext` (name) `` syntax is only treated as a cross-repo ref when `name` matches a configured repo. Patterns like `` `view.name` (GridView) ``, `` `Unity.Analytics` (Runtime) ``, `` `UISortingOrder.Activity` (10) `` are silently treated as inline-code annotations. Trade-off: typos to a known-repo name are caught at file-resolution (`CrossRepoBroken`); typos to a wrong-repo name are silent.
+
+**Anchor fragments:** wiki and cross-repo fragments accept either the kebab-case slug (`#content-type`) or the raw heading text (`#Content Type` — Obsidian convention); raw text is slugified before lookup. Standard md link fragments must be the exact slug — renderers resolve them as real URL fragments, where raw text 404s.
 
 **Self-anchor links:** a wiki link with an empty path and a fragment (`[[#section]]`, `[[#section|alias]]`) targets the *current* file. The fragment is validated against the source file's own headings (broken → `BrokenAnchor`); there's no path to resolve, style-check, or rewrite. The standard-link equivalent `[text](#section)` is **not** checked — it has no extension, so it's dropped at the parser like any other extensionless link.
 
@@ -140,7 +142,7 @@ Disable both with `--no-cache`.
 
 ## Structure
 
-- `src/path.rs` — path helpers (`real_path`, `dir_name`, `base_name`, `rel_path`) + `read_file`
+- `src/path.rs` — path helpers (`real_path`, `dir_name`, `base_name`, `rel_path`) + `CanonicalPath` + `read_file`/`atomic_write_bytes`
 - `src/exclude.rs` — `ExcludeMatcher` with bare-basename hash-set fast path + `DEFAULT_EXCLUDES`
 - `src/extract.rs` — `Link` type + byte-level link/heading/fence scanners + grapheme-aware `anchor_id`
 - `src/crawl.rs` — `bfs_crawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolve_link`, `apply_style_fixes`
@@ -159,7 +161,7 @@ Disable both with `--no-cache`.
 2. **Crawl** — BFS from entry points. For each visited entry-repo file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo. The target file is visited (heading extraction for anchor checks) but its outgoing links are NOT followed — cross-repo recursion stops at depth 1. Two visited sets, both keyed by canonical path.
 3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 
-Edge cases: missing entry point → exit 1; broken link → exit 1; circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union.
+Edge cases: missing entry point → error (exit 2); broken link → exit 1; unreadable file → `Unreadable` issue (exit 1; still counted reachable, never doubles as an orphan); circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union.
 
 ## Performance
 

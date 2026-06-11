@@ -5,6 +5,7 @@
 
 use crate::cache::{atomic_write_json, cache_directory, fnv1a64, fnv1a64_hex, fnv1a64_of_sorted};
 use crate::discovery::RepoIndex;
+use crate::path::CanonicalPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -40,9 +41,8 @@ fn walk_cache_directory() -> PathBuf {
     cache_directory().parent().unwrap().join("walk-cache")
 }
 
-fn walk_cache_file_path(canonical_root: &Path) -> PathBuf {
-    let s = canonical_root.to_string_lossy();
-    walk_cache_directory().join(format!("{}.json", fnv1a64_hex(&s)))
+fn walk_cache_file_path(canonical_root: &CanonicalPath) -> PathBuf {
+    walk_cache_directory().join(format!("{}.json", fnv1a64_hex(canonical_root.as_str())))
 }
 
 /// fnv1a64 of `(use_default_excludes, include_all_extensions, sorted exclude list)`.
@@ -68,7 +68,7 @@ pub(crate) fn compute_flags_key(
 /// Load + validate a walk cache for `canonical_root`. Returns `Some(RepoIndex)` on a verified
 /// hit, `None` on any miss/error/staleness.
 pub(crate) fn try_load_walk_cache(
-    canonical_root: &Path,
+    canonical_root: &CanonicalPath,
     flags_key: u64,
 ) -> Option<RepoIndex> {
     let path = walk_cache_file_path(canonical_root);
@@ -77,24 +77,25 @@ pub(crate) fn try_load_walk_cache(
     if cache.schema_version != WALK_CACHE_SCHEMA_VERSION {
         return None;
     }
-    if cache.canonical_root != canonical_root.to_string_lossy() {
+    if cache.canonical_root != canonical_root.as_str() {
         return None;
     }
     if cache.flags_key != flags_key {
         return None;
     }
+    let root: &Path = canonical_root.as_ref();
     for (rel_dir, expected_mtime_ns) in &cache.dir_mtimes {
         let abs = if rel_dir.is_empty() {
-            canonical_root.to_path_buf()
+            root.to_path_buf()
         } else {
-            canonical_root.join(rel_dir)
+            root.join(rel_dir)
         };
         if stat_mtime_ns(&abs)? != *expected_mtime_ns {
             return None;
         }
     }
     Some(RepoIndex {
-        root: canonical_root.to_path_buf(),
+        root: canonical_root.clone(),
         md_files: cache.md_files,
         by_name: cache.by_name,
         exclude: cache.effective_exclude,
@@ -102,26 +103,21 @@ pub(crate) fn try_load_walk_cache(
 }
 
 pub(crate) fn save_walk_cache(
-    canonical_root: &Path,
+    canonical_root: &CanonicalPath,
     flags_key: u64,
     index: &RepoIndex,
     dir_mtimes: HashMap<String, i64>,
 ) {
     let cache = WalkCache {
         schema_version: WALK_CACHE_SCHEMA_VERSION,
-        canonical_root: canonical_root.to_string_lossy().into_owned(),
+        canonical_root: canonical_root.as_str().to_owned(),
         flags_key,
         dir_mtimes,
         md_files: index.md_files.clone(),
         by_name: index.by_name.clone(),
         effective_exclude: index.exclude.clone(),
     };
-    atomic_write_json(
-        &walk_cache_directory(),
-        &walk_cache_file_path(canonical_root),
-        &cache,
-        "walk-cache",
-    );
+    atomic_write_json(&walk_cache_file_path(canonical_root), &cache, "walk-cache");
 }
 
 pub(crate) fn stat_mtime_ns(path: &Path) -> Option<i64> {
@@ -133,9 +129,9 @@ pub(crate) fn stat_mtime_ns(path: &Path) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::xdg_test_lock;
+    use crate::cache::{xdg_test_env, xdg_test_lock};
+    use crate::path::canonicalize_str;
     use std::collections::{HashMap, HashSet};
-    use tempfile::TempDir;
 
     #[test]
     fn flags_key_stable_across_reordering() {
@@ -158,23 +154,11 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// Isolated XDG + separate "repo" subdir so cache writes don't bump the repo's mtime.
-    fn setup() -> (TempDir, PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let xdg = tmp.path().join("xdg");
-        let repo = tmp.path().join("repo");
-        fs::create_dir_all(&xdg).unwrap();
-        fs::create_dir_all(&repo).unwrap();
-        // SAFETY: caller holds `xdg_test_lock()`; env is process-global but serialized.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg); }
-        let canon = fs::canonicalize(&repo).unwrap();
-        (tmp, canon)
-    }
-
     #[test]
     fn cache_hit_returns_repo_index() {
         let _g = xdg_test_lock();
-        let (_tmp, canon) = setup();
+        let (_tmp, _, canon) = xdg_test_env();
+        let canon = canonicalize_str(&canon).unwrap();
 
         let mut md = HashSet::new();
         md.insert("a.md".to_string());
@@ -185,7 +169,7 @@ mod tests {
             exclude: vec!["Library/".to_string()],
         };
         let mut dir_mtimes = HashMap::new();
-        dir_mtimes.insert("".into(), stat_mtime_ns(&canon).unwrap());
+        dir_mtimes.insert("".into(), stat_mtime_ns(canon.as_ref()).unwrap());
 
         let key = compute_flags_key(true, false, &["Library/".into()]);
         save_walk_cache(&canon, key, &index, dir_mtimes);
@@ -197,7 +181,8 @@ mod tests {
     #[test]
     fn cache_miss_on_flags_change() {
         let _g = xdg_test_lock();
-        let (_tmp, canon) = setup();
+        let (_tmp, _, canon) = xdg_test_env();
+        let canon = canonicalize_str(&canon).unwrap();
 
         let index = RepoIndex {
             root: canon.clone(),
@@ -206,7 +191,7 @@ mod tests {
             exclude: Vec::new(),
         };
         let mut dir_mtimes = HashMap::new();
-        dir_mtimes.insert("".into(), stat_mtime_ns(&canon).unwrap());
+        dir_mtimes.insert("".into(), stat_mtime_ns(canon.as_ref()).unwrap());
 
         let key_a = compute_flags_key(true, false, &[]);
         save_walk_cache(&canon, key_a, &index, dir_mtimes);
@@ -218,7 +203,8 @@ mod tests {
     #[test]
     fn cache_miss_on_dir_mtime_change() {
         let _g = xdg_test_lock();
-        let (_tmp, canon) = setup();
+        let (_tmp, _, canon) = xdg_test_env();
+        let canon = canonicalize_str(&canon).unwrap();
 
         let index = RepoIndex {
             root: canon.clone(),

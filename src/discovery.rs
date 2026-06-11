@@ -8,18 +8,18 @@
 //! exclude semantics. Dot-dir skipping happens inside our visitor.
 
 use crate::exclude::{ExcludeMatcher, DEFAULT_EXCLUDES};
-use crate::path::real_path;
+use crate::path::{canonicalize_str, CanonicalPath};
 use crate::walk_cache::{compute_flags_key, save_walk_cache, stat_mtime_ns, try_load_walk_cache};
 use ignore::{WalkBuilder, WalkState};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIndex {
     /// Canonical (realpath'd) absolute root.
-    pub root: PathBuf,
+    pub root: CanonicalPath,
     /// Relative paths of `.md` files — for orphan reachability tracking.
     pub md_files: HashSet<String>,
     /// Basename → list of absolute paths. `.md` only unless `include_all_extensions`.
@@ -44,7 +44,9 @@ pub fn index_repo(
     include_all_extensions: bool,
     use_walk_cache: bool,
 ) -> RepoIndex {
-    let resolved = real_path(root).unwrap_or_else(|| PathBuf::from(root));
+    // Nonexistent root has no realpath; brand as-is (the walk just yields nothing).
+    let resolved =
+        canonicalize_str(root).unwrap_or_else(|| CanonicalPath::assume_canonical(root.to_string()));
     let mut effective: Vec<String> = if use_default_excludes {
         DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
     } else {
@@ -65,8 +67,7 @@ pub fn index_repo(
 
     let matcher = ExcludeMatcher::new(effective.clone());
     let bare_only = matcher.is_bare_only();
-    let resolved_str = resolved.to_string_lossy().to_string();
-    let root_prefix = format!("{}/", resolved_str);
+    let root_prefix = format!("{}/", resolved.as_str());
 
     // Shared accumulators. Lock contention is small at our entry counts (~15k post-prune)
     // because each insert is microseconds and locked sections are tight.
@@ -179,13 +180,9 @@ pub fn index_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path::write;
     use std::fs;
     use tempfile::TempDir;
-
-    fn write(path: &std::path::Path, content: &str) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
-    }
 
     #[test]
     fn discovers_md_files() {
@@ -272,24 +269,10 @@ mod tests {
         assert!(idx.by_name.contains_key("bar.cs"));
     }
 
-    /// Set up an isolated XDG dir + sibling repo dir under a single tempdir, so cache writes to
-    /// `<tmp>/xdg/md-orphan/walk-cache/` don't bump the indexed `<tmp>/repo/` mtimes.
-    fn setup_walk_cache_env() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let xdg = tmp.path().join("xdg");
-        let repo = tmp.path().join("repo");
-        fs::create_dir_all(&xdg).unwrap();
-        fs::create_dir_all(&repo).unwrap();
-        // SAFETY: caller holds `xdg_test_lock`; env is process-global but serialized.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg); }
-        let canon_repo = fs::canonicalize(&repo).unwrap();
-        (tmp, xdg, canon_repo)
-    }
-
     #[test]
     fn walk_cache_round_trips_and_returns_same_repo_index() {
         let _g = crate::cache::xdg_test_lock();
-        let (_tmp, xdg, repo) = setup_walk_cache_env();
+        let (_tmp, xdg, repo) = crate::cache::xdg_test_env();
         write(&repo.join("a.md"), "");
         write(&repo.join("docs/b.md"), "");
 
@@ -310,7 +293,7 @@ mod tests {
     #[test]
     fn walk_cache_invalidates_on_dir_mutation() {
         let _g = crate::cache::xdg_test_lock();
-        let (_tmp, _xdg, repo) = setup_walk_cache_env();
+        let (_tmp, _xdg, repo) = crate::cache::xdg_test_env();
         write(&repo.join("a.md"), "");
 
         let first = index_repo(repo.to_str().unwrap(), &[], true, false, true);
@@ -328,7 +311,7 @@ mod tests {
     #[test]
     fn walk_cache_invalidates_on_flags_change() {
         let _g = crate::cache::xdg_test_lock();
-        let (_tmp, _xdg, repo) = setup_walk_cache_env();
+        let (_tmp, _xdg, repo) = crate::cache::xdg_test_env();
         write(&repo.join("a.md"), "");
         write(&repo.join("Packages/inner.md"), "");
 

@@ -4,6 +4,8 @@
 
 End-state design for porting md-orphan from Swift to Rust. Round-2 design after Round-1 research.
 
+> Historical record — the shipped implementation diverged in places (e.g. `walkdir` here vs the final `ignore::WalkParallel`). [[architecture.md]] reflects what shipped.
+
 ## Why Rust
 
 Honest assessment, not perf-justified alone:

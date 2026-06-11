@@ -23,7 +23,7 @@ Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesom
 
 ```
 src/
-  path.rs       — path helpers + read_file + scanner-internal helpers
+  path.rs       — path helpers + CanonicalPath + read_file/atomic_write_bytes + scanner-internal helpers
   exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI
   extract.rs    — Link type + byte-level link/heading/fence scanners
   crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes
@@ -84,7 +84,7 @@ pub fn bfs_crawl(
     index: RepoIndex,
     options: &CrawlOptions,
     cache: &mut ExtractionCache,
-) -> (HashSet<String>, Vec<LinkIssue>) {
+) -> (HashSet<CanonicalPath>, Vec<LinkIssue>) {
     let mut state = CrawlState::new(index, options.clone(), cache);
     state.seed(entry_paths);
     while let Some(item) = state.dequeue() { state.visit(&item); }
@@ -95,9 +95,9 @@ pub fn bfs_crawl(
 
 `CrawlState` is a struct (with a `'c` lifetime borrowing `&mut ExtractionCache`) — single-threaded, single-owner, dropped at end of `bfs_crawl`. No statics, no shared instance.
 
-Two visited sets, both keyed by canonical absolute path:
-- `reachable: HashSet<String>` — entry-repo orphan tracking. Files in this set get their outgoing links resolved + recursively followed.
-- `cross_repo_visited: HashSet<String>` — cross-repo target files the entry repo directly references. They're read so anchor checks against their headings work, but their outgoing links are NOT followed — `visit()` returns early after caching headings. Issues from cross-repo files would be downstream-repo concerns, not entry-repo concerns.
+Two visited sets, both keyed by canonical absolute path — the `CanonicalPath` newtype (`path.rs`) brands `realpath(3)` output so raw paths can't sneak into identity checks (Pitfall #1 made compile-checked). `RepoIndex.by_name` values stay unbranded `String`s: the walk doesn't resolve file-level symlinks, so they're only canonical after `basename_fallback` re-realpaths them.
+- `reachable: HashSet<CanonicalPath>` — entry-repo orphan tracking. Files in this set get their outgoing links resolved + recursively followed. Marked *before* the file is read: an unreadable file is still reachable (reported as an `Unreadable` issue, not an orphan).
+- `cross_repo_visited: HashSet<CanonicalPath>` — cross-repo target files the entry repo directly references. They're read so anchor checks against their headings work, but their outgoing links are NOT followed — `visit()` returns early after caching headings. Issues from cross-repo files would be downstream-repo concerns, not entry-repo concerns.
 
 Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canonicalize`, so path-based dedup handles them. Hardlinks (rare in doc trees) are processed twice.
 
