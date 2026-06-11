@@ -11,9 +11,6 @@ Cache writes are last-writer-wins. If users start running two `md-orphan` invoca
 ### XDG nit
 `expand_path` understands `$VAR` and leading `~/`. It does not currently expand `~user/` (other-user homes). Nobody asked, but worth mentioning.
 
-### Walk-cache: XDG inside indexed root
-If `XDG_CONFIG_HOME` resolves under the entry repo (unusual — e.g. running md-orphan over `$HOME` with default `~/.config`), saves bump dir mtimes that the walk recorded, causing guaranteed misses on the next run. The dot-dir prune handles `~/.config`, but a custom non-default XDG inside the tree would force cold-every-run. Either: refuse to persist when `walk_cache_directory()` is under `canonical_root`, or document the constraint. Low priority; affects only users with non-standard XDG layouts.
-
 ### Walk-cache: non-UTF-8 path lossy comparison
 `walk_cache.rs` compares `cache.canonical_root` against `canonical_root.to_string_lossy()` (`try_load_walk_cache`) and hashes via the lossy form for the cache filename. Two distinct paths with non-UTF-8 bytes could lossy-collide, returning a wrong-repo cache. Not a hazard for current users (macOS APFS is UTF-8; Linux dev paths typically are too). Fix would be to hash raw `OsStr` bytes via `as_encoded_bytes()` and reject non-UTF-8 paths from the equality check, or store both. Defer.
 

@@ -5,7 +5,7 @@
 
 use crate::cache::{atomic_write_json, cache_directory, fnv1a64, fnv1a64_hex, fnv1a64_of_sorted};
 use crate::discovery::RepoIndex;
-use crate::path::CanonicalPath;
+use crate::path::{is_under, real_path, CanonicalPath};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -108,6 +108,13 @@ pub(crate) fn save_walk_cache(
     index: &RepoIndex,
     dir_mtimes: HashMap<String, i64>,
 ) {
+    // A cache dir under the indexed root (custom XDG inside the tree, or indexing $HOME with
+    // a non-default layout) would have its parent-dir mtimes bumped by this very save —
+    // guaranteeing a miss next run. Skip persisting; the walk itself stays correct.
+    let cache_dir = canonicalize_best_effort(&walk_cache_directory());
+    if is_under(&cache_dir.to_string_lossy(), canonical_root.as_str()) {
+        return;
+    }
     let cache = WalkCache {
         schema_version: WALK_CACHE_SCHEMA_VERSION,
         canonical_root: canonical_root.as_str().to_owned(),
@@ -118,6 +125,19 @@ pub(crate) fn save_walk_cache(
         effective_exclude: index.exclude.clone(),
     };
     atomic_write_json(&walk_cache_file_path(canonical_root), &cache, "walk-cache");
+}
+
+/// realpath(3) of the nearest existing ancestor, with the missing tail re-appended.
+/// The cache dir may not exist yet (first run), but its containment check still has to see
+/// through symlinks (macOS `/var` → `/private/var`).
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Some(p) = real_path(path) {
+        return p;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        return canonicalize_best_effort(parent).join(name);
+    }
+    path.to_path_buf()
 }
 
 pub(crate) fn stat_mtime_ns(path: &Path) -> Option<i64> {
@@ -198,6 +218,30 @@ mod tests {
 
         let key_b = compute_flags_key(false, false, &[]); // flag flipped → miss
         assert!(try_load_walk_cache(&canon, key_b).is_none());
+    }
+
+    #[test]
+    fn save_refused_when_cache_dir_inside_root() {
+        // XDG resolving under the indexed root → persisting would self-invalidate. Refuse.
+        let _g = xdg_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("xdg")).unwrap();
+        // SAFETY: caller holds `xdg_test_lock()`; env is process-global but serialized.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", repo.join("xdg")) };
+        let canon = canonicalize_str(&repo).unwrap();
+
+        let index = RepoIndex {
+            root: canon.clone(),
+            md_files: HashSet::new(),
+            by_name: HashMap::new(),
+            exclude: Vec::new(),
+        };
+        save_walk_cache(&canon, 1, &index, HashMap::new());
+        assert!(
+            !repo.join("xdg/md-orphan/walk-cache").exists(),
+            "expected save to be refused for in-root cache dir"
+        );
     }
 
     #[test]
