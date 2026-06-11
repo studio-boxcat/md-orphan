@@ -91,7 +91,7 @@ The prefetch reads the seeded entry files in `CrawlState.seed`, extracts cross-r
 
 For projects with no cross-repo refs anywhere, prescan finds zero targets and no parallel work runs.
 
-Tracked in [[TODO.md]]: extending to transitive cross-repos via level-synchronous BFS could save more on meow-tower-like setups, at the cost of trading FIFO crawl order for level-by-level batching.
+Extending to transitive cross-repos (level-synchronous BFS, parallel-batched per level) was considered and dropped — profiling never showed the lazy serial fallback dominating. Revisit only with evidence.
 
 ## What dominates
 
@@ -122,11 +122,20 @@ cargo test                      # unit tests
 cargo test --release            # release build
 ```
 
-## Tracked perf follow-ups
+## --all-extensions cost
 
-See [[TODO.md]] for:
+Indexing every extension on meow-tower (51k files post-prune): **~155 ms cold, ~79 ms warm**
+(measured 2026-06; hyperfine mean). The walk-cache keys on `flags_key`, so toggling the flag
+keeps a separate cache rather than thrashing the default one. Per-link index access is an
+`Rc` bump — the 51k-entry `by_name` is never deep-cloned during resolution.
 
-- Extending parallel discovery to transitive cross-repos (level-synchronous BFS)
-- Non-`.md` style support cost analysis (~10× current `index_repo` time)
-- Trim post-walk pipeline (~30 ms BFS + cross-repo crawl) — the floor on warm runs now
-- Considered-and-rejected cache shapes (cacache, redb, rkyv, merkle-root-mtime, rayon-parallel-stat) — see TODO for the analysis
+## Considered and dropped
+
+Recorded so dead ends aren't re-litigated (full analyses in git history):
+
+- **Transitive cross-repo parallel discovery** — no profiling evidence the lazy serial fallback matters.
+- **Post-walk BFS trim** — the ~25–30 ms resolve/style/cross-repo block is the warm floor; no lever identified short of real profiling.
+- **Cache crates/formats** (`cacache`/`redb`/`sled`, `rkyv`/`bincode`, `atomicwrites`) — startup/parse savings are ~1–3 ms against a ~40 ms warm path, and none help with mtime-validated invalidation, which is the actual hard part.
+- **Merkle-style root-mtime hash** (1 stat vs ~1k) — cuts validation ~3 ms → ~50 µs but invalidates on any dir change anywhere; revisit if the warm budget tightens.
+- **`flock(2)` on cache files** — concurrent invocations are last-writer-wins on regenerable caches; accepted.
+- **`rayon`-parallel validation stats** — thread-pool spin-up eats the win for a one-shot CLI.

@@ -149,7 +149,7 @@ Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache vali
 }
 ```
 
-Validation: schema match + `flags_key` match + every `dir_mtimes` entry stats unchanged. Any miss → fall through to a fresh walk. `flags_key` is `fnv1a64(use_default_excludes | include_all_extensions | sorted-effective-excludes)`; bump triggers for the schema version live in the const's doc comment.
+Validation: schema match + `flags_key` match + every `dir_mtimes` entry stats unchanged. Any miss → fall through to a fresh walk. Assumes dir mtime reliably bumps on entry add/remove/rename — true on APFS/ext4/btrfs/NTFS; NFS and some FUSE/CIFS mounts can lag, making a stale hit theoretically possible there. `flags_key` is `fnv1a64(use_default_excludes | include_all_extensions | sorted-effective-excludes)`; bump triggers for the schema version live in the const's doc comment.
 
 ## Pitfalls — avoided in this design
 

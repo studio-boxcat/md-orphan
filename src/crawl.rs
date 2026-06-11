@@ -14,6 +14,7 @@ use crate::path::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +200,9 @@ struct CrawlState<'c> {
     options: CrawlOptions,
     cache: &'c mut ExtractionCache,
 
-    indices: HashMap<CanonicalPath, RepoIndex>,
+    /// `Rc` so resolvers can hold the index across `&mut self` issue-pushes without deep-cloning
+    /// it per link — `by_name`/`md_files` are large (15k+ entries on Unity-scale repos).
+    indices: HashMap<CanonicalPath, Rc<RepoIndex>>,
     queue: Vec<BfsQueueItem>,
     cursor: usize,
     queued_entry_paths: HashSet<CanonicalPath>,
@@ -220,7 +223,7 @@ impl<'c> CrawlState<'c> {
             resolved_repos.insert(name.clone(), resolved);
         }
         let mut indices = HashMap::new();
-        indices.insert(entry_root.clone(), entry_index);
+        indices.insert(entry_root.clone(), Rc::new(entry_index));
         Self {
             entry_root,
             resolved_repos,
@@ -299,7 +302,7 @@ impl<'c> CrawlState<'c> {
         });
         let prefetched = prefetched.into_inner().unwrap();
         for (root, idx) in prefetched {
-            self.indices.insert(root, idx);
+            self.indices.insert(root, Rc::new(idx));
         }
     }
 
@@ -344,7 +347,8 @@ impl<'c> CrawlState<'c> {
         }
     }
 
-    fn index_for(&mut self, canonical_root: &CanonicalPath) -> &RepoIndex {
+    /// Returned `Rc` is a pointer bump — callers hold it across `&mut self` calls for free.
+    fn index_for(&mut self, canonical_root: &CanonicalPath) -> Rc<RepoIndex> {
         if !self.indices.contains_key(canonical_root) {
             let project_ignore = load_project_ignore(canonical_root.as_ref()).unwrap_or_default();
             let mut excl = self.options.extra_excludes.clone();
@@ -356,9 +360,9 @@ impl<'c> CrawlState<'c> {
                 self.options.include_all_extensions,
                 self.options.use_walk_cache,
             );
-            self.indices.insert(canonical_root.clone(), idx);
+            self.indices.insert(canonical_root.clone(), Rc::new(idx));
         }
-        self.indices.get(canonical_root).unwrap()
+        Rc::clone(self.indices.get(canonical_root).unwrap())
     }
 
     fn headings_for(&mut self, canonical: &CanonicalPath) -> BTreeSet<String> {
@@ -404,7 +408,7 @@ impl<'c> CrawlState<'c> {
     /// repo, and silent on every miss — a span with no file match (or an ambiguous basename)
     /// is prose, not a broken link. Real matches get style/anchor checks and reachability.
     fn resolve_inline(&mut self, link: &Link, source: &BfsQueueItem) {
-        let current = self.index_for(&source.repo_root).clone();
+        let current = self.index_for(&source.repo_root);
         let root = current.root.as_str();
         let raw_combined = format!("{}/{}", root, link.target);
         let (normalized, escaped) = fold_segments(&raw_combined, true);
@@ -452,7 +456,7 @@ impl<'c> CrawlState<'c> {
             }
             return;
         }
-        let current = self.index_for(&source.repo_root).clone();
+        let current = self.index_for(&source.repo_root);
         let Some(resolved) = resolve_link(&link.target, source.path.as_str(), current.root.as_str())
         else {
             return;
@@ -529,7 +533,7 @@ impl<'c> CrawlState<'c> {
         } else {
             None
         };
-        let repo_index = self.index_for(&repo_root).clone();
+        let repo_index = self.index_for(&repo_root);
 
         if canonical.is_none() && is_md {
             match basename_fallback(&link.target, &repo_index.by_name) {
