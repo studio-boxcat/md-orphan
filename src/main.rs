@@ -47,7 +47,7 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
-    /// Index every file extension so non-.md refs ([[foo.cs]], `src/foo.cs`) get style and
+    /// Index every file extension so non-.md wiki refs ([[foo.cs]]) get style and
     /// basename resolution (~30x walk cost on large repos)
     #[arg(long)]
     all_extensions: bool,
@@ -107,7 +107,7 @@ fn run(cli: Cli) -> Result<bool> {
         .unwrap_or_else(default_config_path);
     let mut global_config = load_global_config(&config_path).with_context(|| "loading global config")?;
     // Treat configured-but-not-cloned repos as if they weren't configured at all — refs to them
-    // become inline-code annotations rather than spurious broken-link errors.
+    // are dropped as plain inline code rather than raising spurious broken-link errors.
     global_config.retain_existing();
 
     let root = dir_name(&resolved_entries[0]).to_string();
@@ -328,7 +328,6 @@ fn render_style(link: &str, suggested: &str, scope: &StyleScope) -> (String, Str
             format!("`{link}` ({repo})"),
             format!("`{suggested}` ({repo})"),
         ),
-        StyleScope::Inline => (format!("`{link}`"), format!("`{suggested}`")),
     }
 }
 

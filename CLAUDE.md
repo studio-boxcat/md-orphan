@@ -39,27 +39,24 @@ The root directory is the parent of the entry point. All `.md` files under that 
 | `--config <path>` | Override global config (default `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`) |
 | `--no-default-excludes` | Disable built-in defaults (`.git`, `node_modules`, `Library`, `.build`, ...) |
 | `--no-cache` | Disable both the walk-result cache and the per-file extraction cache |
-| `--all-extensions` | Index every extension so non-`.md` refs (`[[foo.cs]]`, `` `src/foo.cs` ``) get style + basename resolution (~30× walk cost on Unity-scale repos) |
+| `--all-extensions` | Index every extension so non-`.md` wiki refs (`[[foo.cs]]`) get style + basename resolution (~30× walk cost on Unity-scale repos) |
 | `--orient` | Print md-orphan's own `CLAUDE.md` (usage guide for this tool) |
 
 ## Link styles
 
-The tool recognizes four link forms in markdown. Style violations are flagged when a link could be expressed in a more canonical form, where canonical = **bare basename** when the basename is unique within its target repo, or **root-relative path** when not.
+The tool recognizes three link forms in markdown. Style violations are flagged when a link could be expressed in a more canonical form, where canonical = **bare basename** when the basename is unique within its target repo, or **root-relative path** when not.
 
 | Form | Example | Style-checked? |
 |---|---|---|
 | Wiki | `[[guide.md]]`, `[[guide.md#sec\|alias]]`, `[[#section]]` | yes (any extension) |
 | Standard md link | `[text](path.md)` | broken/ambiguous/anchor only — no style rewrite |
 | Cross-repo backtick | `` `bar.md` (meow-toolbox) ``, `` `bar.md#sec` (repo) `` | yes |
-| Inline code | `` `path.ext` `` (no repo suffix) | yes — only when the span matches a real file |
 
 Standard md links (`[text](path)`) get broken-link / ambiguity / anchor checks, but are **not** rewritten — most renderers (GitHub, etc.) interpret them as filesystem-relative, so basename-magic would silently break them.
 
-**Cross-repo annotation filter:** the `` `path.ext` (name) `` syntax is only treated as a cross-repo ref when `name` matches a configured repo. Patterns like `` `view.name` (GridView) ``, `` `Unity.Analytics` (Runtime) ``, `` `UISortingOrder.Activity` (10) `` are silently treated as inline-code annotations. Trade-off: typos to a known-repo name are caught at file-resolution (`CrossRepoBroken`); typos to a wrong-repo name are silent.
+**Cross-repo annotation filter:** the `` `path.ext` (name) `` syntax is only treated as a cross-repo ref when `name` matches a configured repo. Patterns like `` `view.name` (GridView) ``, `` `Unity.Analytics` (Runtime) ``, `` `UISortingOrder.Activity` (10) `` are silently treated as plain inline code. A plain backtick span without a `(repo)` suffix is never a link — it's prose, regardless of how path-like it looks. Trade-off: typos to a known-repo name are caught at file-resolution (`CrossRepoBroken`); typos to a wrong-repo name are silent.
 
-**Inline code spans:** a plain `` `path.ext` `` span is treated as a same-repo reference *only when it resolves to a real file* — no match (or an ambiguous basename) means it's prose, never an error. Parser-level guards drop commands (`git status`), globs (`*.md`), placeholders (`services/<name>.md`), env refs, and extension-less names before resolution. A real match gets the style check (canonical = bare basename / root-relative, same as wiki), anchor validation on `#fragments`, and counts toward reachability.
-
-**Anchor fragments:** wiki, cross-repo, and inline-code fragments accept either the kebab-case slug (`#content-type`) or the raw heading text (`#Content Type` — Obsidian convention); raw text is slugified before lookup. Standard md link fragments must be the exact slug — renderers resolve them as real URL fragments, where raw text 404s.
+**Anchor fragments:** wiki and cross-repo fragments accept either the kebab-case slug (`#content-type`) or the raw heading text (`#Content Type` — Obsidian convention); raw text is slugified before lookup. Standard md link fragments must be the exact slug — renderers resolve them as real URL fragments, where raw text 404s.
 
 **Self-anchor links:** a wiki link with an empty path and a fragment (`[[#section]]`, `[[#section|alias]]`) targets the *current* file. The fragment is validated against the source file's own headings (broken → `BrokenAnchor`); there's no path to resolve, style-check, or rewrite. The standard-link equivalent `[text](#section)` is **not** checked — it has no extension, so it's dropped at the parser like any other extensionless link.
 
@@ -100,7 +97,7 @@ Cross-repo refs `` `path.ext` (repo-name) `` are resolved by looking up the repo
 
 `$VAR` / `${VAR}` and a leading `~/` (or `~user/`) are expanded against the environment. Default location: `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`, falling back to `~/.config/md-orphan/md-orphan.json`. Override with `--config <path>`.
 
-Failure modes (all exit 1): file doesn't exist in target repo, style violation, broken anchor. A `` `…` (name) `` whose name isn't in the config is treated as an inline-code annotation, not a cross-repo ref — see the parser filter note in [Link styles](#link-styles).
+Failure modes (all exit 1): file doesn't exist in target repo, style violation, broken anchor. A `` `…` (name) `` whose name isn't in the config is treated as plain inline code, not a cross-repo ref — see the parser filter note in [Link styles](#link-styles).
 
 The crawl visits each cross-repo target file the entry repo *directly* references — to verify the file exists and its anchors resolve — but **does not recurse** into the cross-repo file's own outgoing links. Cross-repo internal rot is the responsibility of that repo's own md-orphan run, not yours. Orphan detection is also scoped to the entry repo only.
 

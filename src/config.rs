@@ -39,7 +39,7 @@ pub struct GlobalConfig {
 impl GlobalConfig {
     /// Drop entries whose path isn't a directory on this machine. Cross-repo refs to a
     /// configured-but-not-cloned repo would otherwise become spurious "broken" errors;
-    /// after retain, the parser drops them as inline-code annotations.
+    /// after retain, the parser drops them as plain inline code.
     pub fn retain_existing(&mut self) {
         self.repos.retain(|_, path| Path::new(path).is_dir());
     }

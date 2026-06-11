@@ -31,16 +31,14 @@ pub enum LinkKind {
     Wiki,
     Standard,
     CrossRepo { repo: String },
-    /// Plain inline code `` `path.ext` `` (no `(repo)` suffix) that looks path-like.
-    /// Resolved against the *current* repo; a span with no file match is prose, not an error.
-    Inline,
 }
 
 // MARK: - Link extraction
 
 /// Scan raw UTF-8 bytes for markdown links. `repos` filters cross-repo backtick refs:
 /// only `` `path` (name) `` whose `name` is in the set is emitted as `LinkKind::CrossRepo`;
-/// non-matching annotations (e.g. `(GridView)`, `(Runtime)`, `(10)`) are treated as inline code.
+/// non-matching annotations (e.g. `(GridView)`, `(Runtime)`, `(10)`) are ignored as plain
+/// inline code.
 pub fn extract_links(buf: &[u8], repos: &HashSet<String>) -> Vec<Link> {
     if buf.len() <= 4 {
         return Vec::new();
@@ -258,7 +256,6 @@ fn scan_backtick_ref(
     }
     let after_close = end + 1;
     if !(after_close + 2 < count && buf[after_close] == b' ' && buf[after_close + 1] == b'(') {
-        emit_inline_if_pathlike(buf, path_start, end, links);
         return after_close;
     }
     let repo_start = after_close + 2;
@@ -269,21 +266,18 @@ fn scan_backtick_ref(
             break;
         }
         if !(rb.is_ascii_alphanumeric() || rb == b'_' || rb == b'-') {
-            emit_inline_if_pathlike(buf, path_start, end, links);
             return after_close;
         }
         repo_end += 1;
     }
     if !(repo_end < count && buf[repo_end] == b')' && repo_end > repo_start) {
-        emit_inline_if_pathlike(buf, path_start, end, links);
         return after_close;
     }
     // Repo-name bytes are validated ASCII alnum/_/- above, so str::from_utf8 is infallible.
     // `contains` accepts a `&str`, so we avoid allocating a `String` for inline-code annotations.
     let repo_str = std::str::from_utf8(&buf[repo_start..repo_end]).unwrap();
     if !repos.contains(repo_str) {
-        // `(name)` is a non-repo annotation; the span itself may still name a local file.
-        emit_inline_if_pathlike(buf, path_start, end, links);
+        // `(name)` is a non-repo annotation — plain inline code, not a link.
         return repo_end + 1;
     }
     let mut hash_pos: Option<usize> = None;
@@ -306,46 +300,6 @@ fn scan_backtick_ref(
         path_end: name_end,
     });
     repo_end + 1
-}
-
-/// Emit `LinkKind::Inline` when a plain backtick span plausibly names a repo file.
-/// False-positive guards — prose/commands/globs/placeholders are dropped at the parser:
-/// whitespace (`git status`), shell/template metachars (`*.md`, `services/<name>.md`,
-/// `$VAR/x.md`), quotes/backslashes, `./`/`../`/`/` prefixes (never canonical style), and
-/// spans whose path part carries no extension (`CatType`, `docs/internal`).
-/// Whether the span actually names a file is decided at resolve time — no match = prose.
-// Index loop is deliberate: tracks the `#` byte offset for fragment splitting (see scan_wiki_link).
-#[allow(clippy::needless_range_loop)]
-fn emit_inline_if_pathlike(buf: &[u8], path_start: usize, end: usize, links: &mut Vec<Link>) {
-    let mut hash_pos: Option<usize> = None;
-    for j in path_start..end {
-        match buf[j] {
-            // Guards apply to the path part only — fragment bytes are heading text
-            // (raw form may contain spaces), validated later at the anchor check.
-            b'#' => {
-                hash_pos = Some(j);
-                break;
-            }
-            b' ' | b'\t' | b'*' | b'?' | b'$' | b'|' | b'<' | b'>' | b'{' | b'}' | b'"'
-            | b'\'' | b'\\' | b'=' => return,
-            _ => {}
-        }
-    }
-    let name_end = hash_pos.unwrap_or(end);
-    let path = &buf[path_start..name_end];
-    if path.starts_with(b"./") || path.starts_with(b"../") || path.starts_with(b"/") {
-        return;
-    }
-    if !has_extension(buf, path_start, path.len()) {
-        return;
-    }
-    links.push(Link {
-        kind: LinkKind::Inline,
-        target: decode_utf8(buf, path_start, path.len()),
-        fragment: parse_fragment(buf, hash_pos, end),
-        path_start,
-        path_end: name_end,
-    });
 }
 
 /// Constraints on a cross-repo backtick path. Annotations like `foo bar.md`,
@@ -472,25 +426,18 @@ mod tests {
 
     #[test]
     fn cross_repo_filtered_when_name_is_unknown() {
-        // `view.name` (GridView) — annotation, not a cross-repo ref. The span itself is
-        // path-shaped, so it demotes to Inline (resolution drops it when no file matches).
-        let links = cross_repo_links("`view.name` (GridView)", &["meow-tower"]);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].kind, LinkKind::Inline);
-        assert_eq!(links[0].target, "view.name");
+        // `view.name` (GridView) — annotation, not a cross-repo ref. Plain inline code; no link.
+        assert!(cross_repo_links("`view.name` (GridView)", &["meow-tower"]).is_empty());
     }
 
     #[test]
     fn cross_repo_filtered_for_numeric_annotation() {
-        let links = cross_repo_links("`UISortingOrder.Activity` (10)", &["meow-tower"]);
-        assert!(links.iter().all(|l| l.kind == LinkKind::Inline));
+        assert!(cross_repo_links("`UISortingOrder.Activity` (10)", &["meow-tower"]).is_empty());
     }
 
     #[test]
     fn cross_repo_filtered_when_repo_set_is_empty() {
-        let links = cross_repo_links("`foo.md` (meow-tower)", &[]);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].kind, LinkKind::Inline);
+        assert!(cross_repo_links("`foo.md` (meow-tower)", &[]).is_empty());
     }
 
     #[test]
@@ -501,66 +448,15 @@ mod tests {
             &["meow-tower"],
         );
         let targets: Vec<_> = links.iter().map(|l| l.target.clone()).collect();
-        assert_eq!(targets, vec!["view.name", "guide.md"]);
-        assert_eq!(links[0].kind, LinkKind::Inline);
-        assert_eq!(links[1].kind, LinkKind::Wiki);
-    }
-
-    // -- inline code spans --
-
-    #[test]
-    fn inline_emitted_for_pathlike_span() {
-        let links = cross_repo_links("see `foo.md` here", &[]);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].kind, LinkKind::Inline);
-        assert_eq!(links[0].target, "foo.md");
-        assert_eq!(links[0].fragment, None);
+        assert_eq!(targets, vec!["guide.md"]);
+        assert_eq!(links[0].kind, LinkKind::Wiki);
     }
 
     #[test]
-    fn inline_with_fragment() {
-        let links = cross_repo_links("see `docs/foo.md#sec`", &[]);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].target, "docs/foo.md");
-        assert_eq!(links[0].fragment.as_deref(), Some("sec"));
-    }
-
-    #[test]
-    fn inline_raw_text_fragment_with_spaces() {
-        // Guards stop at `#` — raw heading text in the fragment is legal.
-        let links = cross_repo_links("see `guide.md#Some Section`", &[]);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].kind, LinkKind::Inline);
-        assert_eq!(links[0].target, "guide.md");
-        assert_eq!(links[0].fragment.as_deref(), Some("Some Section"));
-    }
-
-    #[test]
-    fn inline_path_part_guards_still_apply_before_fragment() {
-        // Metachars/whitespace in the PATH part still reject the span.
-        assert!(cross_repo_links("`gui de.md#x`", &[]).is_empty());
-        assert!(cross_repo_links("`*.md#x`", &[]).is_empty());
-    }
-
-    #[test]
-    fn inline_guards_drop_prose_commands_globs_placeholders() {
-        for s in [
-            "`git status`",          // whitespace
-            "`*.md`",                // glob
-            "`services/<name>.md`",  // placeholder
-            "`$VAR/x.md`",           // env ref
-            "`CatType`",             // no extension
-            "`docs/internal`",       // no extension on final segment
-            "`./foo.md`",            // relative prefix — never canonical style
-            "`../foo.md`",
-            "`/abs/foo.md`",         // absolute system path
-            "`KEY=value.txt`",       // assignment
-        ] {
-            assert!(
-                cross_repo_links(s, &[]).is_empty(),
-                "expected no links for {s}"
-            );
-        }
+    fn plain_backtick_span_is_not_a_link() {
+        // `path.ext` with no `(repo)` suffix is prose — never a link, even when path-shaped.
+        assert!(cross_repo_links("see `foo.md` here", &[]).is_empty());
+        assert!(cross_repo_links("see `docs/foo.md#sec`", &[]).is_empty());
     }
 
     // -- path-shape constraints (only enforced when name is a configured repo) --

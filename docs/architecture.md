@@ -110,11 +110,11 @@ Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canon
 | Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
 | Per-repo walk-cache | `$XDG_CONFIG_HOME/md-orphan/walk-cache/<fnv1a64-of-canonical-root>.json` | persisted `RepoIndex` + per-dir mtime map |
 
-**Per-file cache schema** (`schema_version: 6`, defined in `cache.rs`):
+**Per-file cache schema** (`schema_version: 7`, defined in `cache.rs`):
 
 ```json
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "display_name": "md-orphan",
   "repo_set_hash": 12345678901234567890,
   "entries": {
@@ -134,6 +134,7 @@ Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache vali
 - 3→4 added `repo_set_hash` to track repo-set changes
 - 4→5 scanner emits `LinkKind::Inline` for plain backtick spans (v4 entries lack them)
 - 5→6 inline-span guards stop at `#` — raw-text fragments with spaces now emitted
+- 6→7 `LinkKind::Inline` removed (feature reverted) — plain backtick spans are no longer links
 
 **Walk-cache schema** (`WALK_CACHE_SCHEMA_VERSION: 1`, defined at `walk_cache.rs`):
 
