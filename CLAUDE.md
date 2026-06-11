@@ -50,11 +50,13 @@ The tool recognizes four link forms in markdown. Style violations are flagged wh
 | Wiki | `[[guide.md]]`, `[[guide.md#sec\|alias]]`, `[[#section]]` | yes (any extension) |
 | Standard md link | `[text](path.md)` | broken/ambiguous/anchor only — no style rewrite |
 | Cross-repo backtick | `` `bar.md` (meow-toolbox) ``, `` `bar.md#sec` (repo) `` | yes |
-| Inline code | `` `path.ext` `` (no repo suffix) | deferred — see [[TODO.md]] |
+| Inline code | `` `path.ext` `` (no repo suffix) | yes — only when the span matches a real file |
 
 Standard md links (`[text](path)`) get broken-link / ambiguity / anchor checks, but are **not** rewritten — most renderers (GitHub, etc.) interpret them as filesystem-relative, so basename-magic would silently break them.
 
 **Cross-repo annotation filter:** the `` `path.ext` (name) `` syntax is only treated as a cross-repo ref when `name` matches a configured repo. Patterns like `` `view.name` (GridView) ``, `` `Unity.Analytics` (Runtime) ``, `` `UISortingOrder.Activity` (10) `` are silently treated as inline-code annotations. Trade-off: typos to a known-repo name are caught at file-resolution (`CrossRepoBroken`); typos to a wrong-repo name are silent.
+
+**Inline code spans:** a plain `` `path.ext` `` span is treated as a same-repo reference *only when it resolves to a real file* — no match (or an ambiguous basename) means it's prose, never an error. Parser-level guards drop commands (`git status`), globs (`*.md`), placeholders (`services/<name>.md`), env refs, and extension-less names before resolution. A real match gets the style check (canonical = bare basename / root-relative, same as wiki), anchor validation on `#fragments`, and counts toward reachability.
 
 **Anchor fragments:** wiki and cross-repo fragments accept either the kebab-case slug (`#content-type`) or the raw heading text (`#Content Type` — Obsidian convention); raw text is slugified before lookup. Standard md link fragments must be the exact slug — renderers resolve them as real URL fragments, where raw text 404s.
 

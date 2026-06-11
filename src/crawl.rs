@@ -20,6 +20,7 @@ use std::sync::Mutex;
 pub enum StyleScope {
     Wiki,
     CrossRepo { repo: String },
+    Inline,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,7 +385,51 @@ impl<'c> CrawlState<'c> {
                 let repo = repo.clone();
                 self.resolve_cross_repo(link, source, &repo);
             }
+            LinkKind::Inline => self.resolve_inline(link, source),
         }
+    }
+
+    /// Inline code `` `path.ext` ``: resolved like a cross-repo ref but against the *current*
+    /// repo, and silent on every miss — a span with no file match (or an ambiguous basename)
+    /// is prose, not a broken link. Real matches get style/anchor checks and reachability.
+    fn resolve_inline(&mut self, link: &Link, source: &BfsQueueItem) {
+        let current = self.index_for(&source.repo_root).clone();
+        let root = current.root.as_str();
+        let raw_combined = format!("{}/{}", root, link.target);
+        let (normalized, escaped) = fold_segments(&raw_combined, true);
+        let mut canonical = if !escaped && is_under(&normalized, root) {
+            canonicalize_str(&normalized)
+        } else {
+            None
+        };
+        if canonical.is_none()
+            && let Ok(resolved) = basename_fallback(&link.target, &current.by_name)
+        {
+            canonical = resolved;
+        }
+        let Some(canonical) = canonical else {
+            return; // prose mention or ambiguous basename — stay silent
+        };
+        if is_under(canonical.as_str(), root) {
+            self.emit_style_if_needed(
+                link,
+                &source.path,
+                &canonical,
+                &current.root,
+                &current.by_name,
+                StyleScope::Inline,
+            );
+        }
+        if !link.target.ends_with(".md") {
+            return;
+        }
+        if let Some(fragment) = &link.fragment {
+            self.validate_fragment(link, &source.path, &canonical, fragment);
+        }
+        let owning_root = self
+            .repo_root_containing(canonical.as_str())
+            .unwrap_or_else(|| current.root.clone());
+        self.enqueue_resolved(canonical, owning_root);
     }
 
     fn resolve_same_repo(&mut self, link: &Link, source: &BfsQueueItem) {
@@ -892,6 +937,73 @@ mod tests {
         if let IssueKind::BrokenAnchor(frag) = &anchors[0].kind {
             assert_eq!(frag, "Existing Section");
         }
+    }
+
+    #[test]
+    fn inline_mention_without_match_is_silent() {
+        // Prose mentions of nonexistent or non-indexed files are not errors.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "see `nope.md` and `Foo.cs` and `view.name`");
+        let (_, issues) = crawl(&canonical, "index.md");
+        assert!(issues.is_empty(), "expected silence, got: {:?}", issues);
+    }
+
+    #[test]
+    fn inline_ambiguous_basename_is_silent() {
+        // Two guide.md files — can't know which one a prose mention means; stay silent.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "see `guide.md`");
+        write(&canonical.join("a/guide.md"), "");
+        write(&canonical.join("b/guide.md"), "");
+        let (_, issues) = crawl(&canonical, "index.md");
+        assert!(issues.is_empty(), "expected silence, got: {:?}", issues);
+    }
+
+    #[test]
+    fn inline_marks_target_reachable() {
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "see `other.md`");
+        write(&canonical.join("other.md"), "hello");
+        let (reachable, issues) = crawl(&canonical, "index.md");
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+        assert_eq!(reachable.len(), 2);
+    }
+
+    #[test]
+    fn inline_anchor_checked_on_real_match() {
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "see `other.md#missing`");
+        write(&canonical.join("other.md"), "# Real Section");
+        let (_, issues) = crawl(&canonical, "index.md");
+        assert_eq!(issues.len(), 1, "expected 1 BrokenAnchor, got: {:?}", issues);
+        assert!(matches!(issues[0].kind, IssueKind::BrokenAnchor(_)));
+    }
+
+    #[test]
+    fn inline_noncanonical_path_flagged_and_fixed() {
+        // `docs/guide.md` with a unique basename → canonical form is `guide.md`.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "see `docs/guide.md` here");
+        write(&canonical.join("docs/guide.md"), "");
+        let (_, issues) = crawl(&canonical, "index.md");
+        let style: Vec<&LinkIssue> = issues
+            .iter()
+            .filter(|i| matches!(i.kind, IssueKind::Style { .. }))
+            .collect();
+        assert_eq!(style.len(), 1, "expected 1 Style, got: {:?}", issues);
+        if let IssueKind::Style { suggested, scope, .. } = &style[0].kind {
+            assert_eq!(suggested, "guide.md");
+            assert_eq!(*scope, StyleScope::Inline);
+        }
+        let owned: Vec<LinkIssue> = style.into_iter().cloned().collect();
+        assert_eq!(apply_style_fixes(&owned), 0);
+        let rewritten = fs::read_to_string(canonical.join("index.md")).unwrap();
+        assert_eq!(rewritten, "see `guide.md` here");
     }
 
     #[test]

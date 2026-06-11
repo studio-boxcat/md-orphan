@@ -298,6 +298,7 @@ fn render_style(link: &str, suggested: &str, scope: &StyleScope) -> (String, Str
             format!("`{link}` ({repo})"),
             format!("`{suggested}` ({repo})"),
         ),
+        StyleScope::Inline => (format!("`{link}`"), format!("`{suggested}`")),
     }
 }
 

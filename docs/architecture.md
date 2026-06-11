@@ -110,11 +110,11 @@ Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canon
 | Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
 | Per-repo walk-cache | `$XDG_CONFIG_HOME/md-orphan/walk-cache/<fnv1a64-of-canonical-root>.json` | persisted `RepoIndex` + per-dir mtime map |
 
-**Per-file cache schema** (`schema_version: 4`, defined at `cache.rs:21`):
+**Per-file cache schema** (`schema_version: 5`, defined in `cache.rs`):
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "display_name": "md-orphan",
   "repo_set_hash": 12345678901234567890,
   "entries": {
@@ -132,6 +132,7 @@ Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canon
 Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache validation: `repo_set_hash` matches the active configured repo set (cross-repo refs are filtered against that set at extract time, so cached entries become unsafe when the set changes). Schema mismatch on either → silent invalidate. Bumps:
 - 2→3 during the Rust port (serde tagged-enum shape diverged from Swift Codable)
 - 3→4 added `repo_set_hash` to track repo-set changes
+- 4→5 scanner emits `LinkKind::Inline` for plain backtick spans (v4 entries lack them)
 
 **Walk-cache schema** (`WALK_CACHE_SCHEMA_VERSION: 1`, defined at `walk_cache.rs`):
 

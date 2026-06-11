@@ -17,7 +17,8 @@ use std::time::SystemTime;
 ///
 /// 4: added `repo_set_hash` so cross-repo backtick refs are filtered against the active
 ///    repo set; cached `LinkKind::CrossRepo` entries from v3 may have ghost repos.
-pub const CACHE_SCHEMA_VERSION: u32 = 4;
+/// 5: scanner emits `LinkKind::Inline` for plain backtick spans; v4 entries lack them.
+pub const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// One cache file per repo at `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -437,10 +438,12 @@ mod tests {
         assert_eq!(first.links.len(), 1);
         cache_a.save();
 
-        // Second run with empty repo set: cached v4 entry has different repo_set_hash → load
-        // returns a fresh empty cache → re-extract with empty set → annotation is filtered out.
+        // Second run with empty repo set: cached entry has different repo_set_hash → load
+        // returns a fresh empty cache → re-extract with empty set → the ref demotes from
+        // CrossRepo to a plain Inline span.
         let mut cache_b = ExtractionCache::new(true, HashSet::new());
         let second = cache_b.read(&path, &canon).unwrap();
-        assert!(second.links.is_empty(), "expected re-extract with empty repo set, got {:?}", second.links);
+        assert_eq!(second.links.len(), 1, "expected re-extract, got {:?}", second.links);
+        assert_eq!(second.links[0].kind, crate::extract::LinkKind::Inline);
     }
 }

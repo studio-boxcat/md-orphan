@@ -2,15 +2,6 @@
 
 ## Deferred follow-ups
 
-### Inline-code style check
-Detect `` `path.ext` `` (no `(repo)` suffix) inline code spans and apply the same canonical-form rule as wiki links. **FP guards required**:
-- Skip if backtick span contains shell metachars (`*`, `?`, `$`, `|`, `<`, `>`)
-- Skip if backtick span contains whitespace (commands like `` `git status` ``)
-- Skip if no extension AND no `/`
-- Resolve target via repo basename map; only flag when there's a real file match
-
-The fenced-code skipper is already in place, so this can be added to `scan_backtick_ref` without parser-level changes.
-
 ### Non-`.md` style support
 `index_repo` only puts `.md` files into `by_name` by default — populating it for all extensions in a Unity-sized repo (~100k files) costs ~800ms vs ~30ms. Wiki/cross-repo style for `.cs`, `.swift`, etc. currently goes unchecked.
 
