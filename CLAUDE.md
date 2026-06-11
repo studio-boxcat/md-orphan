@@ -98,7 +98,7 @@ Cross-repo refs `` `path.ext` (repo-name) `` are resolved by looking up the repo
 }
 ```
 
-`$VAR` / `${VAR}` and a leading `~/` are expanded against the environment. Default location: `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`, falling back to `~/.config/md-orphan/md-orphan.json`. Override with `--config <path>`.
+`$VAR` / `${VAR}` and a leading `~/` (or `~user/`) are expanded against the environment. Default location: `$XDG_CONFIG_HOME/md-orphan/md-orphan.json`, falling back to `~/.config/md-orphan/md-orphan.json`. Override with `--config <path>`.
 
 Failure modes (all exit 1): file doesn't exist in target repo, style violation, broken anchor. A `` `…` (name) `` whose name isn't in the config is treated as an inline-code annotation, not a cross-repo ref — see the parser filter note in [Link styles](#link-styles).
 

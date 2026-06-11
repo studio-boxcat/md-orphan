@@ -8,9 +8,6 @@ The current prefetch only catches first-level cross-repo refs in the seeded entr
 ### Concurrent invocation safety
 Cache writes are last-writer-wins. If users start running two `md-orphan` invocations against the same repo simultaneously (e.g. editor save hooks + lefthook), consider `flock(2)` on the cache file. So far accepted as last-writer-wins because cache is regenerable.
 
-### XDG nit
-`expand_path` understands `$VAR` and leading `~/`. It does not currently expand `~user/` (other-user homes). Nobody asked, but worth mentioning.
-
 ### Walk-cache: non-UTF-8 path lossy comparison
 `walk_cache.rs` compares `cache.canonical_root` against `canonical_root.to_string_lossy()` (`try_load_walk_cache`) and hashes via the lossy form for the cache filename. Two distinct paths with non-UTF-8 bytes could lossy-collide, returning a wrong-repo cache. Not a hazard for current users (macOS APFS is UTF-8; Linux dev paths typically are too). Fix would be to hash raw `OsStr` bytes via `as_encoded_bytes()` and reject non-UTF-8 paths from the equality check, or store both. Defer.
 

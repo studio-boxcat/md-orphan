@@ -21,6 +21,12 @@ pub enum ConfigError {
     },
     #[error("repo '{name}' path '{raw}': unclosed `${{` brace expansion")]
     UnclosedBrace { name: String, raw: String },
+    #[error("repo '{name}' path '{raw}': unknown user in `~{user}/` expansion")]
+    UnknownUser {
+        name: String,
+        raw: String,
+        user: String,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -57,6 +63,20 @@ pub(crate) fn xdg_config_home() -> String {
 /// User home directory. `$HOME` first, fall back to `dirs::home_dir`-equivalent via passwd.
 pub(crate) fn home_dir() -> String {
     env::var("HOME").unwrap_or_default()
+}
+
+/// Another user's home directory via `getpwnam(3)`. `None` for unknown users.
+fn user_home_dir(user: &str) -> Option<String> {
+    let c = std::ffi::CString::new(user).ok()?;
+    // SAFETY: getpwnam returns a pointer into static storage; config loading is
+    // single-threaded and the result is copied out before any other passwd call.
+    unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned())
+    }
 }
 
 /// Load the global config. Returns empty config if path doesn't exist (cross-repo features
@@ -119,13 +139,25 @@ fn strings_only(
     Ok(out)
 }
 
-/// Expand leading `~/` and any `$VAR` / `${VAR}` references. Throws if a referenced env var
-/// is undefined.
+/// Expand leading `~/` (or `~user/`) and any `$VAR` / `${VAR}` references. Throws if a
+/// referenced env var or user is undefined.
 pub fn expand_path(raw: &str, repo_name: &str) -> Result<String, ConfigError> {
     let s = if raw == "~" {
         home_dir()
     } else if let Some(rest) = raw.strip_prefix("~/") {
         format!("{}/{}", home_dir(), rest)
+    } else if let Some(after) = raw.strip_prefix('~') {
+        // `~user` / `~user/rest` — other-user home via getpwnam(3).
+        let (user, rest) = match after.find('/') {
+            Some(i) => (&after[..i], &after[i..]),
+            None => (after, ""),
+        };
+        let home = user_home_dir(user).ok_or_else(|| ConfigError::UnknownUser {
+            name: repo_name.to_string(),
+            raw: raw.to_string(),
+            user: user.to_string(),
+        })?;
+        format!("{home}{rest}")
     } else {
         raw.to_string()
     };
@@ -255,6 +287,24 @@ mod tests {
         let r = expand_path("${MD_ORPHAN_RT_X/sub", "r");
         assert!(matches!(r, Err(ConfigError::UnclosedBrace { .. })));
         unsafe { env::remove_var("MD_ORPHAN_RT_X"); }
+    }
+
+    #[test]
+    fn expand_path_tilde_user() {
+        // `~<current user>/x` must expand to the same home as `~/x` (pw_dir == $HOME in any
+        // non-exotic setup). Skip when $USER is unavailable.
+        let Ok(user) = env::var("USER") else { return };
+        let expanded = expand_path(&format!("~{user}/x"), "r").unwrap();
+        assert_eq!(expanded, format!("{}/x", home_dir()));
+        // Bare `~user` without a trailing path expands to the home itself.
+        let bare = expand_path(&format!("~{user}"), "r").unwrap();
+        assert_eq!(bare, home_dir());
+    }
+
+    #[test]
+    fn expand_path_unknown_user_throws() {
+        let r = expand_path("~no_such_user_zzz/x", "r");
+        assert!(matches!(r, Err(ConfigError::UnknownUser { .. })), "got: {r:?}");
     }
 
     #[test]
