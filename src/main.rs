@@ -189,12 +189,18 @@ no extras."
         v
     };
 
-    let names = cli
-        .entry_points
-        .iter()
-        .map(|p| base_name(p).to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Dedup basenames: globbed entries like `crates/*/CLAUDE.md` would otherwise
+    // render as "CLAUDE.md, CLAUDE.md, ..." nineteen times over.
+    let names = {
+        let mut seen = Vec::new();
+        for p in &cli.entry_points {
+            let name = base_name(p);
+            if !seen.iter().any(|s| s == name) {
+                seen.push(name.to_string());
+            }
+        }
+        seen.join(", ")
+    };
 
     let failed = render_issues(&issues, &orphans, &root, &names, cli.fix);
     if !failed && cli.verbose {

@@ -435,6 +435,13 @@ impl<'c> CrawlState<'c> {
         let is_md = link.target.ends_with(".md");
         let mut canonical = canonicalize_str(&resolved);
 
+        // Wiki paths also resolve against the repo root (Obsidian semantics). Must run before
+        // the basename fallback: the style rewriter's canonical form for duplicated basenames
+        // is root-relative ([[docs/a/dup.md]]), which would otherwise die there as Ambiguous.
+        if canonical.is_none() && matches!(link.kind, LinkKind::Wiki) {
+            canonical = resolve_under_root(&link.target, current.root.as_str());
+        }
+
         // Basename fallback for .md links — and for any extension when by_name indexes all.
         if canonical.is_none() && (is_md || self.options.include_all_extensions) {
             match basename_fallback(&link.target, &current.by_name) {
@@ -818,6 +825,21 @@ mod tests {
         if let IssueKind::Ambiguous(n) = ambig[0].kind {
             assert_eq!(n, 2);
         }
+    }
+
+    #[test]
+    fn wiki_root_relative_with_duplicated_basename() {
+        // The style rewriter's canonical form for duplicated basenames is root-relative;
+        // from a nested source it must resolve against the root, not die as Ambiguous.
+        let dir = TempDir::new().unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        write(&canonical.join("index.md"), "[[hub.md]]");
+        write(&canonical.join("docs/a/hub.md"), "[[docs/b/dup.md]]");
+        write(&canonical.join("docs/a/dup.md"), "");
+        write(&canonical.join("docs/b/dup.md"), "");
+        let (reachable, issues) = crawl(&canonical, "index.md");
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+        assert_eq!(reachable.len(), 3); // index, hub, docs/b/dup — docs/a/dup stays unreached
     }
 
     #[test]
