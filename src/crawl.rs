@@ -4,8 +4,8 @@
 //! by canonical absolute path. Cross-repo discovery is parallelized via `std::thread::scope`.
 
 use crate::cache::ExtractionCache;
-use crate::config::load_project_ignore;
-use crate::discovery::{index_repo, RepoIndex};
+use crate::config::project_ignore_or_warn;
+use crate::discovery::{index_repo, RepoIndex, WalkOptions, WalkedPath};
 use crate::extract::{anchor_id, Link, LinkKind};
 use crate::path::{
     atomic_write_bytes, base_name, canonicalize_str, dir_name, is_under, rel_path,
@@ -40,6 +40,17 @@ pub enum IssueKind {
     Unreadable,
 }
 
+impl IssueKind {
+    /// Style-issue sort key: `path_start` for `Style`, 0 for everything else. Shared by the
+    /// `--fix` byte rewriter (descending order) and `main.rs` rendering (ascending order).
+    pub fn style_path_start(&self) -> usize {
+        match self {
+            IssueKind::Style { path_start, .. } => *path_start,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkIssue {
     pub link: String,
@@ -47,8 +58,9 @@ pub struct LinkIssue {
     pub kind: IssueKind,
 }
 
-// No `Default` derive: it would yield `use_default_excludes: false, use_walk_cache: false`,
-// silently contradicting `new()`'s documented defaults. All construction goes through `new()`.
+// No `Default` derive: it would yield `use_default_excludes: false, use_walk_cache: false` —
+// "everything disabled", silently contradicting the real defaults (both true). Production
+// (main.rs) builds the struct literally from CLI flags; tests use the test-only `new()` below.
 #[derive(Debug, Clone)]
 pub struct CrawlOptions {
     /// repo-name → absolute root (env-expanded; will be realpath'd internally).
@@ -64,14 +76,27 @@ pub struct CrawlOptions {
 }
 
 impl CrawlOptions {
-    // See the struct comment — a Default impl is exactly the footgun being avoided.
+    /// The walk-affecting subset, for [`index_repo`].
+    fn walk_options(&self) -> WalkOptions {
+        WalkOptions {
+            use_default_excludes: self.use_default_excludes,
+            include_all_extensions: self.include_all_extensions,
+            use_walk_cache: self.use_walk_cache,
+        }
+    }
+
+    /// Test-only defaults (built-in excludes on, no repos/extras). Walk cache off — these tests
+    /// run against tempdir repos, and a cached walk would leak dead entries into the real
+    /// `$XDG_CONFIG_HOME` (walk-cache tests redirect XDG instead). See the struct comment for
+    /// why this isn't a `Default` impl.
+    #[cfg(test)]
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             repos: HashMap::new(),
             use_default_excludes: true,
             extra_excludes: Vec::new(),
-            use_walk_cache: true,
+            use_walk_cache: false,
             include_all_extensions: false,
         }
     }
@@ -79,17 +104,23 @@ impl CrawlOptions {
 
 // MARK: - Resolve helper
 
+/// How [`fold_segments`] treats a `..` encountered with no segments left to pop
+/// (i.e. trying to climb above filesystem root).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootEscape {
+    /// Same-repo: silent no-op. Containment is judged only by the caller's final prefix
+    /// check, so a path that climbs out and re-enters (`/a/b/../../../a/b/c.md`) still resolves.
+    Lenient,
+    /// Cross-repo: abort with `escaped = true`. Any path that transiently climbs above the
+    /// configured repo root is rejected outright, even if it would re-enter.
+    Strict,
+}
+
 /// Fold `.`/`..` segments of an absolute path into a normalized `/`-rooted string.
 ///
-/// `strict_root` governs a `..` encountered with no segments left to pop (i.e. trying to climb
-/// above filesystem root):
-/// - `false` (same-repo): silent no-op. Containment is judged only by the caller's final prefix
-///   check, so a path that climbs out and re-enters (`/a/b/../../../a/b/c.md`) still resolves.
-/// - `true` (cross-repo): abort with `escaped = true`. Any path that transiently climbs above the
-///   configured repo root is rejected outright, even if it would re-enter.
-///
-/// Returns the normalized path and whether a strict escape was hit (always `false` when lenient).
-fn fold_segments(combined: &str, strict_root: bool) -> (String, bool) {
+/// Returns the normalized path and whether a [`RootEscape::Strict`] escape was hit
+/// (always `false` when [`RootEscape::Lenient`]).
+fn fold_segments(combined: &str, root_escape: RootEscape) -> (String, bool) {
     let mut segments: Vec<&str> = Vec::new();
     let mut escaped = false;
     for seg in combined.split('/').filter(|s| !s.is_empty()) {
@@ -97,7 +128,7 @@ fn fold_segments(combined: &str, strict_root: bool) -> (String, bool) {
             "." => continue,
             ".." => {
                 if segments.is_empty() {
-                    if strict_root {
+                    if root_escape == RootEscape::Strict {
                         escaped = true;
                         break;
                     }
@@ -111,15 +142,21 @@ fn fold_segments(combined: &str, strict_root: bool) -> (String, bool) {
     (format!("/{}", segments.join("/")), escaped)
 }
 
+/// Join `target` under a base: absolute targets (`/x`) go root-relative (`root + target`),
+/// relative targets append to `base` with a `/`. `base` is the source file's dir for
+/// same-repo links, the repo root itself for cross-repo refs.
+fn join_target(base: &str, root: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        format!("{}{}", root, target)
+    } else {
+        format!("{}/{}", base, target)
+    }
+}
+
 /// Resolve a link relative to its source file. Returns absolute path or None if escapes root.
 pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String> {
-    let source_dir = dir_name(source_file);
-    let combined = if link.starts_with('/') {
-        format!("{}{}", root, link)
-    } else {
-        format!("{}/{}", source_dir, link)
-    };
-    let (resolved, _) = fold_segments(&combined, false);
+    let combined = join_target(dir_name(source_file), root, link);
+    let (resolved, _) = fold_segments(&combined, RootEscape::Lenient);
     if is_under(&resolved, root) {
         Some(resolved)
     } else {
@@ -131,12 +168,8 @@ pub fn resolve_link(link: &str, source_file: &str, root: &str) -> Option<String>
 /// strict escape rule, require containment, then realpath. `None` = no such file, or the
 /// path escaped the root.
 fn resolve_under_root(target: &str, root: &str) -> Option<CanonicalPath> {
-    let raw_combined = if target.starts_with('/') {
-        format!("{}{}", root, target)
-    } else {
-        format!("{}/{}", root, target)
-    };
-    let (normalized, escaped) = fold_segments(&raw_combined, true);
+    let raw_combined = join_target(root, root, target);
+    let (normalized, escaped) = fold_segments(&raw_combined, RootEscape::Strict);
     if escaped || !is_under(&normalized, root) {
         return None;
     }
@@ -150,19 +183,19 @@ fn resolve_under_root(target: &str, root: &str) -> Option<CanonicalPath> {
 /// re-canonicalize here — this is where the `CanonicalPath` brand gets applied.
 fn basename_fallback(
     target: &str,
-    by_name: &HashMap<String, Vec<String>>,
+    by_name: &HashMap<String, Vec<WalkedPath>>,
 ) -> Result<Option<CanonicalPath>, usize> {
     let Some(candidates) = by_name.get(base_name(target)) else {
         return Ok(None);
     };
     match candidates.len() {
         0 => Ok(None),
-        1 => Ok(canonicalize_str(&candidates[0])),
+        1 => Ok(canonicalize_str(candidates[0].as_str())),
         n => Err(n),
     }
 }
 
-// MARK: - bfs_crawl
+// MARK: - bfs_crawl_at_root
 
 #[derive(Debug, Clone)]
 struct BfsQueueItem {
@@ -171,40 +204,25 @@ struct BfsQueueItem {
     is_entry_repo: bool,
 }
 
-pub fn bfs_crawl(
-    entry_paths: &[String],
-    index: RepoIndex,
-    options: &CrawlOptions,
-    cache: &mut ExtractionCache,
-) -> (HashSet<CanonicalPath>, Vec<LinkIssue>) {
-    let mut state = CrawlState::new(index, options.clone(), cache);
-    state.seed(entry_paths);
-    while let Some(item) = state.dequeue() {
-        state.visit(&item);
-    }
-    state.prune_cache();
-    (state.reachable, state.issues)
-}
-
-/// Convenience: walk + crawl in one call. Returns the index alongside results.
+/// Walk + crawl in one call: index the entry repo, BFS from the entry points.
+/// Returns the index alongside results.
 pub fn bfs_crawl_at_root(
     entry_paths: &[String],
     root: &str,
     options: &CrawlOptions,
     cache: &mut ExtractionCache,
 ) -> (RepoIndex, HashSet<CanonicalPath>, Vec<LinkIssue>) {
-    let project_ignore = load_project_ignore(Path::new(root)).unwrap_or_default();
+    let project_ignore = project_ignore_or_warn(Path::new(root));
     let mut exclude = options.extra_excludes.clone();
     exclude.extend(project_ignore);
-    let idx = index_repo(
-        root,
-        &exclude,
-        options.use_default_excludes,
-        options.include_all_extensions,
-        options.use_walk_cache,
-    );
-    let (reachable, issues) = bfs_crawl(entry_paths, idx.clone(), options, cache);
-    (idx, reachable, issues)
+    let idx = index_repo(root, &exclude, options.walk_options());
+    let mut state = CrawlState::new(idx.clone(), options.clone(), cache);
+    state.seed(entry_paths);
+    while let Some(item) = state.dequeue() {
+        state.visit(&item);
+    }
+    state.prune_cache();
+    (idx, state.reachable, state.issues)
 }
 
 // MARK: - CrawlState
@@ -299,18 +317,16 @@ impl<'c> CrawlState<'c> {
         }
         let prefetched = Mutex::new(HashMap::<CanonicalPath, RepoIndex>::new());
         let extra_excludes = self.options.extra_excludes.clone();
-        let use_defaults = self.options.use_default_excludes;
-        let use_walk_cache = self.options.use_walk_cache;
-        let all_ext = self.options.include_all_extensions;
+        let walk_options = self.options.walk_options();
         std::thread::scope(|s| {
             for root in &to_index {
                 let prefetched = &prefetched;
                 let extra_excludes = extra_excludes.clone();
                 s.spawn(move || {
-                    let project_ignore = load_project_ignore(root.as_ref()).unwrap_or_default();
+                    let project_ignore = project_ignore_or_warn(root.as_ref());
                     let mut excl = extra_excludes;
                     excl.extend(project_ignore);
-                    let idx = index_repo(root.as_str(), &excl, use_defaults, all_ext, use_walk_cache);
+                    let idx = index_repo(root.as_str(), &excl, walk_options);
                     prefetched.lock().unwrap().insert(root.clone(), idx);
                 });
             }
@@ -365,16 +381,10 @@ impl<'c> CrawlState<'c> {
     /// Returned `Rc` is a pointer bump — callers hold it across `&mut self` calls for free.
     fn index_for(&mut self, canonical_root: &CanonicalPath) -> Rc<RepoIndex> {
         if !self.indices.contains_key(canonical_root) {
-            let project_ignore = load_project_ignore(canonical_root.as_ref()).unwrap_or_default();
+            let project_ignore = project_ignore_or_warn(canonical_root.as_ref());
             let mut excl = self.options.extra_excludes.clone();
             excl.extend(project_ignore);
-            let idx = index_repo(
-                canonical_root.as_str(),
-                &excl,
-                self.options.use_default_excludes,
-                self.options.include_all_extensions,
-                self.options.use_walk_cache,
-            );
+            let idx = index_repo(canonical_root.as_str(), &excl, self.options.walk_options());
             self.indices.insert(canonical_root.clone(), Rc::new(idx));
         }
         Rc::clone(self.indices.get(canonical_root).unwrap())
@@ -387,11 +397,18 @@ impl<'c> CrawlState<'c> {
         let owning_root = self
             .repo_root_containing(canonical.as_str())
             .unwrap_or_else(|| self.entry_root.clone());
-        let h = self
-            .cache
-            .read(canonical.as_ref(), owning_root.as_ref())
-            .map(|r| r.headings)
-            .unwrap_or_default();
+        let h = match self.cache.read(canonical.as_ref(), owning_root.as_ref()) {
+            Some(r) => r.headings,
+            None => {
+                // Unreadable/vanished target: fall through to empty headings (behavior
+                // unchanged — every fragment into it reports BrokenAnchor) but say why.
+                eprintln!(
+                    "md-orphan: warning: cannot read {canonical} for anchor check; \
+                     its fragments will report as broken"
+                );
+                BTreeSet::new()
+            }
+        };
         self.heading_cache.insert(canonical.clone(), h.clone());
         h
     }
@@ -447,11 +464,7 @@ impl<'c> CrawlState<'c> {
             match basename_fallback(&link.target, &current.by_name) {
                 Ok(resolved) => canonical = resolved,
                 Err(n) => {
-                    self.issues.push(LinkIssue {
-                        link: link.target.clone(),
-                        source: source.path.to_string(),
-                        kind: IssueKind::Ambiguous(n),
-                    });
+                    self.push_ambiguous(link, source, n);
                     return;
                 }
             }
@@ -485,7 +498,6 @@ impl<'c> CrawlState<'c> {
             self.validate_fragment(link, &source.path, &canonical, fragment);
         }
 
-        // Enqueue.
         let owning_root = self
             .repo_root_containing(canonical.as_str())
             .unwrap_or_else(|| current.root.clone());
@@ -505,11 +517,7 @@ impl<'c> CrawlState<'c> {
             match basename_fallback(&link.target, &repo_index.by_name) {
                 Ok(resolved) => canonical = resolved,
                 Err(n) => {
-                    self.issues.push(LinkIssue {
-                        link: link.target.clone(),
-                        source: source.path.to_string(),
-                        kind: IssueKind::Ambiguous(n),
-                    });
+                    self.push_ambiguous(link, source, n);
                     return;
                 }
             }
@@ -552,6 +560,14 @@ impl<'c> CrawlState<'c> {
         self.enqueue_resolved(canonical, owning_root);
     }
 
+    fn push_ambiguous(&mut self, link: &Link, source: &BfsQueueItem, n: usize) {
+        self.issues.push(LinkIssue {
+            link: link.target.clone(),
+            source: source.path.to_string(),
+            kind: IssueKind::Ambiguous(n),
+        });
+    }
+
     /// Push a `BrokenAnchor` issue when `fragment` is absent from the target file's headings.
     /// `canonical` is the file whose headings to check — the resolved target, or the source
     /// itself for self-anchor links (`[[#section]]`).
@@ -583,7 +599,7 @@ impl<'c> CrawlState<'c> {
         source: &CanonicalPath,
         canonical: &CanonicalPath,
         repo_root: &CanonicalPath,
-        by_name: &HashMap<String, Vec<String>>,
+        by_name: &HashMap<String, Vec<WalkedPath>>,
         scope: StyleScope,
     ) {
         let Some(rel_target) =
@@ -670,17 +686,7 @@ pub fn apply_style_fixes(issues: &[LinkIssue]) -> usize {
             }
         };
         // Sort by path_start descending so earlier offsets stay valid.
-        source_issues.sort_by(|a, b| {
-            let av = match &a.kind {
-                IssueKind::Style { path_start, .. } => *path_start,
-                _ => 0,
-            };
-            let bv = match &b.kind {
-                IssueKind::Style { path_start, .. } => *path_start,
-                _ => 0,
-            };
-            bv.cmp(&av)
-        });
+        source_issues.sort_by_key(|i| std::cmp::Reverse(i.kind.style_path_start()));
         let mut bytes = data;
         for issue in &source_issues {
             if let IssueKind::Style {
@@ -746,28 +752,31 @@ mod tests {
 
     #[test]
     fn fold_segments_lenient_collapses_dot_dot() {
-        assert_eq!(fold_segments("/a/b/../c", false), ("/a/c".into(), false));
-        assert_eq!(fold_segments("/a/./b", false), ("/a/b".into(), false));
+        assert_eq!(fold_segments("/a/b/../c", RootEscape::Lenient), ("/a/c".into(), false));
+        assert_eq!(fold_segments("/a/./b", RootEscape::Lenient), ("/a/b".into(), false));
     }
 
     #[test]
     fn fold_segments_lenient_absorbs_dot_dot_past_root() {
         // Climbing above root is a silent no-op; re-entry resolves. (Same-repo containment is
         // enforced by resolve_link's final prefix check, not here.)
-        assert_eq!(fold_segments("/a/b/../../../a/b/c.md", false), ("/a/b/c.md".into(), false));
+        assert_eq!(
+            fold_segments("/a/b/../../../a/b/c.md", RootEscape::Lenient),
+            ("/a/b/c.md".into(), false)
+        );
     }
 
     #[test]
     fn fold_segments_strict_escapes_on_dot_dot_past_root() {
         // Cross-repo mode: the same re-entering path is rejected outright as escaped.
-        let (_, escaped) = fold_segments("/a/b/../../../a/b/c.md", true);
+        let (_, escaped) = fold_segments("/a/b/../../../a/b/c.md", RootEscape::Strict);
         assert!(escaped);
     }
 
     #[test]
     fn fold_segments_strict_no_escape_within_root() {
         // `..` that stays within the path never trips the strict escape.
-        assert_eq!(fold_segments("/a/b/c/../d", true), ("/a/b/d".into(), false));
+        assert_eq!(fold_segments("/a/b/c/../d", RootEscape::Strict), ("/a/b/d".into(), false));
     }
 
     #[test]

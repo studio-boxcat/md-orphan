@@ -44,7 +44,7 @@ The root directory is the parent of the entry point. All `.md` files under that 
 
 ## Link styles
 
-The tool recognizes three link forms in markdown. Style violations are flagged when a link could be expressed in a more canonical form, where canonical = **bare basename** when the basename is unique within its target repo, or **root-relative path** when not.
+The tool recognizes three link forms in markdown. Style violations are flagged when a link could be expressed in a more canonical form, where canonical = **bare basename** when the basename is unique within its target repo, or **root-relative path** when not. Wiki paths resolve source-relative first, then root-relative (Obsidian semantics), then by unique basename — so both canonical forms always resolve.
 
 | Form | Example | Style-checked? |
 |---|---|---|
@@ -103,7 +103,7 @@ The crawl visits each cross-repo target file the entry repo *directly* reference
 
 ## Per-repo ignore (`.md-orphan`)
 
-**Required.** Every entry repo must have a `.md-orphan` file at its root listing project-specific ignore patterns. Running md-orphan against a repo without one exits 1 with a clear error message. If you have nothing to add beyond the built-in defaults, an empty file (`touch .md-orphan`) satisfies the requirement.
+**Required.** Every entry repo must have a `.md-orphan` file at its root listing project-specific ignore patterns. Running md-orphan against a repo without one — or with one that exists but can't be read — exits 2 with a clear error message. If you have nothing to add beyond the built-in defaults, an empty file (`touch .md-orphan`) satisfies the requirement.
 
 Loaded automatically for the entry repo and every cross-repo target visited during recursion. Cross-repo targets without their own `.md-orphan` fall back to defaults only — no hard-fail on cross-repo absence.
 
@@ -130,35 +130,18 @@ Built-in defaults (`.git`, `.svn`, `.hg`, `node_modules`, `.build`, `DerivedData
 
 ## Caches
 
-Two layers, both keyed by `fnv1a64(canonical_root)` — two repos with the same basename in different parents don't collide. Both use atomic writes (tempfile + rename), schema-versioned, last-writer-wins on concurrent invocations.
-
-**Walk-result cache** at `$XDG_CONFIG_HOME/md-orphan/walk-cache/<hash>.json` — persists `RepoIndex` (md_files + by_name + effective excludes). Validation: per-dir mtime stat (APFS bumps dir mtime on entry add/remove/rename, not file content edits). Flags-keyed: changes to `--exclude`, `.md-orphan`, `--no-default-excludes` invalidate. On hit, skips the entire `index_repo` walk (~99 ms cold → ~40 ms warm on Unity-scale repos).
-
-**Per-file extraction cache** at `$XDG_CONFIG_HOME/md-orphan/cache/<hash>.json` — caches links + headings per `.md` file. Per-entry validation: `(mtime_ns, size, fnv1a64(content))` all match. Per-cache-file validation: `repo_set_hash` (fnv1a64 of sorted configured repo names) — invalidates the whole cache when the user's repo config changes, since cross-repo refs are filtered against that set at extract time. Catches the post-`--fix` byte-equal-output edge case via content hash. Entries for vanished files auto-pruned each run.
-
-Load errors silently fall through to fresh extraction; corrupted files are treated as misses and overwritten next run.
+Two per-repo layers under `$XDG_CONFIG_HOME/md-orphan/` — a **walk-result cache** (skips the repo walk while directory mtimes are unchanged; invalidated by changes to `--exclude`, `.md-orphan`, or `--no-default-excludes`) and a **per-file extraction cache** (skips link/heading extraction for unmodified files, validated by mtime + size + content hash). Both are schema-versioned and atomically written; load errors and corrupted files silently fall through to fresh work. Schemas, keys, and validation rules: [[architecture.md#persisted-state]].
 
 Disable both with `--no-cache`.
 
 ## Structure
 
-- `path.rs` — path helpers (`real_path`, `dir_name`, `base_name`, `rel_path`) + `CanonicalPath` + `read_file`/`atomic_write_bytes`
-- `exclude.rs` — `ExcludeMatcher` with bare-basename hash-set fast path + `DEFAULT_EXCLUDES`
-- `extract.rs` — `Link` type + byte-level link/heading/fence scanners + grapheme-aware `anchor_id`
-- `crawl.rs` — `bfs_crawl`, `CrawlState`, `LinkIssue`, `CrawlOptions`, `resolve_link`, `apply_style_fixes`
-- `discovery.rs` — `index_repo` + `RepoIndex` (`ignore::WalkParallel`-based)
-- `config.rs` — global JSON config + per-repo `.md-orphan` parsing + `expand_path`
-- `cache.rs` — per-file extraction cache (mtime + size + fnv1a64 content-hash keyed)
-- `walk_cache.rs` — walk-result cache: persisted `RepoIndex`, per-dir-mtime validated
-- `main.rs` — clap-derive CLI entry + output rendering + `--fix` wiring
-- `tests/fixtures/` — anchor-id parity TSV captured during the Swift→Rust port
-- `dist/md-orphan` — locally built release binary (gitignored; `just build` refreshes it, `~/.local/bin/md-orphan` symlinks to it)
-- See [[architecture.md]] for module layout + design rationale, [[performance.md]] for benchmarks, and [[rust-migration.md]] for the historical Swift→Rust migration record
+Flat one-module-per-concern `src/` — layout, per-module responsibilities, and design rationale: [[architecture.md#module-layout]]. `dist/md-orphan` is the locally built release binary (gitignored; `just build` refreshes it, `~/.local/bin/md-orphan` symlinks to it). Benchmarks: [[performance.md]]. Historical Swift→Rust migration record: [[rust-migration.md]].
 
 ## Algorithm
 
 1. **Discover** — `ignore::WalkParallel` traversal under the entry root with per-thread visitor pruning excluded subtrees (work-stealing across `num_cpus` threads). `.md` filenames enter the basename map for style/ambiguity checks; `--all-extensions` widens the map to every file (~30× walk cost on Unity-sized repos, off by default).
-2. **Crawl** — BFS from entry points. For each visited entry-repo file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo. The target file is visited (heading extraction for anchor checks) but its outgoing links are NOT followed — cross-repo recursion stops at depth 1. Two visited sets, both keyed by canonical path.
+2. **Crawl** — BFS from entry points. For each visited entry-repo file: extract links (cached when source unchanged), resolve each link, check broken/ambiguous/anchor/style. Cross-repo refs trigger lazy index of the target repo. The target file is visited (heading extraction for anchor checks) but its outgoing links are NOT followed — cross-repo recursion stops at depth 1.
 3. **Diff** — `.md` files in the entry repo whose canonical path is not in the reachable set are orphans.
 
 Edge cases: missing entry point → error (exit 2); broken link → exit 1; unreadable file → `Unreadable` issue (exit 1; still counted reachable, never doubles as an orphan); circular links → visited set; symlinks → `std::fs::canonicalize` (handles macOS `/var/folders` → `/private/var/folders`); multiple entry points → reachability union (all must live under the first entry's root — siblings are rejected with exit 2).

@@ -4,7 +4,7 @@
 //! (not file content edits — those are caught by per-file [`ExtractionCache`](crate::cache::ExtractionCache)).
 
 use crate::cache::{atomic_write_json, cache_directory, fnv1a64, fnv1a64_hex, fnv1a64_of_sorted};
-use crate::discovery::RepoIndex;
+use crate::discovery::{RepoIndex, WalkedPath};
 use crate::path::{is_under, real_path, CanonicalPath};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -21,7 +21,16 @@ use std::time::SystemTime;
 /// - serde format change (e.g. tagged-enum representation drift)
 ///
 /// Files written under a different schema are silently treated as a miss + overwritten.
-const WALK_CACHE_SCHEMA_VERSION: u32 = 1;
+///
+/// 2: dropped persisted `effective_exclude` — redundant with `flags_key`, which already
+///    hashes the exclude list.
+const WALK_CACHE_SCHEMA_VERSION: u32 = 2;
+
+/// fnv1a64 of the walk-affecting flags + exclude list. Branded so it can't be cross-passed
+/// with the extraction cache's `RepoSetHash` — on disk both are bare fnv1a64 u64s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct FlagsKey(u64);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct WalkCache {
@@ -29,12 +38,11 @@ pub(crate) struct WalkCache {
     /// Stored to detect fnv1a64-collision: two distinct paths hashing to the same cache file
     /// would otherwise return a wrong-repo `RepoIndex`.
     pub canonical_root: String,
-    pub flags_key: u64,
+    pub flags_key: FlagsKey,
     /// Relative dir path → mtime_ns. Unchanged dir = no entry add/remove/rename happened in it.
     pub dir_mtimes: HashMap<String, i64>,
     pub md_files: HashSet<String>,
-    pub by_name: HashMap<String, Vec<String>>,
-    pub effective_exclude: Vec<String>,
+    pub by_name: HashMap<String, Vec<WalkedPath>>,
 }
 
 fn walk_cache_directory() -> PathBuf {
@@ -52,7 +60,7 @@ pub(crate) fn compute_flags_key(
     use_default_excludes: bool,
     include_all_extensions: bool,
     exclude: &[String],
-) -> u64 {
+) -> FlagsKey {
     let exclude_hash = fnv1a64_of_sorted(exclude.iter().map(String::as_str));
     let prefix = format!(
         "{}|{}|",
@@ -63,14 +71,14 @@ pub(crate) fn compute_flags_key(
     // keeps this stable across exclude reordering (since the inner hash already sorts).
     let mut buf = prefix.into_bytes();
     buf.extend_from_slice(&exclude_hash.to_le_bytes());
-    fnv1a64(&buf)
+    FlagsKey(fnv1a64(&buf))
 }
 
 /// Load + validate a walk cache for `canonical_root`. Returns `Some(RepoIndex)` on a verified
 /// hit, `None` on any miss/error/staleness.
 pub(crate) fn try_load_walk_cache(
     canonical_root: &CanonicalPath,
-    flags_key: u64,
+    flags_key: FlagsKey,
 ) -> Option<RepoIndex> {
     let path = walk_cache_file_path(canonical_root);
     let raw = fs::read_to_string(&path).ok()?;
@@ -99,13 +107,12 @@ pub(crate) fn try_load_walk_cache(
         root: canonical_root.clone(),
         md_files: cache.md_files,
         by_name: cache.by_name,
-        exclude: cache.effective_exclude,
     })
 }
 
 pub(crate) fn save_walk_cache(
     canonical_root: &CanonicalPath,
-    flags_key: u64,
+    flags_key: FlagsKey,
     index: &RepoIndex,
     dir_mtimes: HashMap<String, i64>,
 ) {
@@ -123,7 +130,6 @@ pub(crate) fn save_walk_cache(
         dir_mtimes,
         md_files: index.md_files.clone(),
         by_name: index.by_name.clone(),
-        effective_exclude: index.exclude.clone(),
     };
     atomic_write_json(&walk_cache_file_path(canonical_root), &cache, "walk-cache");
 }
@@ -187,7 +193,6 @@ mod tests {
             root: canon.clone(),
             md_files: md,
             by_name: HashMap::new(),
-            exclude: vec!["Library/".to_string()],
         };
         let mut dir_mtimes = HashMap::new();
         dir_mtimes.insert("".into(), stat_mtime_ns(canon.as_ref()).unwrap());
@@ -209,7 +214,6 @@ mod tests {
             root: canon.clone(),
             md_files: HashSet::new(),
             by_name: HashMap::new(),
-            exclude: Vec::new(),
         };
         let mut dir_mtimes = HashMap::new();
         dir_mtimes.insert("".into(), stat_mtime_ns(canon.as_ref()).unwrap());
@@ -236,9 +240,8 @@ mod tests {
             root: canon.clone(),
             md_files: HashSet::new(),
             by_name: HashMap::new(),
-            exclude: Vec::new(),
         };
-        save_walk_cache(&canon, 1, &index, HashMap::new());
+        save_walk_cache(&canon, FlagsKey(1), &index, HashMap::new());
         assert!(
             !repo.join("xdg/md-orphan/walk-cache").exists(),
             "expected save to be refused for in-root cache dir"
@@ -255,7 +258,6 @@ mod tests {
             root: canon.clone(),
             md_files: HashSet::new(),
             by_name: HashMap::new(),
-            exclude: Vec::new(),
         };
         let mut dir_mtimes = HashMap::new();
         // Mtime that won't match real fs — verifies validation catches drift.

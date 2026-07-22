@@ -1,7 +1,6 @@
-//! Path helpers: real_path, dir_name, base_name, rel_path, read_file, atomic_write_bytes.
+//! Path helpers: real_path, dir_name, base_name, rel_path, atomic_write_bytes.
 //!
-//! Mirrors `Sources/Lib/Util.swift`. Swift had a global reusable read buffer; Rust uses per-call
-//! `Vec<u8>` (allocator is fast enough at our file sizes — sub-ms for ~10KB files).
+//! Mirrors `Sources/Lib/Util.swift`.
 
 use std::fs;
 use std::io;
@@ -91,12 +90,6 @@ pub fn rel_path<'a>(path: &'a str, under_root: &str) -> Option<&'a str> {
 /// replaces the `x == root || x.starts_with(&format!("{root}/"))` idiom.
 pub fn is_under(path: &str, root: &str) -> bool {
     rel_path(path, root).is_some()
-}
-
-/// Read file contents as raw bytes. Per-call `Vec<u8>` allocation; no shared global buffer.
-/// Tests can run in parallel because of this (vs. Swift's `@Suite(.serialized)` constraint).
-pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    fs::read(path)
 }
 
 /// Tempfile + rename atomic write (tempfile in the target's own dir so rename stays on-device).

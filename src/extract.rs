@@ -74,16 +74,16 @@ pub fn extract_links(buf: &[u8], repos: &HashSet<String>) -> Vec<Link> {
 
         if i < count - 1 {
             if buf[i] == b'[' && buf[i + 1] == b'[' {
-                i = scan_wiki_link(buf, count, i, &mut links);
+                i = scan_wiki_link(buf, i, &mut links);
                 continue;
             }
             if buf[i] == b']' && buf[i + 1] == b'(' {
-                i = scan_standard_link(buf, count, i, &mut links);
+                i = scan_standard_link(buf, i, &mut links);
                 continue;
             }
         }
         if buf[i] == b'`' {
-            i = scan_backtick_ref(buf, count, i, &mut links, repos);
+            i = scan_backtick_ref(buf, i, &mut links, repos);
             continue;
         }
         i += 1;
@@ -111,7 +111,8 @@ fn parse_fragment(buf: &[u8], hash_pos: Option<usize>, end: usize) -> Option<Str
 /// Parse `[[page]]`, `[[page|alias]]`, `[[page#section]]` wiki links.
 // Index loops are deliberate: scanners track byte offsets (`path_start`/`path_end`) for `--fix`.
 #[allow(clippy::needless_range_loop)]
-fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
+fn scan_wiki_link(buf: &[u8], i: usize, links: &mut Vec<Link>) -> usize {
+    let count = buf.len();
     let start = i + 2;
     let mut end = start;
     while end < count - 1 {
@@ -180,7 +181,8 @@ fn scan_wiki_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> 
 }
 
 /// Parse `[text](path.md#fragment)` standard links.
-fn scan_standard_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>) -> usize {
+fn scan_standard_link(buf: &[u8], i: usize, links: &mut Vec<Link>) -> usize {
+    let count = buf.len();
     let start = i + 2;
     let mut end = start;
     let mut frag_pos: Option<usize> = None;
@@ -230,11 +232,11 @@ fn scan_standard_link(buf: &[u8], count: usize, i: usize, links: &mut Vec<Link>)
 #[allow(clippy::needless_range_loop)]
 fn scan_backtick_ref(
     buf: &[u8],
-    count: usize,
     i: usize,
     links: &mut Vec<Link>,
     repos: &HashSet<String>,
 ) -> usize {
+    let count = buf.len();
     // Skip multi-backtick spans (``foo``, ```bar```).
     if i + 1 < count && buf[i + 1] == b'`' {
         return i + 1;

@@ -5,7 +5,7 @@
 
 use crate::config::xdg_config_home;
 use crate::extract::{extract_headings, extract_links, Link};
-use crate::path::{atomic_write_bytes, read_file, rel_path};
+use crate::path::{atomic_write_bytes, rel_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -21,17 +21,27 @@ use std::time::SystemTime;
 /// 6: inline-span guards stop at `#` — raw-text fragments with spaces now emitted.
 /// 7: `LinkKind::Inline` removed — plain backtick spans are no longer links; v5/v6 entries
 ///    contain `inline`-kind links that no longer deserialize.
-pub const CACHE_SCHEMA_VERSION: u32 = 7;
+/// 8: dropped write-only `display_name`.
+pub const CACHE_SCHEMA_VERSION: u32 = 8;
+
+/// fnv1a64 of the sorted configured repo-name set. Branded so it can't be cross-passed with
+/// the walk-cache's `FlagsKey` — on disk both are bare fnv1a64 u64s (`serde(transparent)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoSetHash(u64);
+
+/// fnv1a64 of a file's bytes — the strongest leg of the per-entry validation key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContentHash(u64);
 
 /// One cache file per repo at `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LinkCache {
     pub schema_version: u32,
-    pub display_name: String,
-    /// fnv1a64 of sorted joined configured repo names; mismatch invalidates ALL entries
-    /// because cross-repo backtick refs are repo-set-dependent (see [[extract.rs]]).
-    #[serde(default)]
-    pub repo_set_hash: u64,
+    /// Mismatch invalidates ALL entries because cross-repo backtick refs are
+    /// repo-set-dependent (see [[extract.rs]]).
+    pub repo_set_hash: RepoSetHash,
     pub entries: HashMap<String, CacheEntry>,
 }
 
@@ -39,16 +49,15 @@ pub struct LinkCache {
 pub struct CacheEntry {
     pub mtime_ns: i64,
     pub size: i64,
-    pub content_hash: u64,
+    pub content_hash: ContentHash,
     pub links: Vec<Link>,
     pub headings: Vec<String>,
 }
 
 impl LinkCache {
-    pub fn new(display_name: String, repo_set_hash: u64) -> Self {
+    pub fn new(repo_set_hash: RepoSetHash) -> Self {
         Self {
             schema_version: CACHE_SCHEMA_VERSION,
-            display_name,
             repo_set_hash,
             entries: HashMap::new(),
         }
@@ -56,11 +65,11 @@ impl LinkCache {
 }
 
 /// Stable hash of a sorted joined repo-name list. Empty set → 0 sentinel.
-pub(crate) fn compute_repo_set_hash(repos: &HashSet<String>) -> u64 {
+pub(crate) fn compute_repo_set_hash(repos: &HashSet<String>) -> RepoSetHash {
     if repos.is_empty() {
-        return 0;
+        return RepoSetHash(0);
     }
-    fnv1a64_of_sorted(repos.iter().map(String::as_str))
+    RepoSetHash(fnv1a64_of_sorted(repos.iter().map(String::as_str)))
 }
 
 /// fnv1a64 over a sorted-then-joined-with-NUL list. Stable across input ordering.
@@ -93,12 +102,7 @@ pub(crate) fn cache_file_path(canonical_root: &Path) -> PathBuf {
 /// FNV-1a 64-bit hash over UTF-8 bytes. Lowercase hex, no leading zeros — matches Swift's
 /// `String(h, radix: 16)` byte-for-byte so cache filenames survive across the Rust port.
 pub(crate) fn fnv1a64_hex(s: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for byte in s.as_bytes() {
-        h ^= *byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{:x}", h)
+    format!("{:x}", fnv1a64(s.as_bytes()))
 }
 
 pub(crate) fn fnv1a64(buf: &[u8]) -> u64 {
@@ -112,12 +116,8 @@ pub(crate) fn fnv1a64(buf: &[u8]) -> u64 {
 
 // MARK: - Load / save
 
-pub(crate) fn load_link_cache(
-    canonical_root: &Path,
-    display_name: &str,
-    repo_set_hash: u64,
-) -> LinkCache {
-    let fresh = || LinkCache::new(display_name.to_string(), repo_set_hash);
+pub(crate) fn load_link_cache(canonical_root: &Path, repo_set_hash: RepoSetHash) -> LinkCache {
+    let fresh = || LinkCache::new(repo_set_hash);
     let path = cache_file_path(canonical_root);
     let Ok(raw) = fs::read_to_string(&path) else { return fresh(); };
     let Ok(decoded) = serde_json::from_str::<LinkCache>(&raw) else { return fresh(); };
@@ -152,7 +152,7 @@ pub struct ExtractionCache {
     pub enabled: bool,
     /// See [[extract.rs]] for the cross-repo annotation filter.
     repos: HashSet<String>,
-    repo_set_hash: u64,
+    repo_set_hash: RepoSetHash,
 }
 
 impl ExtractionCache {
@@ -175,7 +175,7 @@ impl ExtractionCache {
     /// Read + extract a file. `repo_root` must be canonical (realpath-ed).
     /// File outside repo_root → caching skipped, always extracts fresh.
     pub fn read(&mut self, file_path: &Path, repo_root: &Path) -> Option<ExtractedFile> {
-        let buf = read_file(file_path).ok()?;
+        let buf = fs::read(file_path).ok()?;
         let file_str = file_path.to_string_lossy().to_string();
         let root_str = repo_root.to_string_lossy().to_string();
 
@@ -186,20 +186,13 @@ impl ExtractionCache {
             return Some(extract_fresh(&buf, &self.repos));
         };
 
-        // Stat for mtime + size.
         let meta = match fs::metadata(file_path) {
             Ok(m) => m,
             Err(_) => return Some(extract_fresh(&buf, &self.repos)),
         };
-        let mtime_ns = match meta.modified().and_then(|t| {
-            t.duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(std::io::Error::other)
-        }) {
-            Ok(d) => d.as_nanos() as i64,
-            Err(_) => 0,
-        };
+        let mtime_ns = mtime_ns_or_zero(&meta);
         let size = meta.len() as i64;
-        let hash = fnv1a64(&buf);
+        let hash = ContentHash(fnv1a64(&buf));
 
         let cache = self.ensure_loaded(repo_root);
         if let Some(entry) = cache.entries.get(&rel_key)
@@ -266,15 +259,22 @@ impl ExtractionCache {
 
     fn ensure_loaded(&mut self, canonical_root: &Path) -> &mut LinkCache {
         if !self.caches.contains_key(canonical_root) {
-            let display_name = canonical_root
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let cache = load_link_cache(canonical_root, &display_name, self.repo_set_hash);
+            let cache = load_link_cache(canonical_root, self.repo_set_hash);
             self.caches.insert(canonical_root.to_path_buf(), cache);
         }
         self.caches.get_mut(canonical_root).unwrap()
     }
+}
+
+/// mtime in ns, or 0 when the stat/clock is unusable. Deliberate degrade, not a skip: the
+/// entry's `content_hash` (+ size) still gates hits, so a zero mtime can never produce a
+/// stale hit — it only forces the hash comparison every run.
+fn mtime_ns_or_zero(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn extract_fresh(buf: &[u8], repos: &HashSet<String>) -> ExtractedFile {
@@ -315,7 +315,6 @@ mod tests {
     use crate::extract::LinkKind;
     use std::fs;
     use std::path::Path;
-    use tempfile::TempDir;
 
     #[test]
     fn fnv1a64_stability() {
@@ -343,20 +342,15 @@ mod tests {
     #[test]
     fn cache_round_trips_via_disk() {
         let _g = xdg_test_lock();
-        let tmp = TempDir::new().unwrap();
-        // SAFETY: caller holds `xdg_test_lock()`; env is process-global but serialized.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()); }
+        let (_tmp, _xdg, canon) = xdg_test_env();
 
-        // Use canonical path: macOS /var/folders → /private/var/folders.
-        let canon = fs::canonicalize(tmp.path()).unwrap();
-
-        let mut cache = LinkCache::new("round-trip".into(), 0);
+        let mut cache = LinkCache::new(RepoSetHash(0));
         cache.entries.insert(
             "index.md".into(),
             CacheEntry {
                 mtime_ns: 1_700_000_000_000_000_000,
                 size: 42,
-                content_hash: 0xdeadbeef,
+                content_hash: ContentHash(0xdeadbeef),
                 links: vec![
                     Link {
                         kind: LinkKind::Wiki,
@@ -385,29 +379,25 @@ mod tests {
         );
 
         save_link_cache(&cache, &canon);
-        let loaded = load_link_cache(&canon, "round-trip", 0);
+        let loaded = load_link_cache(&canon, RepoSetHash(0));
 
         assert_eq!(loaded.schema_version, CACHE_SCHEMA_VERSION);
         assert_eq!(loaded.entries.len(), 1);
         let entry = loaded.entries.get("index.md").unwrap();
-        assert_eq!(entry.content_hash, 0xdeadbeef);
+        assert_eq!(entry.content_hash, ContentHash(0xdeadbeef));
         assert_eq!(entry.links.len(), 3);
         assert_eq!(entry.links[0].kind, LinkKind::Wiki);
         assert_eq!(entry.links[1].kind, LinkKind::Standard);
         assert_eq!(entry.links[2].kind, LinkKind::CrossRepo { repo: "r".into() });
         assert_eq!(entry.links[1].fragment, Some("sec".into()));
-
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME"); }
     }
 
     #[test]
     fn extraction_cache_invalidates_on_content_change() {
         let _g = xdg_test_lock();
-        let dir = TempDir::new().unwrap();
-        // Redirect XDG so ExtractionCache::read doesn't pollute the user's real cache dir.
-        // SAFETY: caller holds `xdg_test_lock()`.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
-        let canonical_dir = fs::canonicalize(dir.path()).unwrap();
+        // xdg_test_env redirects XDG so ExtractionCache::read doesn't pollute the user's
+        // real cache dir.
+        let (_tmp, _xdg, canonical_dir) = xdg_test_env();
         let path = canonical_dir.join("index.md");
         fs::write(&path, "[[a.md]]").unwrap();
 
@@ -426,10 +416,7 @@ mod tests {
     #[test]
     fn extraction_cache_invalidates_on_repo_set_change() {
         let _g = xdg_test_lock();
-        let dir = TempDir::new().unwrap();
-        // SAFETY: caller holds `xdg_test_lock`.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()); }
-        let canon = fs::canonicalize(dir.path()).unwrap();
+        let (_tmp, _xdg, canon) = xdg_test_env();
         let path = canon.join("index.md");
         // `foo.md` (some-repo) — cross-repo ref to "some-repo".
         fs::write(&path, "see `foo.md` (some-repo)").unwrap();

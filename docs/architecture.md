@@ -1,4 +1,4 @@
-> **Related:** [[CLAUDE.md]], [[rust-migration.md]]
+> **Related:** [[CLAUDE.md]], [[performance.md]], [[rust-migration.md]]
 
 # md-orphan architecture
 
@@ -10,23 +10,16 @@ The tool started life as a single-file Swift CLI. It accumulated cross-repo refe
 
 ## Prior art
 
-Three peer tools at comparable scale informed the cut:
-
-- **mlc** (Rust, ~2-3k LOC) — flat module layout: `main.rs`, `cli.rs`, `file_traversal.rs`, `markup.rs`, plus `link_extractors/` and `link_validators/`. Confirms the **extract / validate** seam recurs at this scale ([source](https://github.com/becheran/mlc/tree/master/src)).
-- **awesome_bot** (Ruby, ~1.5k LOC) — `lib/awesome_bot/{check,links,output,result,cli}.rb`. Files-as-namespaces, no pipeline abstraction ([source](https://github.com/dkhamsing/awesome_bot/tree/master/lib/awesome_bot)).
-- **markdown-link-check** (JS, ~300 LOC `index.js`) — full coordination layer in one file ([source](https://github.com/tcort/markdown-link-check/blob/master/index.js)).
-- **lychee** (Rust, ~15k LOC) — directory-per-concern under `lychee-lib/src/{extract,checker,filter,collector}/`. Earns the depth via async + 10+ formats × protocols. Out of scope for us ([source](https://github.com/lycheeverse/lychee/tree/master/lychee-lib/src)).
-
-Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesome_bot. **Skipped**: lychee's pipeline traits and per-protocol modules.
+Peer tools at comparable scale informed the cut (links in [References](#references)). Borrowed: the **extract / resolve** seam from mlc + flat-file layout from awesome_bot. **Skipped**: lychee's pipeline traits and per-protocol modules — lychee earns that depth via async + 10+ formats × protocols; out of scope for us.
 
 ## Module layout
 
 ```
 src/
-  path.rs       — path helpers + CanonicalPath + read_file/atomic_write_bytes + scanner-internal helpers
+  path.rs       — path helpers + CanonicalPath + atomic_write_bytes + scanner-internal helpers
   exclude.rs    — ExcludeMatcher + DEFAULT_EXCLUDES + libc fnmatch FFI
   extract.rs    — Link type + byte-level link/heading/fence scanners
-  crawl.rs      — bfs_crawl + CrawlState + LinkIssue + apply_style_fixes
+  crawl.rs      — bfs_crawl_at_root + CrawlState + LinkIssue + apply_style_fixes
   discovery.rs  — index_repo + RepoIndex (`ignore::WalkParallel`-based, parallel)
   config.rs     — global JSON config + .md-orphan + expand_path
   cache.rs      — ExtractionCache (mtime + size + content-hash keyed)
@@ -53,49 +46,25 @@ Public API surface is whatever each module exports with `pub` — grep `^pub ` t
 
 ## Data flow
 
-```
-                   CLI (main.rs)
-                         │
-                         ▼
-              bfs_crawl_at_root(entry_paths, root, options, cache)
-                         │
-                         ├─► index_repo(root)  ──►  RepoIndex { md_files, by_name }
-                         │
-                         └─► CrawlState (struct, &mut self methods)
-                                ├─► seed(entry_paths)
-                                │     └─► prefetch_referenced_repos (std::thread::scope, parallel)
-                                ├─► loop: dequeue → cache.read(file) → resolve(link)
-                                │                         │
-                                │                         ├─► extract.rs scanners
-                                │                         └─► extract_links([Link]) + extract_headings
-                                │
-                                └─► prune_cache()
+```mermaid
+flowchart TD
+    CLI["CLI (main.rs)"] --> BFS["bfs_crawl_at_root(entry_paths, root, options, cache)"]
+    BFS --> IDX["index_repo(root) → RepoIndex { md_files, by_name }"]
+    BFS --> CS["CrawlState (struct, &amp;mut self methods)"]
+    CS --> SEED["seed(entry_paths)"]
+    SEED --> PRE["prefetch_referenced_repos (std::thread::scope, parallel)"]
+    CS --> LOOP["loop: dequeue → cache.read(file) → resolve(link)"]
+    LOOP --> EX["extract.rs scanners: extract_links([Link]) + extract_headings"]
+    CS --> PRUNE["prune_cache()"]
 ```
 
 `Link` flows extractor → cache → resolver → `--fix` byte rewriter as one struct. No conversion at boundaries. `serde::Serialize`/`Deserialize` derive the on-disk cache shape directly — no separate `CachedLink` mirror type.
 
 ## Crawl state
 
-`bfs_crawl` is a 6-line driver over a `CrawlState` struct. Methods on the struct mutate through `&mut self` rather than passing parameters between free functions:
+`bfs_crawl_at_root` is a thin driver — seed the queue, dequeue/visit until empty, prune the cache — over a `CrawlState` struct whose methods mutate through `&mut self` rather than passing parameters between free functions. `CrawlState` (with a `'c` lifetime borrowing `&mut ExtractionCache`) is single-threaded, single-owner, dropped when the driver returns. No statics, no shared instance.
 
-```rust
-pub fn bfs_crawl(
-    entry_paths: &[String],
-    index: RepoIndex,
-    options: &CrawlOptions,
-    cache: &mut ExtractionCache,
-) -> (HashSet<CanonicalPath>, Vec<LinkIssue>) {
-    let mut state = CrawlState::new(index, options.clone(), cache);
-    state.seed(entry_paths);
-    while let Some(item) = state.dequeue() { state.visit(&item); }
-    state.prune_cache();
-    (state.reachable, state.issues)
-}
-```
-
-`CrawlState` is a struct (with a `'c` lifetime borrowing `&mut ExtractionCache`) — single-threaded, single-owner, dropped at end of `bfs_crawl`. No statics, no shared instance.
-
-Two visited sets, both keyed by canonical absolute path — the `CanonicalPath` newtype (`path.rs`) brands `realpath(3)` output so raw paths can't sneak into identity checks (Pitfall #1 made compile-checked). `RepoIndex.by_name` values stay unbranded `String`s: the walk doesn't resolve file-level symlinks, so they're only canonical after `basename_fallback` re-realpaths them.
+Two visited sets, both keyed by canonical absolute path — the `CanonicalPath` newtype (`path.rs`) brands `realpath(3)` output so raw paths can't sneak into identity checks (Pitfall #1 made compile-checked). `RepoIndex.by_name` values carry the `WalkedPath` brand (`discovery.rs`): the walk doesn't resolve file-level symlinks, so they're only canonical after `basename_fallback` re-realpaths them — the separate brand keeps that distinction compile-checked too.
 - `reachable: HashSet<CanonicalPath>` — entry-repo orphan tracking. Files in this set get their outgoing links resolved + recursively followed. Marked *before* the file is read: an unreadable file is still reachable (reported as an `Unreadable` issue, not an orphan).
 - `cross_repo_visited: HashSet<CanonicalPath>` — cross-repo target files the entry repo directly references. They're read so anchor checks against their headings work, but their outgoing links are NOT followed — `visit()` returns early after caching headings. Issues from cross-repo files would be downstream-repo concerns, not entry-repo concerns.
 
@@ -110,43 +79,36 @@ Symlinks pointing to the same `.md` resolve to one canonical via `std::fs::canon
 | Per-repo cache | `$XDG_CONFIG_HOME/md-orphan/cache/<fnv1a64-of-canonical-root>.json` | one file per indexed repo |
 | Per-repo walk-cache | `$XDG_CONFIG_HOME/md-orphan/walk-cache/<fnv1a64-of-canonical-root>.json` | persisted `RepoIndex` + per-dir mtime map |
 
-**Per-file cache schema** (`schema_version: 7`, defined in `cache.rs`):
+**Per-file cache schema** (`CACHE_SCHEMA_VERSION`, defined in `cache.rs` — the const's doc comment carries the bump changelog):
 
 ```json
 {
-  "schema_version": 7,
-  "display_name": "md-orphan",
+  "schema_version": 8,
   "repo_set_hash": 12345678901234567890,
   "entries": {
     "README.md": {
       "mtime_ns": 1700000000000000000,
       "size": 1234,
       "content_hash": 17000000000000000000,
-      "links": [{"kind": "Wiki", "target": "TODO.md", "fragment": null, "path_start": 1995, "path_end": 2002}],
+      "links": [{"kind": "wiki", "target": "architecture.md", "fragment": null, "path_start": 1995, "path_end": 2010}],
       "headings": ["overview", "usage"]
     }
   }
 }
 ```
 
-Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache validation: `repo_set_hash` matches the active configured repo set (cross-repo refs are filtered against that set at extract time, so cached entries become unsafe when the set changes). Schema mismatch on either → silent invalidate. Bumps:
-- 2→3 during the Rust port (serde tagged-enum shape diverged from Swift Codable)
-- 3→4 added `repo_set_hash` to track repo-set changes
-- 4→5 scanner emits `LinkKind::Inline` for plain backtick spans (v4 entries lack them)
-- 5→6 inline-span guards stop at `#` — raw-text fragments with spaces now emitted
-- 6→7 `LinkKind::Inline` removed (feature reverted) — plain backtick spans are no longer links
+Per-entry validation: `(mtime_ns, size, content_hash)` all match. Per-cache validation: `repo_set_hash` matches the active configured repo set (cross-repo refs are filtered against that set at extract time, so cached entries become unsafe when the set changes). Schema mismatch on either → silent invalidate.
 
-**Walk-cache schema** (`WALK_CACHE_SCHEMA_VERSION: 1`, defined at `walk_cache.rs`):
+**Walk-cache schema** (`WALK_CACHE_SCHEMA_VERSION`, defined at `walk_cache.rs` — bump changelog in the const's doc comment):
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_root": "/Users/.../meow-tower",
   "flags_key": 12345678901234567890,
   "dir_mtimes": {"": 1700000000000000000, "docs": 1700000000000000001},
   "md_files": ["README.md", "docs/architecture.md"],
-  "by_name": {"README.md": ["/abs/path/README.md"]},
-  "effective_exclude": ["Library/", "Pods/"]
+  "by_name": {"README.md": ["/abs/path/README.md"]}
 }
 ```
 

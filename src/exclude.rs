@@ -41,15 +41,15 @@ const FNM_PATHNAME: c_int = 0x2;
 pub struct ExcludeMatcher {
     /// Trailing-slash bare-basename patterns (e.g. `Library/`, `Pods/`). Match anywhere in tree.
     /// Stored without trailing slash.
-    pub bare_basenames: HashSet<String>,
+    bare_basenames: HashSet<String>,
     /// Trailing-slash path-containing patterns (e.g. `docs/internal/`). Anchored at root.
-    pub anchored: Vec<String>,
+    anchored: Vec<String>,
     /// Patterns containing `*`, `?`, `[…]`. Matched via `fnmatch`.
-    pub globs: Vec<String>,
+    globs: Vec<String>,
     /// Plain (no trailing slash, no glob) patterns — match as path prefix at root.
-    pub plain_prefixes: Vec<String>,
+    plain_prefixes: Vec<String>,
     /// Trailing-slash glob patterns (e.g. `assets/loc/*/`).
-    pub trailing_globs: Vec<(String, usize)>,
+    trailing_globs: Vec<(String, usize)>,
 }
 
 #[inline]

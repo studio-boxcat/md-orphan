@@ -11,10 +11,24 @@ use crate::exclude::{ExcludeMatcher, DEFAULT_EXCLUDES};
 use crate::path::{canonicalize_str, CanonicalPath};
 use crate::walk_cache::{compute_flags_key, save_walk_cache, stat_mtime_ns, try_load_walk_cache};
 use ignore::{WalkBuilder, WalkState};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// Absolute path as seen by the walk — NOT realpath'd (the walk doesn't resolve file-level
+/// symlinks), so it's only canonical after `basename_fallback` re-realpaths it. The brand
+/// keeps that distinction from `CanonicalPath` compile-checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WalkedPath(String);
+
+impl WalkedPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIndex {
@@ -23,9 +37,28 @@ pub struct RepoIndex {
     /// Relative paths of `.md` files — for orphan reachability tracking.
     pub md_files: HashSet<String>,
     /// Basename → list of absolute paths. `.md` only unless `include_all_extensions`.
-    pub by_name: HashMap<String, Vec<String>>,
-    /// Effective exclude patterns applied (defaults + user).
-    pub exclude: Vec<String>,
+    pub by_name: HashMap<String, Vec<WalkedPath>>,
+}
+
+/// Walk behavior knobs for [`index_repo`] — a struct so call sites read as named fields
+/// instead of a trail of positional bools.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkOptions {
+    pub use_default_excludes: bool,
+    pub include_all_extensions: bool,
+    pub use_walk_cache: bool,
+}
+
+#[cfg(test)]
+impl WalkOptions {
+    /// Test default: built-in excludes on, `.md`-only index, walk cache off.
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            use_default_excludes: true,
+            include_all_extensions: false,
+            use_walk_cache: false,
+        }
+    }
 }
 
 /// Walk a repo, applying exclude pruning at the visitor stage so subtrees skip without iteration.
@@ -37,13 +70,12 @@ pub struct RepoIndex {
 ///
 /// `include_all_extensions=true` populates `by_name` for every file, not just `.md`. ~30× the
 /// work on Unity-sized repos — off by default; CLI `--all-extensions` turns it on.
-pub fn index_repo(
-    root: &str,
-    exclude: &[String],
-    use_default_excludes: bool,
-    include_all_extensions: bool,
-    use_walk_cache: bool,
-) -> RepoIndex {
+pub fn index_repo(root: &str, exclude: &[String], options: WalkOptions) -> RepoIndex {
+    let WalkOptions {
+        use_default_excludes,
+        include_all_extensions,
+        use_walk_cache,
+    } = options;
     // Nonexistent root has no realpath; brand as-is (the walk just yields nothing).
     let resolved =
         canonicalize_str(root).unwrap_or_else(|| CanonicalPath::assume_canonical(root.to_string()));
@@ -65,14 +97,14 @@ pub fn index_repo(
             return cached;
         }
 
-    let matcher = ExcludeMatcher::new(effective.clone());
+    let matcher = ExcludeMatcher::new(effective);
     let bare_only = matcher.is_bare_only();
     let root_prefix = format!("{}/", resolved.as_str());
 
     // Shared accumulators. Lock contention is small at our entry counts (~15k post-prune)
     // because each insert is microseconds and locked sections are tight.
     let md_files: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
-    let by_name: Mutex<HashMap<String, Vec<String>>> = Mutex::new(HashMap::new());
+    let by_name: Mutex<HashMap<String, Vec<WalkedPath>>> = Mutex::new(HashMap::new());
     let dir_mtimes: Mutex<HashMap<String, i64>> = Mutex::new(HashMap::new());
     // A walked-but-unstat'd dir would let mtime drift slip past validation. Skip save in that case.
     let mtime_stat_failed = AtomicBool::new(false);
@@ -155,7 +187,7 @@ pub fn index_repo(
             if matcher.matches(&rel, Some(name)) {
                 return WalkState::Continue;
             }
-            by_name.lock().unwrap().entry(name.to_string()).or_default().push(abs);
+            by_name.lock().unwrap().entry(name.to_string()).or_default().push(WalkedPath(abs));
             if is_md {
                 md_files.lock().unwrap().insert(rel);
             }
@@ -167,7 +199,6 @@ pub fn index_repo(
         root: resolved.clone(),
         md_files: md_files.into_inner().unwrap(),
         by_name: by_name.into_inner().unwrap(),
-        exclude: effective,
     };
     if let Some(key) = flags_key
         && !mtime_stat_failed.load(Ordering::Relaxed)
@@ -191,7 +222,7 @@ mod tests {
         write(&dir.path().join("docs/b.md"), "");
         write(&dir.path().join("notes.txt"), ""); // ignored: not .md
 
-        let idx = index_repo(dir.path().to_str().unwrap(), &[], true, false, false);
+        let idx = index_repo(dir.path().to_str().unwrap(), &[], WalkOptions::for_tests());
         assert!(idx.md_files.contains("a.md"));
         assert!(idx.md_files.contains("docs/b.md"));
         assert_eq!(idx.md_files.len(), 2);
@@ -204,7 +235,7 @@ mod tests {
         write(&dir.path().join(".git/HEAD"), "");
         write(&dir.path().join(".git/foo.md"), "");
 
-        let idx = index_repo(dir.path().to_str().unwrap(), &[], true, false, false);
+        let idx = index_repo(dir.path().to_str().unwrap(), &[], WalkOptions::for_tests());
         assert!(idx.md_files.contains("a.md"));
         assert_eq!(idx.md_files.len(), 1);
     }
@@ -216,7 +247,7 @@ mod tests {
         write(&dir.path().join("proj-ios/Pods/Firebase/README.md"), "");
         write(&dir.path().join("Pods/Other/x.md"), "");
 
-        let idx = index_repo(dir.path().to_str().unwrap(), &[], true, false, false);
+        let idx = index_repo(dir.path().to_str().unwrap(), &[], WalkOptions::for_tests());
         assert!(idx.md_files.contains("README.md"));
         assert_eq!(idx.md_files.len(), 1);
     }
@@ -230,9 +261,7 @@ mod tests {
         let idx = index_repo(
             dir.path().to_str().unwrap(),
             &["Packages/".to_string()],
-            true,
-            false,
-            false,
+            WalkOptions::for_tests(),
         );
         assert!(idx.md_files.contains("a.md"));
         assert_eq!(idx.md_files.len(), 1);
@@ -243,7 +272,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(&dir.path().join("Pods/x.md"), "");
 
-        let idx = index_repo(dir.path().to_str().unwrap(), &[], false, false, false);
+        let idx = index_repo(
+            dir.path().to_str().unwrap(),
+            &[],
+            WalkOptions { use_default_excludes: false, ..WalkOptions::for_tests() },
+        );
         assert!(idx.md_files.contains("Pods/x.md"));
     }
 
@@ -253,7 +286,7 @@ mod tests {
         write(&dir.path().join("foo.md"), "");
         write(&dir.path().join("bar.cs"), "");
 
-        let idx = index_repo(dir.path().to_str().unwrap(), &[], true, false, false);
+        let idx = index_repo(dir.path().to_str().unwrap(), &[], WalkOptions::for_tests());
         assert!(idx.by_name.contains_key("foo.md"));
         assert!(!idx.by_name.contains_key("bar.cs"));
     }
@@ -264,7 +297,11 @@ mod tests {
         write(&dir.path().join("foo.md"), "");
         write(&dir.path().join("bar.cs"), "");
 
-        let idx = index_repo(dir.path().to_str().unwrap(), &[], true, true, false);
+        let idx = index_repo(
+            dir.path().to_str().unwrap(),
+            &[],
+            WalkOptions { include_all_extensions: true, ..WalkOptions::for_tests() },
+        );
         assert!(idx.by_name.contains_key("foo.md"));
         assert!(idx.by_name.contains_key("bar.cs"));
     }
@@ -276,7 +313,11 @@ mod tests {
         write(&repo.join("a.md"), "");
         write(&repo.join("docs/b.md"), "");
 
-        let cold = index_repo(repo.to_str().unwrap(), &[], true, false, true);
+        let cold = index_repo(
+            repo.to_str().unwrap(),
+            &[],
+            WalkOptions { use_walk_cache: true, ..WalkOptions::for_tests() },
+        );
         assert_eq!(cold.md_files.len(), 2);
 
         let cache_dir = xdg.join("md-orphan/walk-cache");
@@ -284,10 +325,13 @@ mod tests {
             fs::read_dir(&cache_dir).unwrap().filter_map(Result::ok).collect();
         assert_eq!(cache_files.len(), 1, "cold run should write exactly one walk-cache file");
 
-        let warm = index_repo(repo.to_str().unwrap(), &[], true, false, true);
+        let warm = index_repo(
+            repo.to_str().unwrap(),
+            &[],
+            WalkOptions { use_walk_cache: true, ..WalkOptions::for_tests() },
+        );
         assert_eq!(cold.md_files, warm.md_files);
         assert_eq!(cold.by_name, warm.by_name);
-        assert_eq!(cold.exclude, warm.exclude);
     }
 
     #[test]
@@ -296,14 +340,22 @@ mod tests {
         let (_tmp, _xdg, repo) = crate::cache::xdg_test_env();
         write(&repo.join("a.md"), "");
 
-        let first = index_repo(repo.to_str().unwrap(), &[], true, false, true);
+        let first = index_repo(
+            repo.to_str().unwrap(),
+            &[],
+            WalkOptions { use_walk_cache: true, ..WalkOptions::for_tests() },
+        );
         assert_eq!(first.md_files.len(), 1);
 
         // Sleep so APFS dir mtime advances measurably even on coarse-resolution fs.
         std::thread::sleep(std::time::Duration::from_millis(20));
         write(&repo.join("b.md"), "");
 
-        let second = index_repo(repo.to_str().unwrap(), &[], true, false, true);
+        let second = index_repo(
+            repo.to_str().unwrap(),
+            &[],
+            WalkOptions { use_walk_cache: true, ..WalkOptions::for_tests() },
+        );
         assert!(second.md_files.contains("b.md"));
         assert_eq!(second.md_files.len(), 2);
     }
@@ -319,14 +371,16 @@ mod tests {
         let with_excl = index_repo(
             repo.to_str().unwrap(),
             &["Packages/".to_string()],
-            true,
-            false,
-            true,
+            WalkOptions { use_walk_cache: true, ..WalkOptions::for_tests() },
         );
         assert_eq!(with_excl.md_files.len(), 1);
 
         // Second run: same dir, no exclude → flags_key differs → cache miss → re-walk.
-        let without_excl = index_repo(repo.to_str().unwrap(), &[], true, false, true);
+        let without_excl = index_repo(
+            repo.to_str().unwrap(),
+            &[],
+            WalkOptions { use_walk_cache: true, ..WalkOptions::for_tests() },
+        );
         assert!(without_excl.md_files.contains("Packages/inner.md"));
         assert_eq!(without_excl.md_files.len(), 2);
     }

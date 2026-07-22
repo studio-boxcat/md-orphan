@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error("{path}: cannot read: {message}")]
+    Unreadable { path: String, message: String },
     #[error("{path}: malformed JSON: {message}")]
     MalformedJson { path: String, message: String },
     #[error("repo '{name}' path '{raw}': undefined env var ${missing_var}")]
@@ -27,8 +29,6 @@ pub enum ConfigError {
         raw: String,
         user: String,
     },
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -60,7 +60,8 @@ pub(crate) fn xdg_config_home() -> String {
         .unwrap_or_else(|| format!("{}/.config", home_dir()))
 }
 
-/// User home directory. `$HOME` first, fall back to `dirs::home_dir`-equivalent via passwd.
+/// Current user's home directory: `$HOME`, or `""` when unset (no passwd fallback —
+/// `$HOME` is always set in any environment this tool runs in).
 pub(crate) fn home_dir() -> String {
     env::var("HOME").unwrap_or_default()
 }
@@ -85,7 +86,7 @@ pub fn load_global_config(path: &Path) -> Result<GlobalConfig, ConfigError> {
     if !path.exists() {
         return Ok(GlobalConfig::default());
     }
-    let raw = fs::read_to_string(path).map_err(|e| ConfigError::MalformedJson {
+    let raw = fs::read_to_string(path).map_err(|e| ConfigError::Unreadable {
         path: path.display().to_string(),
         message: e.to_string(),
     })?;
@@ -167,15 +168,16 @@ pub fn expand_path(raw: &str, repo_name: &str) -> Result<String, ConfigError> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'$' {
-            // Multi-byte UTF-8 char or ASCII: copy through to next $ or end.
+            // Copy through to the next `$` or end. `i` only ever stops on the ASCII `$` or at
+            // len, so the slice boundaries are always char boundaries — a panic here would be
+            // a scanner logic bug, not a data condition.
             let start = i;
             while i < bytes.len() && bytes[i] != b'$' {
                 i += 1;
             }
-            out.push_str(std::str::from_utf8(&bytes[start..i]).unwrap_or(""));
+            out.push_str(&s[start..i]);
             continue;
         }
-        // bytes[i] == '$'
         let after = i + 1;
         if after >= bytes.len() {
             out.push('$');
@@ -201,7 +203,8 @@ pub fn expand_path(raw: &str, repo_name: &str) -> Result<String, ConfigError> {
                 raw: raw.to_string(),
             });
         }
-        let name = std::str::from_utf8(&bytes[name_start..j]).unwrap_or("");
+        // `name_start`/`j` bound an ASCII-only var name — always char boundaries.
+        let name = &s[name_start..j];
         if name.is_empty() {
             out.push('$');
             i = after;
@@ -256,6 +259,18 @@ pub fn load_project_ignore(root: &Path) -> std::io::Result<Vec<String>> {
             }
         })
         .collect())
+}
+
+/// [`load_project_ignore`], but an existing-yet-unreadable `.md-orphan` warns to stderr and
+/// yields no patterns instead of being silently swallowed. A missing file is still `vec![]`.
+pub fn project_ignore_or_warn(root: &Path) -> Vec<String> {
+    load_project_ignore(root).unwrap_or_else(|e| {
+        eprintln!(
+            "md-orphan: warning: cannot read {}/.md-orphan: {e}; ignoring its patterns",
+            root.display()
+        );
+        Vec::new()
+    })
 }
 
 #[cfg(test)]

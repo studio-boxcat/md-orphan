@@ -89,22 +89,7 @@ When the entry files reference cross-repo targets directly, those repos are inde
 
 The prefetch reads the seeded entry files in `CrawlState.seed`, extracts cross-repo names, and dispatches `index_repo` for those targets in parallel. **Transitively-discovered cross-repos** (refs from a cross-repo file rather than the entry, or from same-repo files reachable from the entry) fall back to lazy serial via `index_for`.
 
-For projects with no cross-repo refs anywhere, prescan finds zero targets and no parallel work runs.
-
-Extending to transitive cross-repos (level-synchronous BFS, parallel-batched per level) was considered and dropped — profiling never showed the lazy serial fallback dominating. Revisit only with evidence.
-
-## What dominates
-
-1. **`ignore::WalkParallel` traversal** — kernel-side dirent reads parallelized across N worker threads via crossbeam-deque work stealing. Default excludes prune big subtrees (`Library/`, `Pods/`, etc.); per-repo `.md-orphan` adds project-specific prunes.
-2. **`ExcludeMatcher` bare-basename hash lookup** — O(1) per dir entry. `Mutex<HashMap>` insertions for `by_name` and `Mutex<HashSet>` for `md_files` add small contention; not yet measured as a bottleneck.
-
-## What doesn't help further
-
-- **More threads beyond CPU count**: `ignore` defaults to `num_cpus`; pinning to higher values just thrashes context switches.
-- **Dropping `Mutex` for thread-local accumulators + merge**: the Mutex-locked sections are microseconds; not the bottleneck.
-- **`getattrlistbulk`** (macOS-specific batched stat): known kernel bugs ([Apple Forums](https://developer.apple.com/forums/thread/656787)).
-- **regex**: a manual byte scanner is faster than `regex` for our tight scanner pattern (single-char-class transitions).
-- **Sequential walk for tiny repos**: thread pool spin-up adds ~5 ms vs. sequential, regressing the 6-file self-check from 3 ms → 7 ms. Could add a sequential fast path under a file-count threshold; not worth it given the absolute cost.
+For projects with no cross-repo refs anywhere, prescan finds zero targets and no parallel work runs. Extending the parallelism to transitive cross-repos was considered and dropped — see [Considered and dropped](#considered-and-dropped).
 
 ## Reproducing
 
@@ -131,11 +116,24 @@ keeps a separate cache rather than thrashing the default one. Per-link index acc
 
 ## Considered and dropped
 
-Recorded so dead ends aren't re-litigated (full analyses in git history):
+Rejected optimizations, recorded so dead ends aren't re-litigated (full analyses in git history). Context: the cold walk is bound by kernel `getdents` traversal (see the cold-path breakdown above), and everything below either failed to move that floor or lost to spin-up/complexity costs.
 
-- **Transitive cross-repo parallel discovery** — no profiling evidence the lazy serial fallback matters.
+Walk-phase:
+
+- **More threads beyond CPU count** — `ignore` defaults to `num_cpus`; pinning higher just thrashes context switches.
+- **Sequential walk fast path for tiny repos** — thread-pool spin-up adds ~5 ms vs. sequential, regressing the 6-file self-check from 3 ms → 7 ms; a file-count-threshold fast path isn't worth it at that absolute cost.
+- **Dropping `Mutex` for thread-local accumulators + merge** — the locked `by_name`/`md_files` insertion sections are microseconds; contention has never measured as a bottleneck.
+- **`getattrlistbulk`** (macOS-specific batched stat) — known kernel bugs ([Apple Forums](https://developer.apple.com/forums/thread/656787)).
+
+Post-walk pipeline:
+
+- **regex** — a manual byte scanner is faster than `regex` for our tight scanner pattern (single-char-class transitions).
+- **Transitive cross-repo parallel discovery** (level-synchronous BFS, parallel-batched per level) — profiling never showed the lazy serial `index_for` fallback dominating. Revisit only with evidence.
 - **Post-walk BFS trim** — the ~25–30 ms resolve/style/cross-repo block is the warm floor; no lever identified short of real profiling.
-- **Cache crates/formats** (`cacache`/`redb`/`sled`, `rkyv`/`bincode`, `atomicwrites`) — startup/parse savings are ~1–3 ms against a ~40 ms warm path, and none help with mtime-validated invalidation, which is the actual hard part.
+
+Cache layer:
+
+- **Cache crates/formats** (`cacache`/`redb`/`sled`, `rkyv`/`bincode`, `atomicwrites`) — startup/parse savings are ~1–3 ms against a ~29 ms warm path, and none help with mtime-validated invalidation, which is the actual hard part.
 - **Merkle-style root-mtime hash** (1 stat vs ~1k) — cuts validation ~3 ms → ~50 µs but invalidates on any dir change anywhere; revisit if the warm budget tightens.
-- **`flock(2)` on cache files** — concurrent invocations are last-writer-wins on regenerable caches; accepted.
 - **`rayon`-parallel validation stats** — thread-pool spin-up eats the win for a one-shot CLI.
+- **`flock(2)` on cache files** — concurrent invocations are last-writer-wins on regenerable caches; accepted.

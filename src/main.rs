@@ -5,7 +5,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use md_orphan::cache::ExtractionCache;
 use md_orphan::config::{
-    default_config_path, find_project_ignore_ancestor, load_global_config, project_ignore_exists,
+    default_config_path, find_project_ignore_ancestor, load_global_config, load_project_ignore,
+    project_ignore_exists,
 };
 use md_orphan::crawl::{
     apply_style_fixes, bfs_crawl_at_root, CrawlOptions, IssueKind, LinkIssue, StyleScope,
@@ -43,7 +44,7 @@ struct Cli {
     #[arg(long)]
     no_default_excludes: bool,
 
-    /// Disable per-file extraction cache
+    /// Disable both the walk-result cache and the per-file extraction cache
     #[arg(long)]
     no_cache: bool,
 
@@ -145,6 +146,10 @@ must be enumerated explicitly. Create the file with `touch {root}/.md-orphan` if
 no extras."
         );
     }
+    // Present-but-unreadable hard-fails like missing: continuing with zero project patterns
+    // would mass-report false orphans. (Cross-repo targets stay warn-and-continue.)
+    load_project_ignore(root_path)
+        .map_err(|e| anyhow!("{root}/.md-orphan: cannot read: {e}"))?;
 
     let crawl_options = CrawlOptions {
         repos: global_config.repos,
@@ -286,15 +291,7 @@ fn render_issues(
             if asrc != bsrc {
                 return asrc.cmp(&bsrc);
             }
-            let ai = match &a.kind {
-                IssueKind::Style { path_start, .. } => *path_start,
-                _ => 0,
-            };
-            let bi = match &b.kind {
-                IssueKind::Style { path_start, .. } => *path_start,
-                _ => 0,
-            };
-            ai.cmp(&bi)
+            a.kind.style_path_start().cmp(&b.kind.style_path_start())
         });
         for issue in &sorted {
             if let IssueKind::Style { scope, suggested, .. } = &issue.kind {
