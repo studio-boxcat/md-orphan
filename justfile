@@ -3,6 +3,7 @@ default: build
 # Cargo release profile: lto=thin + codegen-units=1 + strip (set in Cargo.toml).
 build:
     cargo build --release
+    mkdir -p dist
     cp target/release/md-orphan dist/md-orphan
 
 install: build
