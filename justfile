@@ -3,11 +3,11 @@ default: build
 # Cargo release profile: lto=thin + codegen-units=1 + strip (set in Cargo.toml).
 build:
     cargo build --release
-    mkdir -p dist
-    cp target/release/md-orphan dist/md-orphan
 
-install: build
-    ln -sf {{justfile_directory()}}/dist/md-orphan ~/.local/bin/md-orphan
+# Install into ~/.cargo/bin the cargo way; the repo's target/ is the build cache. Every other
+# machine gets the same binary from this repo's git URL (config/setup.sh).
+install:
+    cargo install --path . --locked --force --target-dir target
 
 test:
     cargo test

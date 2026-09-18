@@ -4,7 +4,7 @@ Detect markdown files not reachable from a given entry point by crawling links r
 
 ## Install
 
-Build into `dist/` and symlink to `~/.local/bin`:
+Install into `~/.cargo/bin`:
 
 ```
 just install
