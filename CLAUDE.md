@@ -149,3 +149,7 @@ Edge cases: missing entry point → error (exit 2); broken link → exit 1; unre
 ## Performance
 
 ~5 ms self-check; ~63 ms cold / ~29 ms warm on a Unity-scale 51k-file repo (post-prune). Numbers, per-phase breakdown, and what the walk-cache and per-file cache actually buy: [[performance.md]].
+
+## Not covered yet
+
+Links the crawl does not reach, and what closing each would cost: [[TODO.md]].
