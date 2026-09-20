@@ -17,3 +17,7 @@ run *ARGS:
 
 clean:
     cargo clean
+
+# Compile without emitting — what `boxcat-devenv typecheck` runs for this repo.
+typecheck:
+    cargo check --all-targets
